@@ -40,25 +40,46 @@ def read_passwords():
         print_warning("未找到dict.txt文件喵，请确保文件在正确的位置！")
     return passwords
 
+from tqdm import tqdm
+import re
+
 def extract_with_7zip(file_path, extract_to, password=None):
-    """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示解压进度喵"""
-    command = ['7z', 'x', file_path, f'-o{extract_to}', '-y', '-bb3', '-bsp1']
+    """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
+    command = ['7z', 'x', file_path, f'-o{extract_to}', '-y', '-bsp1']
     if password:
         command.extend(['-p' + password])
 
     # 启动7z进程
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    
+    progress_bar = None
+    last_percent = 0
+    
+    file_size = os.path.getsize(file_path) / (1024*1024)
 
     # 实时输出进度
-    while True:
-        output = process.stdout.readline()
-        if output == '' and process.poll() is not None:
-            break
-        if output:
-            # 使用颜色和加粗来突出显示输出
-            print(f"\033[34m{output.strip()}\033[0m", flush=True)
+    for line in iter(process.stdout.readline, ''):
+        line = line.strip()
+        if "- " in line:
+            current_file = line.split("- ", 1)[1]
+            if progress_bar is None:
+                bar_format = "{desc}: {percentage}%|{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+                progress_bar = tqdm(desc = current_file, total=file_size, unit="MB", bar_format=bar_format)
+                last_percent = 0
+            else:
+                progress_bar.set_description(current_file)
+        if "%" in line:
+            match = re.search(r"(\d+)%", line)
+            if match and progress_bar:
+                percent = int(match.group(0).replace("%", ""))
+                progress_increment = (percent - last_percent) * file_size / 100
+                progress_bar.update(progress_increment)
+                last_percent = percent
+        if "Everything is Ok" in line:
+            if progress_bar:
+                progress_bar.close()
+            print_success("解压完成：Everything is Ok")
 
-    # 检查是否有错误信息
     stderr = process.communicate()[1]
     if stderr:
         print_error(f"错误: {stderr}")
