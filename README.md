@@ -11,6 +11,7 @@
   * 适用于Windows自带的防火墙。
   * 如果你觉得某个程序好用，但你又不放心，那就只能做一些基本的防护了。
 * auto_decompression
+  * `pip install -r requirements.txt` 以安装依赖。
   * 为了适应日渐套娃的资源分享环境而写作的自动解压嵌套文件脚本。To make your life easier.
   * 进度条 / 速度显示。
   * 读取脚本目录下的`dict.txt`作为密码字典进行自动尝试解压。
