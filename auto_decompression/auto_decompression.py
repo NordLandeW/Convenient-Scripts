@@ -38,7 +38,7 @@ def read_passwords():
             passwords = file.read().splitlines()
     except FileNotFoundError:
         print_warning("未找到dict.txt文件喵，请确保文件在正确的位置！")
-    return passwords
+    return passwords if len(passwords)>0 else ["bruh"]
 
 from tqdm import tqdm
 import re
@@ -77,20 +77,27 @@ def extract_with_7zip(file_path, extract_to, password=None):
                 last_percent = percent
         if "Everything is Ok" in line:
             if progress_bar:
+                percent = 100
+                progress_increment = (percent - last_percent) * file_size / 100
+                progress_bar.update(progress_increment)
+                progress_bar.refresh()
                 progress_bar.close()
             print_success("解压完成：Everything is Ok")
 
     stderr = process.communicate()[1]
     if stderr:
-        print_error(f"错误: {stderr}")
-    if "wrong password" in stderr.lower():
-        return False
-    return True
+        print_warning(f"错误: {stderr}")
+        if "wrong password" in stderr.lower():
+            return -1
+        else:
+            print_info(f"{file_path}\n可能不是压缩文件喵。这种情况下上面的错误是正常现象喵。")
+            return -2
+    return 1
 
 def try_passwords(file_path, extract_to, passwords):
     """尝试一系列密码解压文件喵，如果没有有效密码则返回None"""
     for password in passwords:
-        if extract_with_7zip(file_path, extract_to, password):
+        if extract_with_7zip(file_path, extract_to, password)>0:
             return password
     return None
 
@@ -98,7 +105,7 @@ def manual_password_entry(file_path, extract_to, level):
     """当字典中的密码都无效时，手动请求用户输入密码喵"""
     while True:
         password = input(f"请输入第 {level} 层文件的解压密码喵：")
-        if extract_with_7zip(file_path, extract_to, password):
+        if extract_with_7zip(file_path, extract_to, password)>0:
             return password
         print("密码错误，请重新输入喵！")
 
@@ -108,9 +115,13 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
     last_compressed_file_name = os.path.splitext(os.path.basename(file_path))[0]
 
     passwords = read_passwords()
-    password = last_success_password if last_success_password in passwords else None
-    if password is None or not extract_with_7zip(file_path, temp_folder, password):
+    password = last_success_password if last_success_password is not None else passwords[0]
+    first_try = extract_with_7zip(file_path, temp_folder, password)
+    if first_try == -1:
         password = try_passwords(file_path, temp_folder, passwords) or manual_password_entry(file_path, temp_folder, level)
+    elif first_try == -2:
+        shutil.rmtree(temp_folder)
+        return True
 
     files = os.listdir(temp_folder)
     orig_temp_folder = temp_folder
@@ -119,21 +130,28 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
         files = os.listdir(deeper_folder)
         temp_folder = deeper_folder
 
-    if len(files) == 1 and not os.path.isdir(os.path.join(temp_folder, files[0])):
+    finished = False
+    if len(files) == 1:
         new_file_path = os.path.join(temp_folder, files[0])
-        recursive_extract(base_folder, new_file_path, password, level + 1)
-        os.remove(new_file_path)
+        finished = recursive_extract(base_folder, new_file_path, password, level + 1)
+        if not finished:
+            os.remove(new_file_path)
     else:
+        finished = True
+    if finished:
         target_folder = create_unique_directory(base_folder, last_compressed_file_name)
-        for f in files:
-            shutil.move(os.path.join(temp_folder, f), target_folder)
+        for f in os.listdir(orig_temp_folder):
+            shutil.move(os.path.join(orig_temp_folder, f), target_folder)
         print_success(f"最终文件被移动到：{target_folder}")
     shutil.rmtree(orig_temp_folder)
+    return False
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        base_folder = os.path.dirname(sys.argv[1])
-        recursive_extract(base_folder, sys.argv[1])
+        for i in range(1, len(sys.argv)):
+            print_info(f"开始解压文件 {sys.argv[i]} 喵❤")
+            base_folder = os.path.dirname(sys.argv[i])
+            recursive_extract(base_folder, sys.argv[i])
         input("解压完成，按任意键退出程序喵...")
     else:
         print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
