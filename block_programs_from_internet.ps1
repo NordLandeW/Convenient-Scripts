@@ -1,35 +1,35 @@
-# æ£€æŸ¥æ˜¯å¦ä»¥ç®¡ç†å‘˜æƒé™è¿è¡Œ
+# ¼ì²éÊÇ·ñÒÔ¹ÜÀíÔ±È¨ÏŞÔËĞĞ
 if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
 {
-    # è·å–è„šæœ¬çš„å®Œæ•´è·¯å¾„
+    # »ñÈ¡½Å±¾µÄÍêÕûÂ·¾¶
     $scriptPath = $MyInvocation.MyCommand.Definition
-    # é‡æ–°ä»¥ç®¡ç†å‘˜æƒé™å¯åŠ¨è„šæœ¬
+    # ÖØĞÂÒÔ¹ÜÀíÔ±È¨ÏŞÆô¶¯½Å±¾
     Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs
     exit
 }
 
-# è·¯å¾„è®¾ç½®ä¸ºä¸»äººæƒ³è¦ç¦æ­¢ç½‘ç»œè®¿é—®çš„ç¨‹åºæ‰€åœ¨çš„æ–‡ä»¶å¤¹
+# Â·¾¶ÉèÖÃÎªÖ÷ÈËÏëÒª½ûÖ¹ÍøÂç·ÃÎÊµÄ³ÌĞòËùÔÚµÄÎÄ¼ş¼Ğ
 $FolderPath = "C:\Program Files (x86)\360\360zip"
 
-# è·å–è¯¥æ–‡ä»¶å¤¹ä¸‹æ‰€æœ‰çš„.exeæ–‡ä»¶
+# »ñÈ¡¸ÃÎÄ¼ş¼ĞÏÂËùÓĞµÄ.exeÎÄ¼ş
 $Executables = Get-ChildItem -Path $FolderPath -Filter *.exe -Recurse
 
 $taskName = "360"
 
-# ä¸ºæ¯ä¸ª.exeæ–‡ä»¶åˆ›å»ºé˜²ç«å¢™è§„åˆ™
+# ÎªÃ¿¸ö.exeÎÄ¼ş´´½¨·À»ğÇ½¹æÔò
 foreach ($exe in $Executables) {
     $ruleNameOut = $taskName + "Block_Outbound_" + $exe.Name
     $ruleNameIn = $taskName + "Block_Inbound_" + $exe.Name
 
-    # åˆ›å»ºé˜²ç«å¢™è§„åˆ™ç¦æ­¢ç¨‹åºå‡ºç«™è®¿é—®
+    # ´´½¨·À»ğÇ½¹æÔò½ûÖ¹³ÌĞò³öÕ¾·ÃÎÊ
     New-NetFirewallRule -DisplayName $ruleNameOut -Direction Outbound -Program $exe.FullName -Action Block
-    # åˆ›å»ºé˜²ç«å¢™è§„åˆ™ç¦æ­¢ç¨‹åºå…¥ç«™è®¿é—®
+    # ´´½¨·À»ğÇ½¹æÔò½ûÖ¹³ÌĞòÈëÕ¾·ÃÎÊ
     New-NetFirewallRule -DisplayName $ruleNameIn -Direction Inbound -Program $exe.FullName -Action Block
 
-    Write-Output "å·²åˆ›å»ºç¦æ­¢å‡ºç«™å’Œå…¥ç«™çš„è§„åˆ™ï¼Œç¨‹åºï¼š$exe.FullName"
+    Write-Output "ÒÑ´´½¨½ûÖ¹³öÕ¾ºÍÈëÕ¾µÄ¹æÔò£¬³ÌĞò£º$exe.FullName"
 }
 
-Write-Output "æ‰€æœ‰ç¨‹åºçš„å‡ºç«™å’Œå…¥ç«™è§„åˆ™éƒ½å·²è®¾ç½®å®Œæˆï¼Œå–µï½"
-# ç­‰å¾…ç”¨æˆ·æŒ‰ä»»æ„é”®åé€€å‡º
-Write-Output "æŒ‰ä»»æ„é”®é€€å‡º..."
+Write-Output "ËùÓĞ³ÌĞòµÄ³öÕ¾ºÍÈëÕ¾¹æÔò¶¼ÒÑÉèÖÃÍê³É£¬ß÷¡«"
+# µÈ´ıÓÃ»§°´ÈÎÒâ¼üºóÍË³ö
+Write-Output "°´ÈÎÒâ¼üÍË³ö..."
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
