@@ -63,7 +63,7 @@ def extract_with_7zip(file_path, extract_to, password=None):
         if "- " in line:
             current_file = line.split("- ", 1)[1]
             if progress_bar is None:
-                bar_format = "{desc}: {percentage}%|{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+                bar_format = "{desc}: {percentage:.2f}%|{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
                 progress_bar = tqdm(desc = current_file, total=file_size, unit="MB", bar_format=bar_format)
                 last_percent = 0
             else:
