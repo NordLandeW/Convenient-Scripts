@@ -86,10 +86,10 @@ def extract_with_7zip(file_path, extract_to, password=None):
 
     stderr = process.communicate()[1]
     if stderr:
-        print_warning(f"错误: {stderr}")
         if "wrong password" in stderr.lower():
             return -1
         else:
+            print_warning(f"错误: {stderr}")
             print_info(f"{file_path}\n可能不是压缩文件喵。这种情况下上面的错误是正常现象喵。")
             return -2
     return 1
@@ -109,6 +109,8 @@ def manual_password_entry(file_path, extract_to, level):
             return password
         print("密码错误，请重新输入喵！")
 
+global_last_success_password = None
+
 def recursive_extract(base_folder, file_path, last_success_password=None, level = 1):
     """递归解压文件，处理密码保护的压缩文件喵"""
     temp_folder = create_unique_directory(base_folder, "temp_extract")
@@ -122,6 +124,8 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
     elif first_try == -2:
         shutil.rmtree(temp_folder)
         return True
+    
+    global_last_success_password = password
 
     files = os.listdir(temp_folder)
     orig_temp_folder = temp_folder
@@ -151,7 +155,7 @@ if __name__ == "__main__":
         for i in range(1, len(sys.argv)):
             print_info(f"开始解压文件 {sys.argv[i]} 喵❤")
             base_folder = os.path.dirname(sys.argv[i])
-            recursive_extract(base_folder, sys.argv[i])
+            recursive_extract(base_folder, sys.argv[i], global_last_success_password)
         input("解压完成，按任意键退出程序喵...")
     else:
         print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
