@@ -46,7 +46,7 @@ def read_passwords():
             passwords = file.read().splitlines()
     except FileNotFoundError:
         print_warning("未找到dict.txt文件喵，请确保文件在正确的位置！")
-    return passwords if len(passwords)>0 else ["bruh"]
+    return passwords if len(passwords)>0 else ["???"]
 
 from tqdm import tqdm
 import re
@@ -66,6 +66,7 @@ def extract_with_7zip(file_path, extract_to, password=None):
     last_percent = 0
     
     file_size = os.path.getsize(file_path)
+    result = 1
 
     # 实时输出进度
     with Progress(
@@ -78,8 +79,9 @@ def extract_with_7zip(file_path, extract_to, password=None):
         "•",
         rich.progress.TransferSpeedColumn(),
         "•",
+        rich.progress.TimeElapsedColumn(), "/",
         rich.progress.TimeRemainingColumn(),
-        transient=False) as progress:
+        transient=True) as progress:
         for line in iter(process.stdout.readline, ''):
             line = line.strip()
             # print(line)
@@ -89,7 +91,7 @@ def extract_with_7zip(file_path, extract_to, password=None):
                     task = progress.add_task("Decompress...", total=file_size, filename=current_file, start=False)
                     # print(f"Add task {task}")
                     last_percent = 0
-                else:
+                elif task_started:
                     progress.update(task, filename=current_file)
             if "%" in line:
                 match = re.search(r"(\d+)%", line)
@@ -99,10 +101,11 @@ def extract_with_7zip(file_path, extract_to, password=None):
                         if percent == 100:
                             continue
                         # print("Task start")
+                        progress.live.transient = False
                         progress.start_task(task)
                         task_started = True
                     progress_increment = int((percent - last_percent) * file_size / 100) + 1
-                    progress.update(task, advance=progress_increment)
+                    progress.update(task, advance=progress_increment, refresh=True)
                     last_percent = percent
             if "Everything is Ok" in line:
                 if task >= 0:
@@ -111,17 +114,19 @@ def extract_with_7zip(file_path, extract_to, password=None):
 
         stderr = process.communicate()[1]
         if stderr:
-            progress.update(task, visible=False, refresh=True)
             if "wrong password" in stderr.lower():
-                # print("Wrong password")
-                return -1
+                result = -1
             else:
-                print_warning(f"错误: {stderr}")
-                print_info(f"{file_path}\n可能不是压缩文件喵。这种情况下上面的错误是正常现象喵。")
-                return -2
+                result = -2
     
-    print_success("解压完成：Everything is Ok")
-    return 1
+    if result == -1:
+        print_info(f"密码 {password} 尝试错误喵。")
+    elif result == -2:
+        print_warning(f"错误: {stderr}")
+        print_info(f"{file_path}\n可能不是压缩文件喵。这种情况下上面的错误是正常现象喵。")
+    else:
+        print_success("解压完成：Everything is Ok")
+    return result
 
 def try_passwords(file_path, extract_to, passwords):
     """尝试一系列密码解压文件喵，如果没有有效密码则返回None"""
