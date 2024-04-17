@@ -70,7 +70,8 @@ def extract_with_7zip(file_path, extract_to, password=None):
     # 实时输出进度
     with Progress(
         rich.progress.SpinnerColumn(finished_text="✅"),
-        rich.progress.TextColumn("[cyan][b]{task.fields[filename]}[/cyan][/b]"),
+        rich.progress.TextColumn("[cyan][b]{task.fields[filename]}[/cyan][/b]",
+                                table_column=rich.progress.Column(max_width = 75)),
         rich.progress.BarColumn(),
         "[progress.percentage]{task.percentage:>3.1f}%",
         "•",
