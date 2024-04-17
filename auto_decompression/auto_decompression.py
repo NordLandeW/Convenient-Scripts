@@ -179,8 +179,8 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
         finished = True
     if finished:
         target_folder = create_unique_directory(base_folder, last_compressed_file_name)
-        for f in files:
-            shutil.move(os.path.join(temp_folder, f), target_folder)
+        for f in os.listdir(orig_temp_folder):
+            shutil.move(os.path.join(orig_temp_folder, f), target_folder)
         print_success(f"最终文件被移动到：{target_folder}")
     shutil.rmtree(orig_temp_folder)
     return False
