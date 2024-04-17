@@ -54,7 +54,7 @@ import time
 
 def extract_with_7zip(file_path, extract_to, password=None):
     """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
-    command = ['7z', 'x', file_path, f'-o{extract_to}', '-y', '-bsp1']
+    command = ['7z', 'x', file_path, f'-o{extract_to}', '-y', '-bsp1', '-bb3']
     if password:
         command.extend(['-p' + password])
 
@@ -62,7 +62,6 @@ def extract_with_7zip(file_path, extract_to, password=None):
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
     
     task = -1
-    task_started = False
     last_percent = 0
     
     file_size = os.path.getsize(file_path)
@@ -82,50 +81,45 @@ def extract_with_7zip(file_path, extract_to, password=None):
         rich.progress.TimeElapsedColumn(), "/",
         rich.progress.TimeRemainingColumn(),
         transient=True) as progress:
+        task = progress.add_task("Decompress...", total=file_size, filename="")
+        last_percent = 0
         for line in iter(process.stdout.readline, ''):
             line = line.strip()
-            # print(line)
+            # print(">" + line)
             if "- " in line:
-                current_file = line.split("- ", 1)[1]
-                if task < 0:
-                    task = progress.add_task("Decompress...", total=file_size, filename=current_file, start=False)
-                    # print(f"Add task {task}")
-                    last_percent = 0
-                elif task_started:
-                    progress.update(task, filename=current_file)
+                current_file = line.split("- ", 1)[1].replace("\\", "/")
+                progress.update(task, filename=current_file, refresh=True)
             if "%" in line:
                 match = re.search(r"(\d+)%", line)
-                if match and task >= 0:
+                if match:
                     percent = int(match.group(0).replace("%", ""))
-                    if not task_started:
-                        if percent == 100:
-                            continue
-                        # print("Task start")
-                        progress.live.transient = False
-                        progress.start_task(task)
-                        task_started = True
                     progress_increment = int((percent - last_percent) * file_size / 100) + 1
                     progress.update(task, advance=progress_increment, refresh=True)
                     last_percent = percent
             if "Everything is Ok" in line:
-                if task >= 0:
-                    progress.update(task, advance=int(file_size - last_percent * file_size / 100) + 1)
-                    progress.refresh()
+                progress.update(task, advance=int(file_size - last_percent * file_size / 100) + 1)
+                progress.refresh()
 
         stderr = process.communicate()[1]
         if stderr:
             if "wrong password" in stderr.lower():
                 result = -1
-            else:
+            elif "cannot open the file as archive" in stderr.lower():
                 result = -2
+            else:
+                result = -3
+        else:
+            progress.live.transient = False
     
     if result == -1:
         print_info(f"密码 {password} 尝试错误喵。")
     elif result == -2:
-        print_warning(f"错误: {stderr}")
-        print_info(f"{file_path}\n可能不是压缩文件喵。这种情况下上面的错误是正常现象喵。")
+        print_info(f"{file_path}\n可能不是压缩文件喵。")
+    elif result == -3:
+        print_warning(f"未定义错误（可能是密码错误喵）: {stderr}")
+        result = -1
     else:
-        print_success("解压完成：Everything is Ok")
+        print_success("解压完成，没有错误喵。")
     return result
 
 def try_passwords(file_path, extract_to, passwords):
