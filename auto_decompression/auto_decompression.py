@@ -2,22 +2,30 @@ import subprocess
 import os
 import sys
 import shutil
+from rich.console import Console
+from rich.progress import Progress
+import rich.progress
+
+console = Console()
 
 def print_info(message):
     """用蓝色打印普通信息喵"""
-    print(f"\033[34m{message}\033[0m")
+    console.out(message, style="blue")
+
 
 def print_error(message):
     """用红色加粗打印错误信息喵"""
-    print(f"\033[1;31m{message}\033[0m")
+    console.out(message, style="bold red")
 
 def print_success(message):
     """用绿色打印成功信息喵"""
-    print(f"\033[32m{message}\033[0m")
+    console.out(message, style="green")
+
 
 def print_warning(message):
     """用黄色打印警告信息喵"""
-    print(f"\033[33m{message}\033[0m")
+    console.out(message, style="bold yellow underline")
+
 
 def create_unique_directory(base_path, dir_name):
     """创建一个唯一的目录，如果目录存在，则添加波浪号来避免重复喵"""
@@ -42,6 +50,7 @@ def read_passwords():
 
 from tqdm import tqdm
 import re
+import time
 
 def extract_with_7zip(file_path, extract_to, password=None):
     """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
@@ -52,46 +61,66 @@ def extract_with_7zip(file_path, extract_to, password=None):
     # 启动7z进程
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
     
-    progress_bar = None
+    task = -1
+    task_started = False
     last_percent = 0
     
-    file_size = os.path.getsize(file_path) / (1024*1024)
+    file_size = os.path.getsize(file_path)
 
     # 实时输出进度
-    for line in iter(process.stdout.readline, ''):
-        line = line.strip()
-        if "- " in line:
-            current_file = line.split("- ", 1)[1]
-            if progress_bar is None:
-                bar_format = "{desc}: {percentage:.2f}%|{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
-                progress_bar = tqdm(desc = current_file, total=file_size, unit="MB", bar_format=bar_format)
-                last_percent = 0
-            else:
-                progress_bar.set_description(current_file)
-        if "%" in line:
-            match = re.search(r"(\d+)%", line)
-            if match and progress_bar:
-                percent = int(match.group(0).replace("%", ""))
-                progress_increment = (percent - last_percent) * file_size / 100
-                progress_bar.update(progress_increment)
-                last_percent = percent
-        if "Everything is Ok" in line:
-            if progress_bar:
-                percent = 100
-                progress_increment = (percent - last_percent) * file_size / 100
-                progress_bar.update(progress_increment)
-                progress_bar.refresh()
-                progress_bar.close()
-            print_success("解压完成：Everything is Ok")
+    with Progress(
+        rich.progress.SpinnerColumn(finished_text="✅"),
+        rich.progress.TextColumn("[cyan][b]{task.fields[filename]}[/cyan][/b]"),
+        rich.progress.BarColumn(),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        "•",
+        rich.progress.FileSizeColumn(),
+        "•",
+        rich.progress.TransferSpeedColumn(),
+        "•",
+        rich.progress.TimeRemainingColumn(),
+        transient=False) as progress:
+        for line in iter(process.stdout.readline, ''):
+            line = line.strip()
+            # print(line)
+            if "- " in line:
+                current_file = line.split("- ", 1)[1]
+                if task < 0:
+                    task = progress.add_task("Decompress...", total=file_size, filename=current_file, start=False)
+                    # print(f"Add task {task}")
+                    last_percent = 0
+                else:
+                    progress.update(task, filename=current_file)
+            if "%" in line:
+                match = re.search(r"(\d+)%", line)
+                if match and task >= 0:
+                    percent = int(match.group(0).replace("%", ""))
+                    if not task_started:
+                        if percent == 100:
+                            continue
+                        # print("Task start")
+                        progress.start_task(task)
+                        task_started = True
+                    progress_increment = int((percent - last_percent) * file_size / 100) + 1
+                    progress.update(task, advance=progress_increment)
+                    last_percent = percent
+            if "Everything is Ok" in line:
+                if task >= 0:
+                    progress.update(task, advance=int(file_size - last_percent * file_size / 100) + 1)
+                    progress.refresh()
 
-    stderr = process.communicate()[1]
-    if stderr:
-        if "wrong password" in stderr.lower():
-            return -1
-        else:
-            print_warning(f"错误: {stderr}")
-            print_info(f"{file_path}\n可能不是压缩文件喵。这种情况下上面的错误是正常现象喵。")
-            return -2
+        stderr = process.communicate()[1]
+        if stderr:
+            progress.update(task, visible=False, refresh=True)
+            if "wrong password" in stderr.lower():
+                # print("Wrong password")
+                return -1
+            else:
+                print_warning(f"错误: {stderr}")
+                print_info(f"{file_path}\n可能不是压缩文件喵。这种情况下上面的错误是正常现象喵。")
+                return -2
+    
+    print_success("解压完成：Everything is Ok")
     return 1
 
 def try_passwords(file_path, extract_to, passwords):
@@ -104,10 +133,11 @@ def try_passwords(file_path, extract_to, passwords):
 def manual_password_entry(file_path, extract_to, level):
     """当字典中的密码都无效时，手动请求用户输入密码喵"""
     while True:
-        password = input(f"请输入第 {level} 层文件的解压密码喵：")
+        console.print(f"[cyan][b]请输入第{level}层文件的解压密码喵：", end="")
+        password = input()
         if extract_with_7zip(file_path, extract_to, password)>0:
             return password
-        print("密码错误，请重新输入喵！")
+        print_warning("密码错误，请重新输入喵！")
 
 global_last_success_password = None
 
