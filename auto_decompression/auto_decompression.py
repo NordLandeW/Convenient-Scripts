@@ -190,6 +190,7 @@ if __name__ == "__main__":
         console.print("[cyan][b]要为每个压缩包单独建立一个文件夹吗？[Y/n]：", end="")
         question = input()
         if question.lower() == "n":
+            print_info("[cyan]将所有压缩包内的文件都解压到当前文件夹下喵❤")
             extract_to_base_folder=True
         for i in range(1, len(sys.argv)):
             print_info(f"开始解压文件 {sys.argv[i]} 喵❤")
