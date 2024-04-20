@@ -7,6 +7,7 @@ from rich.progress import Progress
 import rich.progress
 
 console = Console()
+extract_to_base_folder = False
 
 def print_info(message):
     """用蓝色打印普通信息喵"""
@@ -174,7 +175,10 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
     else:
         finished = True
     if finished:
-        target_folder = create_unique_directory(base_folder, last_compressed_file_name)
+        if extract_to_base_folder:
+            target_folder = base_folder
+        else:
+            target_folder = create_unique_directory(base_folder, last_compressed_file_name)
         for f in files:
             shutil.move(os.path.join(temp_folder, f), target_folder)
         print_success(f"最终文件被移动到：{target_folder}")
@@ -183,6 +187,10 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
+        console.print("[cyan][b]要为每个压缩包单独建立一个文件夹吗？[Y/n]：", end="")
+        question = input()
+        if question.lower == "n":
+            extract_to_base_folder=True
         for i in range(1, len(sys.argv)):
             print_info(f"开始解压文件 {sys.argv[i]} 喵❤")
             base_folder = os.path.dirname(sys.argv[i])
