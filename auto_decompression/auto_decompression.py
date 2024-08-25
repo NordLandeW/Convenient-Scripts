@@ -52,6 +52,7 @@ def read_passwords():
 from tqdm import tqdm
 import re
 import time
+import threading
 
 def extract_with_7zip(file_path, extract_to, password=None):
     """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
@@ -64,9 +65,46 @@ def extract_with_7zip(file_path, extract_to, password=None):
     
     task = -1
     last_percent = 0
-    
     file_size = os.path.getsize(file_path)
     result = 1
+
+    # 定义处理 stdout 的函数
+    def handle_stdout():
+        nonlocal last_percent, task, result
+        for line in iter(process.stdout.readline, ''):
+            if process.poll() is not None:
+                break  # 进程已经结束
+            line = line.strip()
+            # print(": " + line)
+            if "- " in line:
+                current_file = line.split("- ", 1)[1].replace("\\", "/")
+                progress.update(task, filename=current_file, refresh=True)
+            if "%" in line:
+                match = re.search(r"(\d+)%", line)
+                if match:
+                    percent = int(match.group(0).replace("%", ""))
+                    progress_increment = int((percent - last_percent) * file_size / 100) + 1
+                    progress.update(task, advance=progress_increment, refresh=True)
+                    last_percent = percent
+            if "Everything is Ok" in line:
+                progress.update(task, advance=int(file_size - last_percent * file_size / 100) + 1)
+                progress.refresh()
+
+    # 定义处理 stderr 的函数
+    def handle_stderr():
+        nonlocal result
+        for err_line in iter(process.stderr.readline, ''):
+            err_line = err_line.strip()
+            if err_line:
+                process.terminate()
+                # 检查错误信息
+                if "wrong password" in err_line.lower():
+                    result = -1
+                elif "cannot open the file as archive" in err_line.lower():
+                    result = -2
+                else:
+                    result = -3
+                break
 
     # 实时输出进度
     with Progress(
@@ -83,45 +121,29 @@ def extract_with_7zip(file_path, extract_to, password=None):
         rich.progress.TimeElapsedColumn(), "/",
         rich.progress.TimeRemainingColumn(),
         transient=True) as progress:
+        
         task = progress.add_task("Decompress...", total=file_size, filename="")
-        last_percent = 0
-        for line in iter(process.stdout.readline, ''):
-            line = line.strip()
-            # print(">" + line)
-            if "- " in line:
-                current_file = line.split("- ", 1)[1].replace("\\", "/")
-                progress.update(task, filename=current_file, refresh=True)
-            if "%" in line:
-                match = re.search(r"(\d+)%", line)
-                if match:
-                    percent = int(match.group(0).replace("%", ""))
-                    progress_increment = int((percent - last_percent) * file_size / 100) + 1
-                    progress.update(task, advance=progress_increment, refresh=True)
-                    last_percent = percent
-            if "Everything is Ok" in line:
-                progress.update(task, advance=int(file_size - last_percent * file_size / 100) + 1)
-                progress.refresh()
 
-        stderr = process.communicate()[1]
-        if stderr:
-            if "wrong password" in stderr.lower():
-                result = -1
-            elif "cannot open the file as archive" in stderr.lower():
-                result = -2
-            else:
-                result = -3
-        else:
-            progress.live.transient = False
-    
+        # 启动线程来处理 stdout 和 stderr
+        stdout_thread = threading.Thread(target=handle_stdout)
+        stderr_thread = threading.Thread(target=handle_stderr)
+
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # 等待线程完成
+        stdout_thread.join()
+        stderr_thread.join()
+
     if result == -1:
         print_info(f"密码 {password} 尝试错误喵。")
     elif result == -2:
         print_info(f"{file_path}\n可能不是压缩文件喵。")
     elif result == -3:
-        print_warning(f"未定义错误（可能是密码错误喵）: {stderr}")
-        result = -1
+        print_warning(f"未定义错误（可能是密码错误喵）")
     else:
         print_success("解压完成，没有错误喵。")
+    
     return result
 
 def try_passwords(file_path, extract_to, passwords):
