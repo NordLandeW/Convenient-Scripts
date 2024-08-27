@@ -49,9 +49,7 @@ def read_passwords():
         print_warning("未找到dict.txt文件喵，请确保文件在正确的位置！")
     return passwords if len(passwords)>0 else ["???"]
 
-from tqdm import tqdm
 import re
-import time
 import threading
 
 def extract_with_7zip(file_path, extract_to, password=None):
@@ -95,16 +93,18 @@ def extract_with_7zip(file_path, extract_to, password=None):
         nonlocal result
         for err_line in iter(process.stderr.readline, ''):
             err_line = err_line.strip()
+            # print_error(f"\n{err_line}\n")
             if err_line:
                 process.terminate()
                 # 检查错误信息
                 if "wrong password" in err_line.lower():
                     result = -1
+                    break
                 elif "cannot open the file as archive" in err_line.lower():
                     result = -2
+                    break
                 else:
                     result = -3
-                break
 
     # 实时输出进度
     with Progress(
