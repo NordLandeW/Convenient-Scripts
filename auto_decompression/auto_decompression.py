@@ -8,6 +8,7 @@ import rich.progress
 
 console = Console()
 extract_to_base_folder = False
+pwdFilename = "dict.txt"
 
 def print_info(message):
     """用蓝色打印普通信息喵"""
@@ -42,11 +43,12 @@ def create_unique_directory(base_path, dir_name):
 def read_passwords():
     """从与脚本同一目录下的dict.txt中读取密码喵，如果文件不存在或为空则返回空列表"""
     passwords = []
+    pwdPath = os.path.join(sys.path[0], pwdFilename)
     try:
-        with open('dict.txt', 'r', encoding='utf-8') as file:
+        with open(pwdPath, 'r', encoding='utf-8') as file:
             passwords = file.read().splitlines()
-    except FileNotFoundError:
-        print_warning("未找到dict.txt文件喵，请确保文件在正确的位置！")
+    except FileNotFoundError as e:
+        print_warning(f"未找到{pwdPath}文件喵，请确保文件在正确的位置！错误信息：{e}")
     return passwords if len(passwords)>0 else ["???"]
 
 import re
