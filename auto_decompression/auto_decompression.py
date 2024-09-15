@@ -67,6 +67,7 @@ def extract_with_7zip(file_path, extract_to, password=None):
     last_percent = 0
     file_size = os.path.getsize(file_path)
     result = 1
+    err_log = ""
 
     # 定义处理 stdout 的函数
     def handle_stdout():
@@ -93,8 +94,10 @@ def extract_with_7zip(file_path, extract_to, password=None):
     # 定义处理 stderr 的函数
     def handle_stderr():
         nonlocal result
+        nonlocal err_log
         for err_line in iter(process.stderr.readline, ''):
             err_line = err_line.strip()
+            err_log += err_line + "\n"
             # print_error(f"\n{err_line}\n")
             if err_line:
                 process.terminate()
@@ -142,7 +145,7 @@ def extract_with_7zip(file_path, extract_to, password=None):
     elif result == -2:
         print_info(f"{file_path}\n可能不是压缩文件喵。")
     elif result == -3:
-        print_warning(f"未定义错误（可能是密码错误喵）")
+        print_warning(f"未定义错误（可能是密码错误喵）。错误日志：\n{err_log}")
     else:
         print_success("解压完成，没有错误喵。")
     
