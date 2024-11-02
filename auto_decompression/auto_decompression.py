@@ -1,3 +1,4 @@
+import json
 import subprocess
 import os
 import sys
@@ -6,9 +7,12 @@ from rich.console import Console
 from rich.progress import Progress
 import rich.progress
 
+__version__ = "1.0.0"
 console = Console()
 extract_to_base_folder = False
-pwdFilename = "dict.txt"
+pwdOldFilename = "dict.txt"
+pwdFilename = "dict.json"
+pwdDictionary = {}
 
 def print_info(message):
     """用蓝色打印普通信息喵"""
@@ -40,21 +44,69 @@ def create_unique_directory(base_path, dir_name):
     print_success(f"创建目录：{dir_name}")
     return os.path.join(base_path, dir_name)
 
-def read_passwords():
+def read_passwords_old():
     """从与脚本同一目录下的dict.txt中读取密码喵，如果文件不存在或为空则返回空列表"""
     passwords = []
-    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    pwdPath = os.path.join(sys.path[0], pwdOldFilename)
     try:
         with open(pwdPath, 'r', encoding='utf-8') as file:
             passwords = file.read().splitlines()
-    except FileNotFoundError as e:
-        print_warning(f"未找到{pwdPath}文件喵，请确保文件在正确的位置！错误信息：{e}")
+    except Exception as e:
+        print_warning(f"读取旧密码文件错误喵！错误信息：{e}")
+
     return passwords if len(passwords)>0 else ["???"]
+
+# Old version workaround.
+def convert_old_pwd_to_new_pwd(passwords):
+    for pwd in passwords:
+        pwdDictionary[pwd] = 0
+    save_passwords()
+    print_info("密码本格式更新完毕喵！")
+
+def read_passwords():
+    global pwdDictionary
+    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    try:
+        with open(pwdPath, 'r', encoding='utf-8') as file:
+            pwdDictionary = json.load(file)
+    except Exception as e:
+        print_warning(f"读取文件错误喵！错误信息：{e}")
+
+def save_passwords():
+    # print(str(pwdDictionary))
+    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    try:
+        with open(pwdPath, 'w', encoding='utf-8') as file:
+            json.dump(pwdDictionary, file, ensure_ascii=False, indent=4)
+        # print(f"密码已成功保存到 {pwdPath} 喵～")
+    except Exception as e:
+        print_warning(f"保存密码时出错喵！请检查文件权限或路径。错误信息：{e}")
+
+def check_passwords():
+    global pwdDictionary
+    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    pwdOldPath = os.path.join(sys.path[0], pwdOldFilename)
+    if not os.path.exists(pwdPath):
+        # Check if a old version file exists.
+        if os.path.exists(pwdOldPath):
+            convert_old_pwd_to_new_pwd(read_passwords_old())
+        else:
+            pwdDictionary = {}
+    else:
+        read_passwords()
+
+def add_password(pwd, count = 1):
+    if pwd == None:
+        return
+    if pwd in pwdDictionary:
+        pwdDictionary[pwd] += count;
+    else:
+        pwdDictionary[pwd] = count;
 
 import re
 import threading
 
-def extract_with_7zip(file_path, extract_to, password=None):
+def extract_with_7zip(file_path, extract_to, password:str=None):
     """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
     command = ['7z', 'x', file_path, f'-o{extract_to}', '-y', '-bsp1', '-bb3']
     if password:
@@ -151,9 +203,12 @@ def extract_with_7zip(file_path, extract_to, password=None):
     
     return result
 
-def try_passwords(file_path, extract_to, passwords):
+def try_passwords(file_path, extract_to, passwords, last_success_password):
     """尝试一系列密码解压文件喵，如果没有有效密码则返回None"""
     for password in passwords:
+        password = password[0]
+        if last_success_password:
+            continue
         if extract_with_7zip(file_path, extract_to, password)>0:
             return password
     return None
@@ -174,16 +229,17 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
     temp_folder = create_unique_directory(base_folder, "temp_extract")
     last_compressed_file_name = os.path.splitext(os.path.basename(file_path))[0]
 
-    passwords = read_passwords()
-    password = last_success_password if last_success_password is not None else passwords[0]
+    passwords = sorted(pwdDictionary.items(), key=lambda item: item[1], reverse=True)
+    password = last_success_password if last_success_password is not None else passwords[0][0]
     first_try = extract_with_7zip(file_path, temp_folder, password)
     if first_try == -1:
-        password = try_passwords(file_path, temp_folder, passwords) or manual_password_entry(file_path, temp_folder, level)
+        password = try_passwords(file_path, temp_folder, passwords, last_success_password) or manual_password_entry(file_path, temp_folder, level)
     elif first_try == -2:
         shutil.rmtree(temp_folder)
         return True
     
     global_last_success_password = password
+    add_password(password)
 
     files = os.listdir(temp_folder)
     orig_temp_folder = temp_folder
@@ -212,7 +268,10 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
     shutil.rmtree(orig_temp_folder)
     return False
 
-if __name__ == "__main__":
+import time
+
+def main():
+    check_passwords()
     if len(sys.argv) > 1:
         console.print("[cyan][b]要为每个压缩包单独建立一个文件夹吗？[Y/n]：", end="")
         question = input()
@@ -223,7 +282,12 @@ if __name__ == "__main__":
             print_info(f"开始解压文件 {sys.argv[i]} 喵❤")
             base_folder = os.path.dirname(sys.argv[i])
             recursive_extract(base_folder, sys.argv[i], global_last_success_password)
-        input("解压完成，按任意键退出程序喵...")
+        save_passwords()
+        print_info("解压完成，退出程序喵...")
+        # time.sleep(2)
     else:
         print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
         input("")
+
+if __name__ == "__main__":
+    main()
