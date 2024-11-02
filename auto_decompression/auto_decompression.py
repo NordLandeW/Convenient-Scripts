@@ -207,7 +207,7 @@ def try_passwords(file_path, extract_to, passwords, last_success_password):
     """尝试一系列密码解压文件喵，如果没有有效密码则返回None"""
     for password in passwords:
         password = password[0]
-        if last_success_password:
+        if last_success_password == password:
             continue
         if extract_with_7zip(file_path, extract_to, password)>0:
             return password
