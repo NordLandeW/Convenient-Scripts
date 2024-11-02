@@ -3,6 +3,9 @@ import subprocess
 import os
 import sys
 import shutil
+import traceback
+import extract_hidden_zip as hiddenZip
+import send2trash
 from rich.console import Console
 from rich.progress import Progress
 import rich.progress
@@ -13,11 +16,11 @@ extract_to_base_folder = False
 pwdOldFilename = "dict.txt"
 pwdFilename = "dict.json"
 pwdDictionary = {}
+RECOVER_SUFFIX = ".AutoDecRecovered"
 
 def print_info(message):
     """用蓝色打印普通信息喵"""
     console.out(message, style="blue")
-
 
 def print_error(message):
     """用红色加粗打印错误信息喵"""
@@ -27,11 +30,36 @@ def print_success(message):
     """用绿色打印成功信息喵"""
     console.out(message, style="green")
 
-
 def print_warning(message):
     """用黄色打印警告信息喵"""
     console.out(message, style="bold yellow underline")
 
+def move_temp_folders_to_recycle_bin(current_directory):
+    # 获取当前目录下的所有文件和文件夹
+    items = os.listdir(current_directory)
+
+    # 过滤出以 'temp_extract' 为前缀的子文件夹
+    temp_folders = [item for item in items if os.path.isdir(os.path.join(current_directory, item)) and item.startswith('temp_extract')]
+    if len(temp_folders) == 0:
+        return False
+
+    # 将所有符合条件的子文件夹移动到系统回收站中
+    for folder in temp_folders:
+        folder_path = os.path.join(current_directory, folder)
+        send2trash.send2trash(folder_path)
+        print_info(f"将 {folder_path} 移动到了回收站喵☆")
+    return True
+
+def remove_autodec_files(directory):
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(RECOVER_SUFFIX):
+                file_path = os.path.join(root, file)
+                try:
+                    os.remove(file_path)
+                    print_info(f"移除了临时文件 {file_path} 喵！")
+                except Exception as e:
+                    print_error(f"移除临时文件 {file_path} 时出现错误喵: {e}")
 
 def create_unique_directory(base_path, dir_name):
     """创建一个唯一的目录，如果目录存在，则添加波浪号来避免重复喵"""
@@ -231,12 +259,22 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
 
     passwords = sorted(pwdDictionary.items(), key=lambda item: item[1], reverse=True)
     password = last_success_password if last_success_password is not None else passwords[0][0]
-    first_try = extract_with_7zip(file_path, temp_folder, password)
-    if first_try == -1:
-        password = try_passwords(file_path, temp_folder, passwords, last_success_password) or manual_password_entry(file_path, temp_folder, level)
-    elif first_try == -2:
-        shutil.rmtree(temp_folder)
-        return True
+    
+    while True:
+        tryResult = extract_with_7zip(file_path, temp_folder, password)
+        if tryResult == -1:
+            password = try_passwords(file_path, temp_folder, passwords, last_success_password) or manual_password_entry(file_path, temp_folder, level)
+            break
+        elif tryResult == -2:
+            if hiddenZip.has_embedded_zip(file_path):
+                print_info("发现文件嵌入了隐藏Zip喵，准备处理喵！")
+                hiddenZip.extract_zip_from_combined_file(file_path, file_path+RECOVER_SUFFIX)
+                file_path = file_path+RECOVER_SUFFIX
+            else:
+                shutil.rmtree(temp_folder)
+                return True
+        else:
+            break
     
     global_last_success_password = password
     add_password(password)
@@ -281,13 +319,20 @@ def main():
         for i in range(1, len(sys.argv)):
             print_info(f"开始解压文件 {sys.argv[i]} 喵❤")
             base_folder = os.path.dirname(sys.argv[i])
+            if move_temp_folders_to_recycle_bin(base_folder):
+                print_info("检测到上一次非正常退出留下的临时文件夹喵！已经把它们全部移动到回收站了喵☆")
             recursive_extract(base_folder, sys.argv[i], global_last_success_password)
+            remove_autodec_files(base_folder)
         save_passwords()
         print_info("解压完成，退出程序喵...")
-        # time.sleep(2)
+        time.sleep(1)
     else:
         print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
         input("")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print_error(f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}")
+        
