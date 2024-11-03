@@ -44,11 +44,16 @@ def move_temp_folders_to_recycle_bin(current_directory):
         return False
 
     # 将所有符合条件的子文件夹移动到系统回收站中
+    recycled = False
     for folder in temp_folders:
         folder_path = os.path.join(current_directory, folder)
-        send2trash.send2trash(folder_path)
-        print_info(f"将 {folder_path} 移动到了回收站喵☆")
-    return True
+        try:
+            send2trash.send2trash(folder_path)
+            print_info(f"将 {folder_path} 移动到了回收站喵☆")
+            recycled = True
+        except Exception as e:
+            pass
+    return recycled
 
 def remove_autodec_files(directory):
     for root, _, files in os.walk(directory):
