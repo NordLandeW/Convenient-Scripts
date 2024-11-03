@@ -335,4 +335,5 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print_error(f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}")
+        input()
         
