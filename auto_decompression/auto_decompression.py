@@ -257,6 +257,12 @@ def manual_password_entry(file_path, extract_to, level):
 
 global_last_success_password = None
 
+def try_remove_directory(dir):
+    try:
+        shutil.rmtree(dir)
+    except:
+        pass
+
 def recursive_extract(base_folder, file_path, last_success_password=None, level = 1):
     """递归解压文件，处理密码保护的压缩文件喵"""
     temp_folder = create_unique_directory(base_folder, "temp_extract")
@@ -276,7 +282,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
                 hiddenZip.extract_zip_from_combined_file(file_path, file_path+RECOVER_SUFFIX)
                 file_path = file_path+RECOVER_SUFFIX
             else:
-                shutil.rmtree(temp_folder)
+                try_remove_directory(temp_folder)
                 return True
         else:
             break
@@ -308,7 +314,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
         for f in files:
             shutil.move(os.path.join(temp_folder, f), target_folder)
         print_success(f"最终文件被移动到：{target_folder}")
-    shutil.rmtree(orig_temp_folder)
+    try_remove_directory(orig_temp_folder)
     return False
 
 import time
