@@ -236,11 +236,11 @@ def extract_with_7zip(file_path, extract_to, password:str=None):
     
     return result
 
-def try_passwords(file_path, extract_to, passwords, last_success_password):
+def try_passwords(file_path, extract_to, passwords, last_tried_password):
     """尝试一系列密码解压文件喵，如果没有有效密码则返回None"""
     for password in passwords:
         password = password[0]
-        if last_success_password == password:
+        if last_tried_password == password:
             continue
         if extract_with_7zip(file_path, extract_to, password)>0:
             return password
@@ -268,7 +268,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
     while True:
         tryResult = extract_with_7zip(file_path, temp_folder, password)
         if tryResult == -1:
-            password = try_passwords(file_path, temp_folder, passwords, last_success_password) or manual_password_entry(file_path, temp_folder, level)
+            password = try_passwords(file_path, temp_folder, passwords, password) or manual_password_entry(file_path, temp_folder, level)
             break
         elif tryResult == -2:
             if hiddenZip.has_embedded_zip(file_path):
