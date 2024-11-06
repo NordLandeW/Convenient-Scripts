@@ -277,9 +277,13 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
             password = try_passwords(file_path, temp_folder, passwords, password) or manual_password_entry(file_path, temp_folder, level)
             break
         elif tryResult == -2:
-            if hiddenZip.has_embedded_zip(file_path):
+            if hiddenZip.has_embedded_signature(file_path, hiddenZip.ZIP_SIGNATURE):
                 print_info("发现文件嵌入了隐藏Zip喵，准备处理喵！")
-                hiddenZip.extract_zip_from_combined_file(file_path, file_path+RECOVER_SUFFIX)
+                hiddenZip.extract_embedded_file(file_path, file_path+RECOVER_SUFFIX, hiddenZip.ZIP_SIGNATURE)
+                file_path = file_path+RECOVER_SUFFIX
+            elif hiddenZip.has_embedded_signature(file_path, hiddenZip.RAR_SIGNATURE):
+                print_info("发现文件嵌入了隐藏RAR喵，准备处理喵！")
+                hiddenZip.extract_embedded_file(file_path, file_path+RECOVER_SUFFIX, hiddenZip.RAR_SIGNATURE)
                 file_path = file_path+RECOVER_SUFFIX
             else:
                 try_remove_directory(temp_folder)
