@@ -343,7 +343,15 @@ def main():
         time.sleep(1)
     else:
         print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
-        input("")
+        print_info("也可以输入想要添加的密码喵：")
+        while True:
+            pwd = input()
+            if pwd != "":
+                add_password(pwd, 0)
+                save_passwords()
+                print_info(f"已添加密码 {pwd} 喵！")
+            else:
+                break
 
 if __name__ == "__main__":
     try:
