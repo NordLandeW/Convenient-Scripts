@@ -264,6 +264,8 @@ def try_remove_directory(dir):
         pass
 
 def recursive_extract(base_folder, file_path, last_success_password=None, level = 1):
+    global global_last_success_password
+    global extract_to_base_folder
     """递归解压文件，处理密码保护的压缩文件喵"""
     temp_folder = create_unique_directory(base_folder, "temp_extract")
     last_compressed_file_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -371,6 +373,7 @@ class FileServer:
 
 # Modified main function to support singleton behavior
 def main():
+    global extract_to_base_folder
     try:
         # Try to send file paths to the existing instance
         send_file_to_main_instance(sys.argv[1])
