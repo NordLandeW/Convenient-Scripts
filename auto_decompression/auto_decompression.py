@@ -307,7 +307,10 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
         new_file_path = os.path.join(temp_folder, files[0])
         finished = recursive_extract(base_folder, new_file_path, password, level + 1)
         if not finished:
-            os.remove(new_file_path)
+            try:
+                os.remove(new_file_path)
+            except:
+                pass
     else:
         finished = True
     if finished:
@@ -321,37 +324,110 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
     try_remove_directory(orig_temp_folder)
     return False
 
-import time
+SERVER_PORT = 65432
 
-def main():
-    check_passwords()
-    if len(sys.argv) > 1:
-        console.print("[cyan][b]要为每个压缩包单独建立一个文件夹吗？[Y/n]：", end="")
-        question = input()
-        if question.lower() == "n":
-            print_info("将所有压缩包内的文件都解压到当前文件夹下喵❤")
-            extract_to_base_folder=True
-        for i in range(1, len(sys.argv)):
-            print_info(f"开始解压文件 {sys.argv[i]} 喵❤")
-            base_folder = os.path.dirname(sys.argv[i])
-            if move_temp_folders_to_recycle_bin(base_folder):
-                print_info("检测到上一次非正常退出留下的临时文件夹喵！已经把它们全部移动到回收站了喵☆")
-            recursive_extract(base_folder, sys.argv[i], global_last_success_password)
-            remove_autodec_files(base_folder)
-        save_passwords()
-        print_info("解压完成，退出程序喵...")
-        time.sleep(1)
-    else:
-        print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
-        print_info("也可以输入想要添加的密码喵：")
+import multiprocessing
+import threading
+import socket
+
+# Function to send file path to the main instance
+def send_file_to_main_instance(file_path):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.connect(("localhost", SERVER_PORT))
+        client.sendall(file_path.encode() + b"\n")
+
+# Function to create a socket server to handle file paths
+class FileRequestHandler(threading.Thread):
+    def __init__(self, conn, server):
+        super().__init__()
+        self.conn = conn
+        self.server = server
+
+    def run(self):
+        data = self.conn.recv(1024).strip().decode()
+        if data:
+            self.server.files_to_process.append(data)
+        self.conn.close()
+
+class FileServer:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.files_to_process = []
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+
+    def serve_forever(self):
         while True:
-            pwd = input()
-            if pwd != "":
-                add_password(pwd, 0)
+            conn, _ = self.server_socket.accept()
+            handler = FileRequestHandler(conn, self)
+            handler.start()
+
+    def shutdown(self):
+        self.server_socket.close()
+
+
+
+# Modified main function to support singleton behavior
+def main():
+    try:
+        # Try to send file paths to the existing instance
+        send_file_to_main_instance(sys.argv[1])
+        print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
+        return
+    except (ConnectionRefusedError, socket.error):
+        # No existing instance, continue to start a new one
+        pass
+
+    # Create socket server to listen for additional file paths
+    server = FileServer("localhost", SERVER_PORT)
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+
+    check_passwords()
+    files_to_process = sys.argv[1:]
+
+    try:
+        if len(files_to_process) > 0:
+            console.print("[cyan][b]要为每个压缩包单独建立一个文件夹吗？[Y/n]：", end="")
+            question = input()
+            if question.lower() == "n":
+                print_info("将所有压缩包内的文件都解压到当前文件夹下喵❤")
+                extract_to_base_folder = True
+            while True:
+                current_batch = files_to_process[:]
+                files_to_process = []
+                for file_path in current_batch:
+                    print_info(f"开始解压文件 {file_path} 喵❤")
+                    base_folder = os.path.dirname(file_path)
+                    if move_temp_folders_to_recycle_bin(base_folder):
+                        print_info("检测到上一次非正常退出留下的临时文件夹喵！已经把它们全部移动到回收站了喵☆")
+                    recursive_extract(base_folder, file_path, global_last_success_password)
+                    remove_autodec_files(base_folder)
                 save_passwords()
-                print_info(f"已添加密码 {pwd} 喵！")
-            else:
-                break
+                if not server.files_to_process:
+                    break
+                files_to_process.extend(server.files_to_process)
+                server.files_to_process.clear()
+            print_info("解压完成，退出程序喵...")
+        else:
+            print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
+            print_info("也可以输入想要添加的密码喵：")
+            while True:
+                pwd = input()
+                if pwd != "":
+                    add_password(pwd, 0)
+                    save_passwords()
+                    print_info(f"已添加密码 {pwd} 喵！")
+                else:
+                    break
+    except Exception as e:
+        print_error(f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}")
+        input()
+    finally:
+        server.shutdown()
 
 if __name__ == "__main__":
     try:
@@ -359,4 +435,3 @@ if __name__ == "__main__":
     except Exception as e:
         print_error(f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}")
         input()
-        
