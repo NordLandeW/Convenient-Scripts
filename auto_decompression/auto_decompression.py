@@ -190,7 +190,7 @@ def extract_with_7zip(file_path, extract_to, password:str=None):
                 if "wrong password" in err_line.lower():
                     result = -1
                     break
-                elif "cannot open the file as archive" in err_line.lower():
+                elif "cannot open" in err_line.lower():
                     result = -2
                     break
                 else:
