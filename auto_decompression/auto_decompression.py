@@ -18,6 +18,9 @@ pwdFilename = "dict.json"
 pwdDictionary = {}
 RECOVER_SUFFIX = ".AutoDecRecovered"
 
+def append_scr_path(relative_path):
+    return os.path.join(sys.path[0], relative_path)
+
 def print_info(message):
     """用蓝色打印普通信息喵"""
     console.out(message, style="blue")
@@ -333,9 +336,10 @@ import time
 from filelock import FileLock, Timeout
 
 # Function to send file path to the main instance
-queue_file_path = "queue_file.txt"
-queue_file_lock = "queue_file.lock"
-instance_lock = "instance.lock"
+queue_file_path = append_scr_path("queue_file.txt")
+queue_file_lock = append_scr_path("queue_file.lock")
+instance_lock = append_scr_path("instance.lock")
+
 def send_file_to_main_instance(file_paths):
     print(str(file_paths))
     lock = FileLock(queue_file_lock)
