@@ -328,66 +328,53 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level 
 
 SERVER_PORT = 65432
 
-import multiprocessing
-import threading
-import socket
+from multiprocessing import Process, Manager
+import time
+from filelock import FileLock, Timeout
 
 # Function to send file path to the main instance
-def send_file_to_main_instance(file_path):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
-        client.connect(("localhost", SERVER_PORT))
-        client.sendall(file_path.encode() + b"\n")
+queue_file_path = "queue_file.txt"
+queue_file_lock = "queue_file.lock"
+instance_lock = "instance.lock"
+def send_file_to_main_instance(file_paths):
+    print(str(file_paths))
+    lock = FileLock(queue_file_lock)
+    with lock.acquire(timeout=-1):
+        with open(queue_file_path, "a") as f:
+            for file in file_paths:
+                f.write(file + "\n")
 
-# Function to create a socket server to handle file paths
-class FileRequestHandler(threading.Thread):
-    def __init__(self, conn, server):
-        super().__init__()
-        self.conn = conn
-        self.server = server
+class FileManager:
+    def __init__(self):
+        manager = Manager()
+        self.files_to_process = manager.list()
+        self.process = Process(target=self.queue_listener)
+        self.process.start()
 
-    def run(self):
-        data = self.conn.recv(1024).strip().decode()
-        if data:
-            self.server.files_to_process.append(data)
-        self.conn.close()
-
-class FileServer:
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
-        self.files_to_process = []
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
-
-    def serve_forever(self):
+    def queue_listener(self):
         while True:
-            conn, _ = self.server_socket.accept()
-            handler = FileRequestHandler(conn, self)
-            handler.start()
+            lock = FileLock(queue_file_lock)
+            if os.path.exists(queue_file_path):
+                with lock.acquire(timeout = 0):
+                    with open(queue_file_path, "r") as f:
+                        lines = f.readlines()
+                    if lines:
+                        os.remove(queue_file_path)
+                        for line in lines:
+                            self.files_to_process.append(line.strip())
+            time.sleep(0.1)
 
-    def shutdown(self):
-        self.server_socket.close()
-
-
+    def stop(self):
+        self.process.terminate()
+    
+    def __del__(self):
+        self.stop()
 
 # Modified main function to support singleton behavior
 def main():
     global extract_to_base_folder
-    try:
-        # Try to send file paths to the existing instance
-        send_file_to_main_instance(sys.argv[1])
-        print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
-        return
-    except (ConnectionRefusedError, socket.error):
-        # No existing instance, continue to start a new one
-        pass
 
-    # Create socket server to listen for additional file paths
-    server = FileServer("localhost", SERVER_PORT)
-    server_thread = threading.Thread(target=server.serve_forever)
-    server_thread.daemon = True
-    server_thread.start()
+    manager = FileManager()
 
     check_passwords()
     files_to_process = sys.argv[1:]
@@ -410,10 +397,10 @@ def main():
                     recursive_extract(base_folder, file_path, global_last_success_password)
                     remove_autodec_files(base_folder)
                 save_passwords()
-                if not server.files_to_process:
+                if not manager.files_to_process:
                     break
-                files_to_process.extend(server.files_to_process)
-                server.files_to_process.clear()
+                files_to_process.extend(manager.files_to_process)
+                manager.files_to_process[:] = []  # 使用切片赋值清空列表
             print_info("解压完成，退出程序喵...")
         else:
             print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
@@ -427,14 +414,26 @@ def main():
                 else:
                     break
     except Exception as e:
-        print_error(f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}")
-        input()
-    finally:
-        server.shutdown()
+        error_end(e)
+
+def error_end(e:Exception = None):
+    print_error(f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}")
+    input()
 
 if __name__ == "__main__":
+    lock = FileLock(instance_lock)
     try:
-        main()
-    except Exception as e:
-        print_error(f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}")
-        input()
+        with lock.acquire(timeout = 0):
+            try:
+                main()
+                time.sleep(1)
+            except Exception as e:
+                error_end(e)
+    except Timeout:
+        if len(sys.argv) >= 2:
+            # Try to send file paths to the existing instance
+            send_file_to_main_instance(sys.argv[1:])
+        print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
+        pass
+    except Exception:
+        error_end()
