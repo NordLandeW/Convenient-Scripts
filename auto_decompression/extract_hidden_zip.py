@@ -1,3 +1,4 @@
+import shutil
 import sys
 import struct
 import os
@@ -14,7 +15,7 @@ ZIP_SIGNATURE = [b'PK\x03\x04']
 
 def find_signature_in_file(filename, signatures):
     """
-    在指定文件前部数据中搜索指定签名，返回 (pos, signature)，
+    在指定文件的前部数据中，以流式分块方式搜索任意指定签名，返回 (pos, signature)，
     找不到则返回 (None, None)。
     """
     file_size = os.path.getsize(filename)
@@ -25,25 +26,44 @@ def find_signature_in_file(filename, signatures):
     else:
         max_search_size = file_size
 
-    # 流式分块读取前 max_search_size 字节，并拼成一个 bytes 用于搜索
-    data_chunks = []
+    max_sig_len = max(len(sig) for sig in signatures)
+
     with open(filename, 'rb') as f:
         bytes_to_read = max_search_size
+        total_read = 0  # 已经读取的字节数
+        leftover = b""  # 用于处理跨块边界的残留数据
+
         while bytes_to_read > 0:
-            chunk = f.read(min(CHUNK_SIZE, bytes_to_read))
+            # 本次需要读取的块大小
+            chunk_size = min(CHUNK_SIZE, bytes_to_read)
+            chunk = f.read(chunk_size)
             if not chunk:
-                break
-            data_chunks.append(chunk)
-            bytes_to_read -= len(chunk)
+                break  # 文件读完
 
-    data = b"".join(data_chunks)
+            # 拼接 leftover 和当前 chunk
+            combined = leftover + chunk
 
-    # 在读取的数据中查找任一签名
-    for sig in signatures:
-        pos = data.find(sig)
-        if pos != -1:
-            return pos, sig
+            # 在 combined 中查找签名
+            for sig in signatures:
+                pos = combined.find(sig)
+                if pos != -1:
+                    # 找到后，计算在整个文件中的绝对位置
+                    absolute_pos = total_read - len(leftover) + pos
+                    return absolute_pos, sig
 
+            # 如果没找到，则将 combined 的后 (max_sig_len - 1) 字节留下来
+            # 防止签名跨 chunk 边界
+            if len(combined) >= max_sig_len - 1:
+                leftover = combined[-(max_sig_len - 1):]
+            else:
+                leftover = combined
+
+            # 累计读入的字节数
+            bytes_read_this_round = len(chunk)
+            total_read += bytes_read_this_round
+            bytes_to_read -= bytes_read_this_round
+
+    # 未找到签名
     return None, None
 
 
@@ -139,21 +159,17 @@ def has_embedded_signature(filename, signature):
 def extract_embedded_file(input_file, output_file, signature):
     """
     从 input_file 中找到 signature 对应的起始位置，一直读到文件尾，将数据写入 output_file。
+    采用 shutil.copyfileobj 实现分块拷贝，避免高内存占用。
     """
-    with open(input_file, 'rb') as f:
-        start_pos, sig = find_signature_in_file(input_file, signature)
-        if start_pos is None:
-            raise ValueError(f"无法找到指定文件的起始位置：{input_file}")
+    start_pos, sig = find_signature_in_file(input_file, signature)
+    if start_pos is None:
+        raise ValueError(f"无法找到指定文件的起始位置：{input_file}")
 
+    with open(input_file, 'rb') as f_in, open(output_file, 'wb') as f_out:
         # 移动到签名起始位置
-        f.seek(start_pos)
-
-        with open(output_file, 'wb') as out_file:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                out_file.write(chunk)
+        f_in.seek(start_pos)
+        # 使用 copyfileobj 的 length 参数控制单次拷贝的块大小，防止占用过多内存
+        shutil.copyfileobj(f_in, f_out, length=CHUNK_SIZE)
 
 
 if __name__ == "__main__":
