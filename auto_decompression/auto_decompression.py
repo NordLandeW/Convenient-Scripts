@@ -344,7 +344,7 @@ def send_file_to_main_instance(file_paths):
     print(str(file_paths))
     lock = FileLock(queue_file_lock)
     with lock.acquire(timeout=-1):
-        with open(queue_file_path, "a") as f:
+        with open(queue_file_path, "a", encoding="utf-8") as f:
             for file in file_paths:
                 f.write(file + "\n")
 
@@ -360,7 +360,7 @@ class FileManager:
             lock = FileLock(queue_file_lock)
             if os.path.exists(queue_file_path):
                 with lock.acquire(timeout = 0):
-                    with open(queue_file_path, "r") as f:
+                    with open(queue_file_path, "r", encoding="utf-8") as f:
                         lines = f.readlines()
                     if lines:
                         os.remove(queue_file_path)
@@ -425,8 +425,8 @@ def error_end(e:Exception = None):
     input()
 
 if __name__ == "__main__":
-    lock = FileLock(instance_lock)
     try:
+        lock = FileLock(instance_lock)
         with lock.acquire(timeout = 0):
             try:
                 main()
