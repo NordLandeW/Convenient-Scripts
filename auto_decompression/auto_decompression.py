@@ -142,6 +142,41 @@ def add_password(pwd, count = 1):
 import re
 import threading
 
+def get_total_split_size(file_path: str) -> int:
+    """
+    根据文件的“最后一个后缀之前”的部分来识别分卷文件。
+    假设 file_path = /path/to/abc.z01，
+    则 base_part = 'abc'，那么同目录下凡是 'abc.任意后缀' 的文件，都会被视为同一个分卷组并累加。
+    """
+    dir_name = os.path.dirname(file_path)
+    base_name = os.path.basename(file_path)
+    
+    # 如果没有最后一个 '.'，则视为没有后缀，直接返回当前文件大小
+    if '.' not in base_name:
+        return os.path.getsize(file_path)
+
+    # 取最后一个 '.' 之前的部分，比如：abc.zip -> ('abc', 'zip')；abc.z01 -> ('abc', 'z01')
+    base_part = base_name.rsplit('.', 1)[0]  # 'abc'
+
+    total_size = 0
+    # 遍历同一目录下的所有文件，判断“最后一个后缀之前”的部分是否和 base_part 一致
+    for fname in os.listdir(dir_name or '.'):
+        full_path = os.path.join(dir_name, fname)
+        # 排除目录
+        if not os.path.isfile(full_path):
+            continue
+
+        # 对当前文件名，也做同样的 rsplit 判断
+        if '.' in fname:
+            cur_base_part = fname.rsplit('.', 1)[0]
+            if cur_base_part == base_part:
+                total_size += os.path.getsize(full_path)
+        else:
+            # 没有后缀就不认同一分卷
+            pass
+
+    return total_size
+
 def extract_with_7zip(file_path, extract_to, password:str=None):
     """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
     command = ['7z', 'x', file_path, f'-o{extract_to}', '-y', '-bsp1', '-bb3']
@@ -153,7 +188,7 @@ def extract_with_7zip(file_path, extract_to, password:str=None):
     
     task = -1
     last_percent = 0
-    file_size = os.path.getsize(file_path)
+    file_size = get_total_split_size(file_path)
     result = 1
     err_log = ""
 
