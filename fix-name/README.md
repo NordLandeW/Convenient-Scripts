@@ -16,5 +16,7 @@ pip install -r requirements.txt
 
 ## 致谢
 常用字字典使用了下面列出的项目：
+
 [Kanji usage frequency](https://scriptin.github.io/kanji-frequency/)
+
 [nk2028/commonly-used-chinese-characters-and-words](https://github.com/nk2028/commonly-used-chinese-characters-and-words)
