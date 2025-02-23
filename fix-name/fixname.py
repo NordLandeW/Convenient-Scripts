@@ -7,8 +7,7 @@
 
 【新增功能】
 1. 可通过参数 --dict 指定一个常用字词典文件（默认 dict.txt），
-   文件中存放纯文本（无格式）的常用字符。在启发式评分时，
-   如果候选转换结果中出现字典内字符，则每个匹配加 3 分。
+   文件中存放纯文本（无格式）的常用字符。在启发式评分时， 如果候选转换结果中出现字典内字符，则每个匹配加 3 分。
 2. 脚本默认以预览模式运行。如果未同时指定 --current-enc 和 --actual-enc，
    则仅进行预览；只有当同时提供这两个参数时，才直接执行修复操作。
 3. 在预览模式下，脚本遍历所有文件/目录，展示各候选转换结果并累加全局得分，
@@ -79,8 +78,8 @@ def score_conversion(original, fixed, common_chars=None):
     if common_chars:
         bonus = sum(3 for ch in fixed if ch in common_chars)
     score = num_cjk + bonus - num_replace * 10
-    # 注意：原版本中如果 fixed 与 original 完全相同，会扣 5 分，
-    # 现修改为不做额外扣分。
+    if fixed == original:
+        score -= 10
     return score
 
 def process_item(name, global_candidate_scores, global_candidate_examples, common_chars):
@@ -136,8 +135,20 @@ def preview_mode(directory, dict_file):
     global_candidate_scores = {}     # 键：(cur_enc, act_enc)；值：累计得分
     global_candidate_examples = {}     # 键：(cur_enc, act_enc)；值：[(原名称, 转换后名称), ...]
 
-    # 遍历所有文件和目录
+    # 遍历所有文件和目录，检查路径本身
     for root, dirs, files in os.walk(directory):
+        # 检查当前路径（文件夹路径）本身
+        print(f"\n【路径】：{root}")
+        candidates = process_item(root, global_candidate_scores, global_candidate_examples, common_chars)
+        for score, cur_enc, act_enc, fixed in candidates:
+            if score >= 5:
+                color = Fore.GREEN
+            elif score >= 0:
+                color = Fore.YELLOW
+            else:
+                color = Fore.RED
+            print(f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}")
+        
         # 处理文件
         for name in files:
             full_path = os.path.join(root, name)
@@ -151,6 +162,7 @@ def preview_mode(directory, dict_file):
                 else:
                     color = Fore.RED
                 print(f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}")
+        
         # 处理目录
         for name in dirs:
             full_path = os.path.join(root, name)
@@ -203,6 +215,12 @@ def fix_mode(directory, current_enc, actual_enc):
         如果目标名称已存在，则提示并跳过。
     """
     for root, dirs, files in os.walk(directory, topdown=False):
+        # 检查并修复路径本身
+        new_root = get_fixed_name(root, current_enc, actual_enc)
+        if new_root and new_root != root:
+            os.rename(root, new_root)
+            print(f"目录重命名：\n  {root}\n  -->\n  {new_root}")
+        
         for name in files:
             new_name = get_fixed_name(name, current_enc, actual_enc)
             if new_name is None or new_name == name:
@@ -217,6 +235,7 @@ def fix_mode(directory, current_enc, actual_enc):
                     print(f"文件重命名：\n  {old_path}\n  -->\n  {new_path}")
                 except Exception as e:
                     print(f"{Fore.RED}重命名失败：{old_path} -> {new_path}，错误：{e}{Style.RESET_ALL}")
+        
         for name in dirs:
             new_name = get_fixed_name(name, current_enc, actual_enc)
             if new_name is None or new_name == name:
