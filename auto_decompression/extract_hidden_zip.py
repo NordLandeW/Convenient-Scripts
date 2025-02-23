@@ -1,175 +1,141 @@
 import shutil
 import sys
-import struct
 import os
+import json
+import subprocess
 
 # 可调整参数
-STREAMING_SIZE_THRESHOLD = 3 * 1024 * 1024 * 1024  # 3GB 阈值
-SEARCH_RATIO = 0.2  # 只在前 20% 的文件内容中搜索
 CHUNK_SIZE = 256 * 1024 * 1024  # 256 MB
 
-# 定义 RAR 和 ZIP 的签名
-RAR_SIGNATURE = [b'Rar!\x1A\x07\x00', b'Rar!\x1A\x07\x01\x00']
-ZIP_SIGNATURE = [b'PK\x03\x04']
+# 用于缓存 binwalk 安装检测结果，避免重复检测
+_BINWALK_INSTALLED = None
 
-
-def find_signature_in_file(filename, signatures):
+def _check_binwalk_installed():
     """
-    在指定文件的前部数据中，以流式分块方式搜索任意指定签名，返回 (pos, signature)，
-    找不到则返回 (None, None)。
+    检查系统中是否安装了 binwalk，可根据需要修改检查方式:
+    - 使用 shutil.which("binwalk")
+    - 或者通过 subprocess.run(["binwalk", "--help"])
+    返回 True/False，并在未安装时输出提示。
     """
-    file_size = os.path.getsize(filename)
+    global _BINWALK_INSTALLED
+    if _BINWALK_INSTALLED is not None:
+        return _BINWALK_INSTALLED
 
-    # 根据文件大小决定最多读取的字节数
-    if file_size > STREAMING_SIZE_THRESHOLD:
-        max_search_size = int(file_size * SEARCH_RATIO)
+    # 示例：使用 shutil.which 检测
+    found = shutil.which("binwalk")
+    if not found:
+        print("未检测到 binwalk，可执行文件。请先安装 binwalk。")
+        _BINWALK_INSTALLED = False
     else:
-        max_search_size = file_size
+        _BINWALK_INSTALLED = True
 
-    max_sig_len = max(len(sig) for sig in signatures)
-
-    with open(filename, 'rb') as f:
-        bytes_to_read = max_search_size
-        total_read = 0  # 已经读取的字节数
-        leftover = b""  # 用于处理跨块边界的残留数据
-
-        while bytes_to_read > 0:
-            # 本次需要读取的块大小
-            chunk_size = min(CHUNK_SIZE, bytes_to_read)
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break  # 文件读完
-
-            # 拼接 leftover 和当前 chunk
-            combined = leftover + chunk
-
-            # 在 combined 中查找签名
-            for sig in signatures:
-                pos = combined.find(sig)
-                if pos != -1:
-                    # 找到后，计算在整个文件中的绝对位置
-                    absolute_pos = total_read - len(leftover) + pos
-                    return absolute_pos, sig
-
-            # 如果没找到，则将 combined 的后 (max_sig_len - 1) 字节留下来
-            # 防止签名跨 chunk 边界
-            if len(combined) >= max_sig_len - 1:
-                leftover = combined[-(max_sig_len - 1):]
-            else:
-                leftover = combined
-
-            # 累计读入的字节数
-            bytes_read_this_round = len(chunk)
-            total_read += bytes_read_this_round
-            bytes_to_read -= bytes_read_this_round
-
-    # 未找到签名
-    return None, None
+    return _BINWALK_INSTALLED
 
 
-def read_vint(file_obj):
+def _get_binwalk_analysis(filename):
     """
-    读取可变长度整数（vint）。
-    参考 RAR 文档中对 Header Size、Header Type 等字段的可变长度编码描述。
+    调用 binwalk 并返回解析后的 JSON 结果。
+    如果 binwalk 不可用，则直接返回空列表。
     """
-    result = 0
-    shift = 0
-    while True:
-        byte = file_obj.read(1)
-        if not byte:
-            raise EOFError("Unexpected end of file while reading vint.")
-        byte_val = byte[0]  # 等价于 ord(byte) ，更符合 Python3 习惯
-        result |= (byte_val & 0x7F) << shift
-        if not (byte_val & 0x80):
-            break
-        shift += 7
-    return result
+    if not _check_binwalk_installed():
+        return []  # 无法执行 binwalk，则返回空
+
+    # Windows 下若 binwalk.exe 在同级目录，可写:
+    # cmd = [".\\binwalk.exe", filename, "-l", "-", "-q"]
+    cmd = ["binwalk", filename, "-l", "-", "-q"]
+    try:
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as e:
+        print(f"调用 binwalk 出错：{e}")
+        return []
+
+    try:
+        parsed = json.loads(output)
+        return parsed
+    except json.JSONDecodeError:
+        print("无法解析 binwalk 的 JSON 输出。")
+        return []
+
+
+def _pick_highest_confidence(filename, signature):
+    """
+    从 binwalk 的 JSON 输出中选出与 signature 匹配的最高置信度结果。
+    - signature 为 "*" 时，表示可接受任何格式（name）。
+    - 否则按照忽略大小写匹配格式名称。
+    返回值示例: (offset, size, name, confidence)，若没找到则返回 None。
+    """
+    data = _get_binwalk_analysis(filename)
+    if not data:
+        return None
+
+    # binwalk 的 JSON 输出通常是长度为 1 的数组
+    analysis = data[0].get("Analysis", {}) if len(data) > 0 else {}
+    file_map = analysis.get("file_map", [])
+
+    candidate = None  # (offset, size, name, confidence)
+    sig_lower = signature.lower()
+
+    for item in file_map:
+        item_name = str(item.get("name", "")).lower()
+        conf = item.get("confidence", 0)
+        off = item.get("offset", 0)
+        sz = item.get("size", 0)
+
+        # 如果 signature == "*"，表示接受任何格式；否则需精确匹配
+        if (sig_lower == "*") or (item_name == sig_lower):
+            # 选取 confidence 最大的
+            if candidate is None or conf > candidate[3]:
+                candidate = (off, sz, item_name, conf)
+
+    return candidate
 
 
 def has_embedded_signature(filename, signature):
     """
-    检查 filename 文件内是否包含指定(或指定列表) signature 并进行初步有效性验证，
+    检查 filename 文件内是否包含指定(或指定列表) signature，并进行初步有效性验证，
     若有效，则返回 True，否则返回 False。
-    """
-    # 如果传入的 signature 非列表，则转换成列表处理
-    if not isinstance(signature, list):
-        signature = [signature]
 
-    # 查找签名位置
-    pos, matched_signature = find_signature_in_file(filename, signature)
-    if pos is None:
+    这里附加需求：
+    - 若 binwalk 未安装，提示用户后返回 False。
+    - 若最高置信度 <= 200，则也返回 False。
+    """
+    if not _check_binwalk_installed():
+        # binwalk 不可用，直接返回 False
         return False
 
-    # 进一步验证文件头是否真的有效
-    with open(filename, 'rb') as f:
-        f.seek(pos + len(matched_signature))
+    chosen = _pick_highest_confidence(filename, signature)
+    if chosen is None:
+        return False
 
-        # 如果匹配到的是 ZIP 签名
-        if matched_signature in ZIP_SIGNATURE:
-            # 读取 ZIP 本地文件头的额外 30 个字节进行验证
-            header_data = f.read(30)
-            if len(header_data) < 30:
-                return False
-
-            try:
-                # 解包字段：版本、通用位标记、压缩方法等
-                version, flag, method, mod_time, mod_date, crc32, comp_size, \
-                    uncomp_size, filename_len, extra_len = struct.unpack('<HHHHHIIIHH', header_data[:26])
-                
-                filename_inner = f.read(filename_len)
-                extra_field = f.read(extra_len)
-
-                # 严格验证：检查文件名长度、扩展字段长度和压缩方法
-                if (
-                    filename_len >= 0 and extra_len >= 0
-                    and method in (0, 8, 12, 14)  # 有效压缩方法
-                    and len(filename_inner) == filename_len
-                    and len(extra_field) == extra_len
-                ):
-                    return True
-            except struct.error:
-                return False
-
-        # 如果匹配到的是 RAR 签名
-        elif matched_signature in RAR_SIGNATURE:
-            # 验证 RAR marker block 和 archive header
-            try:
-                # 读取 Header CRC32
-                header_crc32 = f.read(4)
-                if len(header_crc32) < 4:
-                    return False
-
-                # 读取 Header size (vint)
-                header_size = read_vint(f)
-                # 读取 Header type (vint)
-                header_type = read_vint(f)
-
-                # 检查 Header type 是否是有效类型
-                if header_type not in (1, 2, 3, 4, 5):
-                    return False
-
-                # 如果通过检查，认为这是一个有效的 RAR 文件
-                return True
-            except (EOFError, struct.error):
-                return False
-
-    return False
+    offset, size, name, confidence = chosen
+    # 只有当 confidence > 200 时才返回 True
+    return confidence > 200
 
 
 def extract_embedded_file(input_file, output_file, signature):
     """
-    从 input_file 中找到 signature 对应的起始位置，一直读到文件尾，将数据写入 output_file。
-    采用 shutil.copyfileobj 实现分块拷贝，避免高内存占用。
+    在符合的 signature 结果中找置信度最高的进行提取。
+    注意：此处并未对 confidence 做限制，如果需要也可再加判断。
+    若未找到符合的，则抛出 ValueError。
     """
-    start_pos, sig = find_signature_in_file(input_file, signature)
-    if start_pos is None:
-        raise ValueError(f"无法找到指定文件的起始位置：{input_file}")
+    chosen = _pick_highest_confidence(input_file, signature)
+    if chosen is None:
+        raise ValueError(f"无法找到指定格式({signature})的嵌入文件：{input_file}")
+
+    offset, size, name, conf = chosen
+    if size <= 0:
+        raise ValueError(f"从 binwalk 中解析得到的 size={size} 不合法，无法提取。")
 
     with open(input_file, 'rb') as f_in, open(output_file, 'wb') as f_out:
-        # 移动到签名起始位置
-        f_in.seek(start_pos)
-        # 使用 copyfileobj 的 length 参数控制单次拷贝的块大小，防止占用过多内存
-        shutil.copyfileobj(f_in, f_out, length=CHUNK_SIZE)
+        f_in.seek(offset)
+        bytes_left = size
+        while bytes_left > 0:
+            chunk_size = min(CHUNK_SIZE, bytes_left)
+            data = f_in.read(chunk_size)
+            if not data:
+                break
+            f_out.write(data)
+            bytes_left -= len(data)
 
 
 if __name__ == "__main__":
@@ -179,20 +145,15 @@ if __name__ == "__main__":
 
     for input_file in sys.argv[1:]:
         try:
-            # 先检测 ZIP
-            if has_embedded_signature(input_file, ZIP_SIGNATURE):
+            if has_embedded_signature(input_file, "zip"):
                 output_zip = f"{input_file}_embedded.zip"
-                extract_embedded_file(input_file, output_zip, ZIP_SIGNATURE)
+                extract_embedded_file(input_file, output_zip, "zip")
                 print(f"成功提取 ZIP 文件: {output_zip}")
+            elif has_embedded_signature(input_file, "rar"):
+                output_rar = f"{input_file}_embedded.rar"
+                extract_embedded_file(input_file, output_rar, "rar")
+                print(f"成功提取 RAR 文件: {output_rar}")
             else:
-                # 再检测 RAR
-                for rar_sig in RAR_SIGNATURE:
-                    if has_embedded_signature(input_file, rar_sig):
-                        output_rar = f"{input_file}_embedded.rar"
-                        extract_embedded_file(input_file, output_rar, rar_sig)
-                        print(f"成功提取 RAR 文件: {output_rar}")
-                        break
-                else:
-                    print(f"文件 {input_file} 中未发现嵌入的 ZIP 或 RAR 文件。")
+                print(f"{input_file} 中未发现 (confidence > 200) 的 ZIP 或 RAR 文件。")
         except Exception as e:
             print(f"处理文件 {input_file} 时出错: {e}")
