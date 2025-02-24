@@ -32,23 +32,36 @@ import sys
 import argparse
 import random
 import time
+import loguru
 from colorama import init, Fore, Style
 
 # 初始化 colorama（在 Windows 下处理 ANSI 颜色转码）
 init(autoreset=True)
 
 # 针对 CJK 常用的候选编码列表
-CANDIDATE_ENCODINGS = ["gb18030", "gbk", "gb2312", "big5", "shift_jis", "euc-kr", "utf-8"]
+CANDIDATE_ENCODINGS = [
+    "gb18030",
+    "gbk",
+    "gb2312",
+    "big5",
+    "shift_jis",
+    "euc-kr",
+    "utf-8",
+]
+
 
 def is_cjk(ch):
     """
     判断字符是否属于常用 CJK 区间（含中日韩常用字）
     """
     code = ord(ch)
-    return ((0x4E00 <= code <= 0x9FFF) or    # 中日韩统一表意文字
-            (0x3400 <= code <= 0x4DBF) or    # 中日韩统一表意文字扩展 A
-            (0x3040 <= code <= 0x30FF) or    # 日文平假名、片假名
-            (0xAC00 <= code <= 0xD7AF))      # 韩文音节
+    return (
+        (0x4E00 <= code <= 0x9FFF)  # 中日韩统一表意文字
+        or (0x3400 <= code <= 0x4DBF)  # 中日韩统一表意文字扩展 A
+        or (0x3040 <= code <= 0x30FF)  # 日文平假名、片假名
+        or (0xAC00 <= code <= 0xD7AF)
+    )  # 韩文音节
+
 
 def get_fixed_name(original, current_enc, actual_enc):
     """
@@ -58,10 +71,13 @@ def get_fixed_name(original, current_enc, actual_enc):
     errors='replace' 保证出错时用替换符“�”填充。
     """
     try:
-        fixed = original.encode(current_enc, errors='replace').decode(actual_enc, errors='replace')
+        fixed = original.encode(current_enc, errors="replace").decode(
+            actual_enc, errors="replace"
+        )
         return fixed
     except Exception as e:
         return None
+
 
 def score_conversion(original, fixed, common_chars=None):
     """
@@ -82,7 +98,10 @@ def score_conversion(original, fixed, common_chars=None):
         score -= 10
     return score
 
-def process_item(name, global_candidate_scores, global_candidate_examples, common_chars):
+
+def process_item(
+    name, global_candidate_scores, global_candidate_examples, common_chars
+):
     """
     对单个文件或目录名称，尝试所有候选转换，并更新全局统计字典和示例字典。
 
@@ -106,6 +125,7 @@ def process_item(name, global_candidate_scores, global_candidate_examples, commo
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates
 
+
 def preview_mode(directory, dict_file):
     """
     预览模式：
@@ -119,27 +139,35 @@ def preview_mode(directory, dict_file):
     common_chars = None
     if dict_file and os.path.exists(dict_file):
         try:
-            with open(dict_file, 'r', encoding='utf-8') as f:
+            with open(dict_file, "r", encoding="utf-8") as f:
                 text = f.read()
                 # 去除空白字符后得到常用字符集合
                 common_chars = set(ch for ch in text if not ch.isspace())
             print(f"加载常用字词典：{dict_file}，共 {len(common_chars)} 个字符")
         except Exception as e:
-            print(f"{Fore.RED}加载字典文件 {dict_file} 失败，忽略字典加分项，错误：{e}{Style.RESET_ALL}")
+            print(
+                f"{Fore.RED}加载字典文件 {dict_file} 失败，忽略字典加分项，错误：{e}{Style.RESET_ALL}"
+            )
             common_chars = None
     else:
         if dict_file:
-            print(f"{Fore.YELLOW}字典文件 {dict_file} 不存在，将忽略字典加分项。{Style.RESET_ALL}")
+            print(
+                f"{Fore.YELLOW}字典文件 {dict_file} 不存在，将忽略字典加分项。{Style.RESET_ALL}"
+            )
         common_chars = None
 
-    global_candidate_scores = {}     # 键：(cur_enc, act_enc)；值：累计得分
-    global_candidate_examples = {}     # 键：(cur_enc, act_enc)；值：[(原名称, 转换后名称), ...]
+    global_candidate_scores = {}  # 键：(cur_enc, act_enc)；值：累计得分
+    global_candidate_examples = (
+        {}
+    )  # 键：(cur_enc, act_enc)；值：[(原名称, 转换后名称), ...]
 
     # 遍历所有文件和目录，检查路径本身
     for root, dirs, files in os.walk(directory):
         # 检查当前路径（文件夹路径）本身
         print(f"\n【路径】：{root}")
-        candidates = process_item(root, global_candidate_scores, global_candidate_examples, common_chars)
+        candidates = process_item(
+            root, global_candidate_scores, global_candidate_examples, common_chars
+        )
         for score, cur_enc, act_enc, fixed in candidates:
             if score >= 5:
                 color = Fore.GREEN
@@ -147,13 +175,17 @@ def preview_mode(directory, dict_file):
                 color = Fore.YELLOW
             else:
                 color = Fore.RED
-            print(f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}")
-        
+            print(
+                f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}"
+            )
+
         # 处理文件
         for name in files:
             full_path = os.path.join(root, name)
             print(f"\n【文件】：{full_path}")
-            candidates = process_item(name, global_candidate_scores, global_candidate_examples, common_chars)
+            candidates = process_item(
+                name, global_candidate_scores, global_candidate_examples, common_chars
+            )
             for score, cur_enc, act_enc, fixed in candidates:
                 if score >= 5:
                     color = Fore.GREEN
@@ -161,13 +193,17 @@ def preview_mode(directory, dict_file):
                     color = Fore.YELLOW
                 else:
                     color = Fore.RED
-                print(f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}")
-        
+                print(
+                    f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}"
+                )
+
         # 处理目录
         for name in dirs:
             full_path = os.path.join(root, name)
             print(f"\n【目录】：{full_path}")
-            candidates = process_item(name, global_candidate_scores, global_candidate_examples, common_chars)
+            candidates = process_item(
+                name, global_candidate_scores, global_candidate_examples, common_chars
+            )
             for score, cur_enc, act_enc, fixed in candidates:
                 if score >= 5:
                     color = Fore.GREEN
@@ -175,12 +211,16 @@ def preview_mode(directory, dict_file):
                     color = Fore.YELLOW
                 else:
                     color = Fore.RED
-                print(f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}")
+                print(
+                    f"  [{cur_enc:>9} -> {act_enc:<9}] Score: {score:>3} : {color}{fixed}{Style.RESET_ALL}"
+                )
 
     # 全局统计输出：选出累计得分最高的 10 个候选转换选项，并随机抽样展示 3 个示例
     print("\n============================")
     print("【总体候选转换统计】")
-    sorted_global = sorted(global_candidate_scores.items(), key=lambda x: x[1], reverse=True)
+    sorted_global = sorted(
+        global_candidate_scores.items(), key=lambda x: x[1], reverse=True
+    )
     top_10 = sorted_global[:10]
     for (cur_enc, act_enc), total_score in top_10:
         print(f"\n  [{cur_enc:>9} -> {act_enc:<9}] Aggregated Score: {total_score}")
@@ -198,68 +238,114 @@ def preview_mode(directory, dict_file):
     if sorted_global:
         best_key, best_score = sorted_global[0]
         best_cur_enc, best_act_enc = best_key
-        choice = input("是否使用全局最高评分候选项 [%s -> %s] 直接进行修复? (y/n): " % (best_cur_enc, best_act_enc))
-        if choice.strip().lower() == 'y':
-            print("开始使用候选转换方案 [%s -> %s] 进行文件名修复..." % (best_cur_enc, best_act_enc))
+        choice = input(
+            "是否使用全局最高评分候选项 [%s -> %s] 直接进行修复? (y/n): "
+            % (best_cur_enc, best_act_enc)
+        )
+        if choice.strip().lower() == "y":
+            print(
+                "开始使用候选转换方案 [%s -> %s] 进行文件名修复..."
+                % (best_cur_enc, best_act_enc)
+            )
             fix_mode(directory, best_cur_enc, best_act_enc)
             print("修复完成。")
         else:
             print("未进行修复操作。")
 
+
 def fix_mode(directory, current_enc, actual_enc):
     """
     实际修复模式：
-      - 遍历目录及其子目录，对文件和目录名称使用指定的编码进行转换重命名。
-      - 遍历采用自底向上方式，避免先重命名父目录而影响后续处理。
+      - 若根目录本身需要转换名称，则先行处理。
+      - 再自底向上遍历目录及其子目录，对文件和目录名称使用指定编码转换后重命名。
       - 如果转换后名称与原名称相同或转换失败，则跳过重命名；
         如果目标名称已存在，则提示并跳过。
     """
+    directory = os.path.abspath(directory)
+
+    # 先尝试修复根目录名称
+    root_dir_name = os.path.basename(directory)
+    fixed_root_name = get_fixed_name(root_dir_name, current_enc, actual_enc)
+    if fixed_root_name and fixed_root_name != root_dir_name:
+        parent_dir = os.path.dirname(directory)
+        new_root_path = os.path.join(parent_dir, fixed_root_name)
+        if os.path.exists(new_root_path):
+            print(
+                f"{Fore.RED}跳过根目录：{directory} —— 目标名称 {new_root_path} 已存在！{Style.RESET_ALL}"
+            )
+        else:
+            try:
+                os.rename(directory, new_root_path)
+                print(f"根目录重命名：\n  {directory}\n  -->\n  {new_root_path}")
+                directory = new_root_path  # 更新为新的根目录
+            except Exception as e:
+                print(
+                    f"{Fore.RED}重命名失败：{directory} -> {new_root_path}，错误：{e}{Style.RESET_ALL}"
+                )
+
+    # 开始自底向上遍历并修复
     for root, dirs, files in os.walk(directory, topdown=False):
-        # 检查并修复路径本身
-        new_root = get_fixed_name(root, current_enc, actual_enc)
-        if new_root and new_root != root:
-            os.rename(root, new_root)
-            print(f"目录重命名：\n  {root}\n  -->\n  {new_root}")
-        
-        for name in files:
-            new_name = get_fixed_name(name, current_enc, actual_enc)
-            if new_name is None or new_name == name:
-                continue
-            old_path = os.path.join(root, name)
-            new_path = os.path.join(root, new_name)
-            if os.path.exists(new_path):
-                print(f"{Fore.RED}跳过文件：{old_path} —— 目标名称 {new_path} 已存在！{Style.RESET_ALL}")
-            else:
-                try:
-                    os.rename(old_path, new_path)
-                    print(f"文件重命名：\n  {old_path}\n  -->\n  {new_path}")
-                except Exception as e:
-                    print(f"{Fore.RED}重命名失败：{old_path} -> {new_path}，错误：{e}{Style.RESET_ALL}")
-        
+        # 修复子目录名称
         for name in dirs:
             new_name = get_fixed_name(name, current_enc, actual_enc)
-            if new_name is None or new_name == name:
+            # 新名称无效或相同则跳过
+            if not new_name or new_name == name:
                 continue
+
             old_path = os.path.join(root, name)
             new_path = os.path.join(root, new_name)
+
             if os.path.exists(new_path):
-                print(f"{Fore.RED}跳过目录：{old_path} —— 目标名称 {new_path} 已存在！{Style.RESET_ALL}")
+                print(
+                    f"{Fore.RED}跳过目录：{old_path} —— 目标名称 {new_path} 已存在！{Style.RESET_ALL}"
+                )
             else:
                 try:
                     os.rename(old_path, new_path)
                     print(f"目录重命名：\n  {old_path}\n  -->\n  {new_path}")
                 except Exception as e:
-                    print(f"{Fore.RED}重命名失败：{old_path} -> {new_path}，错误：{e}{Style.RESET_ALL}")
+                    print(
+                        f"{Fore.RED}重命名失败：{old_path} -> {new_path}，错误：{e}{Style.RESET_ALL}"
+                    )
+
+        # 修复文件名称
+        for name in files:
+            new_name = get_fixed_name(name, current_enc, actual_enc)
+            if not new_name or new_name == name:
+                continue
+
+            old_path = os.path.join(root, name)
+            new_path = os.path.join(root, new_name)
+
+            if os.path.exists(new_path):
+                print(
+                    f"{Fore.RED}跳过文件：{old_path} —— 目标名称 {new_path} 已存在！{Style.RESET_ALL}"
+                )
+            else:
+                try:
+                    os.rename(old_path, new_path)
+                    print(f"文件重命名：\n  {old_path}\n  -->\n  {new_path}")
+                except Exception as e:
+                    print(
+                        f"{Fore.RED}重命名失败：{old_path} -> {new_path}，错误：{e}{Style.RESET_ALL}"
+                    )
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="修复文件名乱码的脚本（主要针对 CJK 文字），支持常用字词典加分，并默认以预览模式运行。"
     )
     parser.add_argument("--dir", default=".", help="指定遍历的目录（默认当前目录）")
-    parser.add_argument("--current-enc", help="当前文件名错误解码时所用的编码（如 gbk）")
+    parser.add_argument(
+        "--current-enc", help="当前文件名错误解码时所用的编码（如 gbk）"
+    )
     parser.add_argument("--actual-enc", help="原始正确的文件名编码（如 utf-8）")
-    parser.add_argument("--dict", dest="dict_file", default="dict.txt",
-                        help="指定常用字词典文件路径，默认为 dict.txt")
+    parser.add_argument(
+        "--dict",
+        dest="dict_file",
+        default="dict.txt",
+        help="指定常用字词典文件路径，默认为 dict.txt",
+    )
     args = parser.parse_args()
     directory = args.dir
 
@@ -273,5 +359,10 @@ def main():
     print("\n脚本将在 5 秒后退出...")
     time.sleep(5)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        loguru.logger.exception("程序报错：{e}")
+        input()
