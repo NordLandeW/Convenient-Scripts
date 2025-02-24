@@ -13,19 +13,19 @@ import ctypes
 from ctypes import c_void_p, c_size_t, memmove, windll
 from loguru import logger
 
+import math
+import os
+
 def compute_score(img_path, screen_ratio, max_area, max_size):
     info = get_image_info(img_path)
     if info is None:
         return -10000
     width, height, ratio, file_size = info
+
     # 1. 比例评分（最高100分）
-    if screen_ratio == 0:
-        score_aspect = 0
-    else:
-        alpha = 5.0  # 可以根据实际需求调整
-        normalized_diff = min(1, abs(ratio - screen_ratio) / screen_ratio)
-        score_aspect = 100.0 * math.exp(-alpha * normalized_diff)
-    # 2. 格式评分
+    score_aspect = aspect_ratio_score(ratio, screen_ratio)
+
+    # 2. 格式评分（保持原有逻辑）
     ext = os.path.splitext(img_path)[1].lower()
     if ext == '.png':
         score_format = 20
@@ -35,6 +35,7 @@ def compute_score(img_path, screen_ratio, max_area, max_size):
         score_format = -1000
     else:
         score_format = 0
+
     # 3. 分辨率评分（最高60分）
     if width * height >= 3840 * 2160:  # 4K
         score_resolution = 60
@@ -46,9 +47,36 @@ def compute_score(img_path, screen_ratio, max_area, max_size):
         score_resolution = 10
     else:
         score_resolution = -40
+
     # 4. 文件大小评分（最高30分）
     score_filesize = 30 * (file_size / max_size) if max_size > 0 else 0
+    
     return score_aspect + score_format + score_resolution + score_filesize
+
+def aspect_ratio_score(image_ratio, desired_ratio):
+    """
+    使用倍数偏离度 + 高斯衰减计算纵横比评分，返回 [0, 100] 区间的分数。
+    """
+    # 如果只接受宽屏，可在这里加一条限制
+    # if image_ratio < 1:
+    #    return 0  # 或者只给个极低的上限，比如 return 10
+
+    # 倍数偏离度: ratio_factor >= 1
+    # ratio_factor = 1 表示与期望值相同
+    # ratio_factor = 2 表示宽（或窄）了一倍
+    ratio_factor = max(image_ratio / desired_ratio, desired_ratio / image_ratio)
+    
+    # 若 ratio_factor=1 则 perfect；越大(或越小)表示偏离越大
+    # 这里选择高斯衰减：score = 100 * exp( -alpha * ( ln(rf) )^2 )
+    alpha = 2.0          # 惩罚因子，可调大一点，如果希望对偏离更敏感
+    max_score = 100.0    # 纵横比评分的满分
+    # 取 ln(ratio_factor)，无论是 >1 还是 <1，平方后一样对待
+    diff = math.log(ratio_factor)
+    # 高斯衰减
+    raw_score = max_score * math.exp(-alpha * (diff ** 2))
+
+    # 也可以再根据是否是大于1还是小于1做一个额外的微调（可选）
+    return raw_score
 
 def get_image_info(filepath):
     """
@@ -333,6 +361,8 @@ class PreviewWindow:
         self.img_path = self.image_list[self.index]
         self.top = tk.Toplevel(master)
         self.top.title(f"预览: {os.path.basename(self.img_path)}")
+        self.top.focus_force()
+        self.top.lift()
         sw = master.winfo_screenwidth()
         sh = master.winfo_screenheight()
         w = int(sw * 0.75)
