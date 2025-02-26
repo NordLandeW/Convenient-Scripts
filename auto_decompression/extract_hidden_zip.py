@@ -10,6 +10,9 @@ CHUNK_SIZE = 256 * 1024 * 1024  # 256 MB
 # 用于缓存 binwalk 安装检测结果，避免重复检测
 _BINWALK_INSTALLED = None
 
+# 用于缓存针对每个文件的 binwalk 检测结果，避免重复检测
+_BINWALK_RESULTS_CACHE = {}
+
 def _check_binwalk_installed():
     """
     检查系统中是否安装了 binwalk，可根据需要修改检查方式:
@@ -40,6 +43,10 @@ def _get_binwalk_analysis(filename):
     if not _check_binwalk_installed():
         return []  # 无法执行 binwalk，则返回空
 
+    global _BINWALK_RESULTS_CACHE
+    if filename in _BINWALK_RESULTS_CACHE:
+        return _BINWALK_RESULTS_CACHE[filename]
+
     # Windows 下若 binwalk.exe 在同级目录，可写:
     # cmd = [".\\binwalk.exe", filename, "-l", "-", "-q"]
     cmd = ["binwalk", filename, "-l", "-", "-q"]
@@ -51,10 +58,12 @@ def _get_binwalk_analysis(filename):
 
     try:
         parsed = json.loads(output)
-        return parsed
     except json.JSONDecodeError:
         print("无法解析 binwalk 的 JSON 输出。")
-        return []
+        parsed = []
+
+    _BINWALK_RESULTS_CACHE[filename] = parsed
+    return parsed
 
 
 def _pick_highest_confidence(filename, signature):
