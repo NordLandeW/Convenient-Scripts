@@ -357,9 +357,9 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
                 file_path, temp_folder, passwords, password
             ) or manual_password_entry(file_path, temp_folder, level)
             break
-        elif tryResult == -2 and level <= 2 and RECOVER_SUFFIX not in file_path:
+        elif tryResult == -2:
             for fmt in ["zip", "rar", "7z", "*"]:
-                if hiddenZip.has_embedded_signature(file_path, fmt):
+                if level <= 2 and RECOVER_SUFFIX not in file_path and hiddenZip.has_embedded_signature(file_path, fmt):
                     print_info(
                         f"发现文件嵌入了隐藏{"的某个文件" if fmt == "*" else fmt.upper()}喵，准备处理喵！"
                     )
@@ -368,9 +368,9 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
                     )
                     file_path = file_path + RECOVER_SUFFIX
                     break
-            else:
-                try_remove_directory(temp_folder)
-                return True
+                else:
+                    try_remove_directory(temp_folder)
+                    return True
         else:
             break
 
