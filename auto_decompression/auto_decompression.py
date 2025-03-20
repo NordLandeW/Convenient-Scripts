@@ -357,7 +357,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
                 file_path, temp_folder, passwords, password
             ) or manual_password_entry(file_path, temp_folder, level)
             break
-        elif tryResult == -2:
+        elif tryResult == -2 and level <= 2 and RECOVER_SUFFIX not in file_path:
             for fmt in ["zip", "rar", "7z", "*"]:
                 if hiddenZip.has_embedded_signature(file_path, fmt):
                     print_info(
