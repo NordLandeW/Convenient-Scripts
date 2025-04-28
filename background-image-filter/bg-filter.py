@@ -7,14 +7,16 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import struct
 import ctypes
 from ctypes import c_void_p, c_size_t, memmove, windll
 from loguru import logger
 
-import math
-import os
+def _print_progress(cur, total, prefix=""):
+    pct = cur * 100 // total
+    sys.stdout.write(f"\r{prefix}{cur}/{total}  {pct}%")
+    sys.stdout.flush()
 
 def compute_score(img_path, screen_ratio, max_area, max_size):
     info = get_image_info(img_path)
@@ -50,55 +52,31 @@ def compute_score(img_path, screen_ratio, max_area, max_size):
 
     # 4. 文件大小评分（最高30分）
     score_filesize = 30 * (file_size / max_size) if max_size > 0 else 0
-    
+
     return score_aspect + score_format + score_resolution + score_filesize
 
+
 def aspect_ratio_score(image_ratio, desired_ratio):
-    """
-    使用倍数偏离度 + 高斯衰减计算纵横比评分，返回 [0, 100] 区间的分数。
-    """
-    # 如果只接受宽屏，可在这里加一条限制
-    # if image_ratio < 1:
-    #    return 0  # 或者只给个极低的上限，比如 return 10
-
-    # 倍数偏离度: ratio_factor >= 1
-    # ratio_factor = 1 表示与期望值相同
-    # ratio_factor = 2 表示宽（或窄）了一倍
     ratio_factor = max(image_ratio / desired_ratio, desired_ratio / image_ratio)
-    
-    # 若 ratio_factor=1 则 perfect；越大(或越小)表示偏离越大
-    # 这里选择高斯衰减：score = 100 * exp( -alpha * ( ln(rf) )^2 )
-    alpha = 2.0          # 惩罚因子，可调大一点，如果希望对偏离更敏感
-    max_score = 100.0    # 纵横比评分的满分
-    # 取 ln(ratio_factor)，无论是 >1 还是 <1，平方后一样对待
+    alpha = 2.0
+    max_score = 100.0
     diff = math.log(ratio_factor)
-    # 高斯衰减
     raw_score = max_score * math.exp(-alpha * (diff ** 2))
-
-    # 也可以再根据是否是大于1还是小于1做一个额外的微调（可选）
     return raw_score
 
+
 def get_image_info(filepath):
-    """
-    获取图片信息：宽度、高度、宽高比和文件大小
-    """
     try:
         with Image.open(filepath) as img:
             width, height = img.size
             ratio = width / height if height != 0 else 0
-    except Exception as e:
+    except Exception:
         return None
     file_size = os.path.getsize(filepath)
     return width, height, ratio, file_size
 
+
 def sort_key(filepath, screen_ratio):
-    """
-    构造排序 key：
-      - 与屏幕宽高比差值（越小越好）
-      - png 图片优先（png 得到 0，否则 1）
-      - 分辨率（宽×高，越大越好）
-      - 文件大小（作为码率代理，越大越好）
-    """
     info = get_image_info(filepath)
     if info is None:
         return (float('inf'), 1, 0, 0)
@@ -109,10 +87,8 @@ def sort_key(filepath, screen_ratio):
     resolution = width * height
     return (diff, is_png, -resolution, -file_size)
 
+
 def collect_images(folder):
-    """
-    遍历文件夹及其子文件夹，收集常见图片的路径
-    """
     image_files = []
     allowed_ext = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff'}
     for root, dirs, files in os.walk(folder):
@@ -122,7 +98,9 @@ def collect_images(folder):
                 image_files.append(os.path.join(root, f))
     return image_files
 
+
 # 将文件作为单个文件复制到剪贴板（仅在 Windows 上支持）
+
 def copy_file_to_clipboard(filepath):
     try:
         import win32clipboard
@@ -133,28 +111,20 @@ def copy_file_to_clipboard(filepath):
     try:
         win32clipboard.OpenClipboard()
         win32clipboard.EmptyClipboard()
-        # 构造 DROPFILES 结构体
-        # DROPFILES { DWORD pFiles, POINT pt, BOOL fNC, BOOL fWide }
         dropfiles_header = struct.pack("IiiII", 20, 0, 0, 0, 1)
         file_list = (filepath + "\0").encode("utf-16le") + b"\0\0"
         data = dropfiles_header + file_list
-
-        GHND = 0x0042  # GMEM_MOVEABLE | GMEM_ZEROINIT
-
-        # 设置 GlobalAlloc/GlobalLock 参数类型与返回值类型
+        GHND = 0x0042
         windll.kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_ulong]
         windll.kernel32.GlobalAlloc.restype = c_void_p
         windll.kernel32.GlobalLock.argtypes = [c_void_p]
         windll.kernel32.GlobalLock.restype = c_void_p
-
         hGlobalMem = windll.kernel32.GlobalAlloc(GHND, len(data))
         if not hGlobalMem:
-            print("GlobalAlloc failed")
             win32clipboard.CloseClipboard()
             return
         pGlobalMem = windll.kernel32.GlobalLock(hGlobalMem)
         if not pGlobalMem:
-            print("GlobalLock failed")
             win32clipboard.CloseClipboard()
             return
         memmove(pGlobalMem, data, len(data))
@@ -162,12 +132,13 @@ def copy_file_to_clipboard(filepath):
         win32clipboard.SetClipboardData(win32con.CF_HDROP, hGlobalMem)
         win32clipboard.CloseClipboard()
         print("文件已复制到剪贴板:", filepath)
-    except Exception as e:
+    except Exception:
         logger.exception("复制文件到剪贴板失败")
         try:
             win32clipboard.CloseClipboard()
         except Exception:
             pass
+
 
 def open_external_and_copy(img_path):
     try:
@@ -183,28 +154,25 @@ def open_external_and_copy(img_path):
     except Exception as e:
         print("打开外部程序失败:", e)
 
+
 class ImageBrowser:
-    def __init__(self, master, folder=None, page_size=12):
+    def __init__(self, master, folder=None, page_size=12, desired_ratio=None):
         self.master = master
         self.master.title("图片浏览器")
         self.page_size = page_size
         self.folder = folder
         self.images = []
         self.sorted_images = []
-        self.thumbnails = {}  # 缓存：key 为 (img_path, target_size)
-        self.thumbnail_futures = {}  # 后台任务缓存
+        self.thumbnails = {}
+        self.thumbnail_futures = {}
         self.current_page = 0
-        self.current_columns = 3  # 固定每页图片数排布
-
+        self.current_columns = 3
+        self.desired_ratio = desired_ratio
         self.placeholder_image = ImageTk.PhotoImage(Image.new("RGB", (10, 10), "gray"))
         self.executor = ThreadPoolExecutor(max_workers=4)
-
         self.setup_ui()
-
-        # 主界面左右方向键快捷翻页
         self.master.bind("<Left>", lambda event: self.prev_page())
         self.master.bind("<Right>", lambda event: self.next_page())
-
         if self.folder:
             self.load_folder(self.folder)
 
@@ -223,7 +191,6 @@ class ImageBrowser:
         self.page_label.pack(side=tk.LEFT, padx=5)
         next_button = tk.Button(top_frame, text="下一页", command=self.next_page)
         next_button.pack(side=tk.LEFT, padx=5)
-
         self.middle_frame = tk.Frame(self.master)
         self.middle_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.middle_frame.bind("<Configure>", lambda event: self.display_page())
@@ -240,26 +207,41 @@ class ImageBrowser:
         if not self.images:
             messagebox.showinfo("提示", "该文件夹下没有找到图片！")
             return
-        # 计算屏幕比例及所有图片的最大分辨率和文件大小
+
+        total = len(self.images)
         screen_width = self.master.winfo_screenwidth()
         screen_height = self.master.winfo_screenheight()
         self.screen_ratio = screen_width / screen_height
-        max_area = 0
-        max_size = 0
-        for path in self.images:
+
+        # 阶段一：读取图片信息并统计 max_area / max_size
+        self.max_area = 0
+        self.max_size = 0
+        for idx, path in enumerate(self.images, 1):
             info = get_image_info(path)
             if info is not None:
-                width, height, ratio, file_size = info
-                area = width * height
-                if area > max_area:
-                    max_area = area
-                if file_size > max_size:
-                    max_size = file_size
-        self.max_area = max_area
-        self.max_size = max_size
-        # 按启发式评分排序（分数越高越好）
-        self.sorted_images = sorted(self.images, key=lambda x: compute_score(x, self.screen_ratio, self.max_area, self.max_size), reverse=True)
+                w, h, _, sz = info
+                area = w * h
+                if area > self.max_area:
+                    self.max_area = area
+                if sz > self.max_size:
+                    self.max_size = sz
+            _print_progress(idx, total, "读取信息 ")
 
+        print()  # 换行
+
+        # 阶段二：多线程计算评分
+        score_dict = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(compute_score, p, self.screen_ratio,
+                                self.max_area, self.max_size): p for p in self.images}
+            for idx, fut in enumerate(as_completed(futures), 1):
+                p = futures[fut]
+                score_dict[p] = fut.result()
+                _print_progress(idx, total, "计算评分 ")
+        print()  # 换行
+
+        # 根据评分排序
+        self.sorted_images = sorted(self.images, key=lambda x: score_dict[x], reverse=True)
 
     def display_page(self):
         for widget in self.middle_frame.winfo_children():
@@ -267,7 +249,6 @@ class ImageBrowser:
         start_index = self.current_page * self.page_size
         end_index = start_index + self.page_size
         page_images = self.sorted_images[start_index:end_index]
-
         columns = self.current_columns
         rows = math.ceil(len(page_images) / columns)
         frame_width = self.middle_frame.winfo_width()
@@ -276,9 +257,8 @@ class ImageBrowser:
             cell_width, cell_height = 150, 150
         else:
             pad = 5
-            cell_width = (frame_width - (columns+1)*pad) / columns
-            cell_height = (frame_height - (rows+1)*pad) / rows
-
+            cell_width = (frame_width - (columns + 1) * pad) / columns
+            cell_height = (frame_height - (rows + 1) * pad) / rows
         target_size = (int(cell_width), int(cell_height))
         pad = 2
         for idx, img_path in enumerate(page_images):
@@ -288,21 +268,16 @@ class ImageBrowser:
             if thumb is None:
                 thumb = self.placeholder_image
             cur_index = start_index + idx
-            # 用 Canvas 显示缩略图和评分
             cell_canvas = tk.Canvas(self.middle_frame, width=target_size[0], height=target_size[1], highlightthickness=0)
-            cell_canvas.create_image(target_size[0]//2, target_size[1]//2, image=thumb)
+            cell_canvas.create_image(target_size[0] // 2, target_size[1] // 2, image=thumb)
             score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size)
-            # 数字向内偏移4像素，避免被右侧裁剪
-            cell_canvas.create_text(target_size[0]-4, target_size[1]-4, text=str(int(score)), anchor="se", fill="green", font=("Arial", 10, "bold"))
+            cell_canvas.create_text(target_size[0] - 4, target_size[1] - 4, text=str(int(score)), anchor="se", fill="green", font=("Arial", 10, "bold"))
             cell_canvas.grid(row=row, column=col, padx=pad, pady=pad, sticky="nsew")
             cell_canvas.bind("<Button-1>", lambda event, path=img_path, idx=cur_index: self.open_preview(path, idx))
             cell_canvas.bind("<Button-3>", lambda event, path=img_path: open_external_and_copy(path))
             self.middle_frame.grid_columnconfigure(col, weight=1)
-
-
-
         total_pages = (len(self.sorted_images) + self.page_size - 1) // self.page_size
-        self.page_label.config(text=f"Page {self.current_page+1}/{total_pages}")
+        self.page_label.config(text=f"Page {self.current_page + 1}/{total_pages}")
 
     def get_thumbnail(self, img_path, target_size):
         key = (img_path, target_size)
@@ -354,7 +329,6 @@ class PreviewWindow:
         self.screen_ratio = screen_ratio
         self.max_area = max_area
         self.max_size = max_size
-
         self.master = master
         self.image_list = image_list
         self.index = index
@@ -370,27 +344,21 @@ class PreviewWindow:
         x = (sw - w) // 2
         y = (sh - h) // 2
         self.top.geometry(f"{w}x{h}+{x}+{y}")
-
         try:
             self.original_image = Image.open(self.img_path)
         except Exception as e:
             print(f"无法打开图片: {self.img_path}\n{e}")
             self.top.destroy()
             return
-
         self.zoom_level = 1.0
-
         self.canvas = tk.Canvas(self.top, bg="gray")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", lambda event: self.display_image())
-
-        self.slider = tk.Scale(self.top, from_=0.1, to=3.0, resolution=0.1,
-                               orient=tk.HORIZONTAL, label="额外缩放", command=self.update_zoom)
+        self.slider = tk.Scale(self.top, from_=0.1, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, label="额外缩放", command=self.update_zoom)
         self.slider.set(1.0)
         self.slider.pack(fill=tk.X)
         self.info_label = tk.Label(self.top, text="", anchor="w")
         self.info_label.pack(fill=tk.X, padx=5, pady=5)
-
         btn_frame = tk.Frame(self.top)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
         prev_btn = tk.Button(btn_frame, text="上一张", command=self.prev_image)
@@ -399,12 +367,9 @@ class PreviewWindow:
         next_btn.pack(side=tk.LEFT, padx=10, pady=5)
         ext_btn = tk.Button(btn_frame, text="外部打开并复制", command=self.open_external_and_copy)
         ext_btn.pack(side=tk.RIGHT, padx=10, pady=5)
-
-
         self.top.bind("<Left>", lambda event: self.prev_image())
         self.top.bind("<Right>", lambda event: self.next_image())
         self.top.bind("<Control-c>", lambda event: self.copy_current_file())
-
         self.display_image()
 
     def display_image(self):
@@ -427,10 +392,9 @@ class PreviewWindow:
             print("图片缩放失败:", e)
             return
         self.canvas.delete("all")
-        self.canvas.create_image(canvas_width/2, canvas_height/2, anchor=tk.CENTER, image=self.photo)
+        self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
         self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
         self.top.title(f"预览: {os.path.basename(self.img_path)}")
-        # 更新预览信息：尺寸、文件大小和评分
         info = get_image_info(self.img_path)
         if info is not None:
             width, height, ratio, file_size = info
@@ -472,12 +436,21 @@ class PreviewWindow:
     def copy_current_file(self):
         copy_file_to_clipboard(self.img_path)
 
+
 def main():
     parser = argparse.ArgumentParser(description="图片浏览器 GUI")
     parser.add_argument("--folder", help="要扫描的文件夹路径")
     parser.add_argument("--page-size", type=int, default=12, help="每页显示图片数量，默认12个")
+    parser.add_argument("--ratio", help="指定目标宽高比，格式 a:b")
     args = parser.parse_args()
-
+    desired_ratio = None
+    if args.ratio:
+        try:
+            a, b = args.ratio.split(":")
+            desired_ratio = float(a) / float(b)
+        except Exception:
+            print("比例格式应为 a:b，其中 a、b 为数字")
+            sys.exit(1)
     root = tk.Tk()
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
@@ -486,9 +459,9 @@ def main():
     x = (sw - w) // 2
     y = (sh - h) // 2
     root.geometry(f"{w}x{h}+{x}+{y}")
-
-    app = ImageBrowser(root, folder=args.folder, page_size=args.page_size)
+    app = ImageBrowser(root, folder=args.folder, page_size=args.page_size, desired_ratio=desired_ratio)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
