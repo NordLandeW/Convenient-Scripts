@@ -165,36 +165,39 @@ import threading
 
 def get_total_split_size(file_path: str) -> int:
     """
-    根据文件的“第一个后缀之前”的部分来识别分卷文件。
-    假设 file_path = /path/to/abc.z01，
-    则 base_part = 'abc'，那么同目录下凡是 'abc.任意后缀' 的文件，都会被视为同一个分卷组并累加。
+    取倒数第二个（如果只有一个'.'就取一个）'.'之前相同的部分，计算所有同样前缀文件的总大小。
     """
     dir_name = os.path.dirname(file_path)
     base_name = os.path.basename(file_path)
 
-    # 如果没有第一个 '.'，则视为没有后缀，直接返回当前文件大小
+    # 如果没有 '.'，直接返回当前文件大小
     if "." not in base_name:
         return os.path.getsize(file_path)
 
-    # 取第一个 '.' 之前的部分，比如：abc.zip -> ('abc', 'zip')；abc.z01 -> ('abc', 'z01')
-    base_part = base_name.split(".", 1)[0]  # 'abc'
+    # 找到所有 '.' 的位置
+    dot_positions = [i for i, c in enumerate(base_name) if c == '.']
+    if len(dot_positions) == 1:
+        base_part = base_name[:dot_positions[0]]
+    else:
+        base_part = base_name[:dot_positions[-2]]
 
     total_size = 0
-    # 遍历同一目录下的所有文件，判断“第一个后缀之前”的部分是否和 base_part 一致
     for fname in os.listdir(dir_name or "."):
         full_path = os.path.join(dir_name, fname)
-        # 排除目录
         if not os.path.isfile(full_path):
             continue
 
-        # 对当前文件名，也做同样的 split 判断
-        if "." in fname:
-            cur_base_part = fname.split(".", 1)[0]
-            if cur_base_part == base_part:
-                total_size += os.path.getsize(full_path)
+        # 对比相同策略所得的前缀
+        cur_dots = [i for i, c in enumerate(fname) if c == '.']
+        if not cur_dots:
+            continue
+        elif len(cur_dots) == 1:
+            cur_base_part = fname[:cur_dots[0]]
         else:
-            # 没有后缀就不认同一分卷
-            pass
+            cur_base_part = fname[:cur_dots[-2]]
+
+        if cur_base_part == base_part:
+            total_size += os.path.getsize(full_path)
 
     return total_size
 
