@@ -14,6 +14,7 @@ import sys
 import argparse
 import random
 import time
+from collections import defaultdict
 from loguru import logger
 from colorama import init, Fore, Style
 
@@ -58,7 +59,17 @@ def score_conversion(original, fixed, common_chars=None):
     return bonus - num_replace * 10
 
 
-def process_item(name, global_scores, global_examples, common_chars):
+def update_global_stats(key, score, orig, fixed,
+                        global_scores, global_examples, global_best):
+    global_scores[key] += score
+    # 保存 (score, orig, fixed)
+    global_examples[key].append((score, orig, fixed))
+    if score > global_best[key][0]:
+        global_best[key] = (score, orig, fixed)
+
+
+
+def process_item(name, global_scores, global_examples, global_best, common_chars):
     candidates = []
     for cur_enc in CANDIDATE_ENCODINGS:
         for act_enc in CANDIDATE_ENCODINGS:
@@ -68,78 +79,110 @@ def process_item(name, global_scores, global_examples, common_chars):
             score = score_conversion(name, fixed, common_chars)
             candidates.append((score, cur_enc, act_enc, fixed))
             key = (cur_enc, act_enc)
-            global_scores[key] = global_scores.get(key, 0) + score
-            global_examples.setdefault(key, []).append((name, fixed))
+            update_global_stats(key, score, name, fixed, global_scores, global_examples, global_best)
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates
 
 
+def print_candidates(candidates):
+    for score, cur_enc, act_enc, fixed in candidates:
+        if score < 0:
+            break  # 忽略负分
+        color = Fore.GREEN if score >= 5 else Fore.YELLOW
+        print(f"  [{cur_enc:>9}->{act_enc:<9}] {score:>4} : {color}{fixed}{Style.RESET_ALL}")
+
+
 def preview_mode(directory, dict_file):
+    dict_used = False
     common_chars = None
     dict_path = os.path.join(SCRIPT_DIR, dict_file) if not os.path.isabs(dict_file) else dict_file
     if dict_file and os.path.exists(dict_path):
         try:
             with open(dict_path, "r", encoding="utf-8") as f:
                 common_chars = set(ch for ch in f.read() if not ch.isspace())
+            dict_used = True
             print(f"加载常用字词典：{dict_path}，{len(common_chars)} 字符")
             logger.info(f"Loaded dict {dict_path} with {len(common_chars)} chars")
         except Exception as e:
             print(f"{Fore.RED}加载字典失败：{e}{Style.RESET_ALL}")
             logger.error(f"Dict load error: {e}")
-    else:
-        if dict_file:
-            print(f"{Fore.YELLOW}字典文件 {dict_path} 不存在{Style.RESET_ALL}")
-            logger.warning(f"Dict {dict_path} not found")
 
-    global_scores, global_examples = {}, {}
+    global_scores = defaultdict(int)
+    global_examples = defaultdict(list)
+    global_best = defaultdict(lambda: (-1000, "", ""))
+
+    total_files = 0
+    total_dirs = 0
 
     for root, dirs, files in os.walk(directory):
         print(f"\n【路径】：{root}")
-        for score, cur_enc, act_enc, fixed in process_item(root, global_scores, global_examples, common_chars):
-            if fixed == root:
-                continue
-            color = Fore.GREEN if score >= 5 else Fore.YELLOW if score >= 0 else Fore.RED
-            print(f"  [{cur_enc:>9}->{act_enc:<9}] {score:>4} : {color}{fixed}{Style.RESET_ALL}")
+        print_candidates(process_item(root, global_scores, global_examples, global_best, common_chars)[:5])
 
         for name in files:
-            for score, cur_enc, act_enc, fixed in process_item(name, global_scores, global_examples, common_chars):
-                if fixed == name:
-                    continue
-                color = Fore.GREEN if score >= 5 else Fore.YELLOW if score >= 0 else Fore.RED
-                print(f"  [{cur_enc:>9}->{act_enc:<9}] {score:>4} : {color}{fixed}{Style.RESET_ALL}")
+            total_files += 1
+            print_candidates(process_item(name, global_scores, global_examples, global_best, common_chars)[:3])
 
         for name in dirs:
-            for score, cur_enc, act_enc, fixed in process_item(name, global_scores, global_examples, common_chars):
-                if fixed == name:
-                    continue
-                color = Fore.GREEN if score >= 5 else Fore.YELLOW if score >= 0 else Fore.RED
-                print(f"  [{cur_enc:>9}->{act_enc:<9}] {score:>4} : {color}{fixed}{Style.RESET_ALL}")
+            total_dirs += 1
+            print_candidates(process_item(name, global_scores, global_examples, global_best, common_chars)[:3])
 
     print("\n============================")
     print("【总体候选转换统计】")
-    sorted_global = sorted(global_scores.items(), key=lambda x: x[1], reverse=True)[:10]
-    for idx, ((cur_enc, act_enc), total_score) in enumerate(sorted_global, 1):
-        print(f"\n{idx:>2}. [{cur_enc:>9}->{act_enc:<9}] {total_score}")
-        examples = random.sample(global_examples[(cur_enc, act_enc)], min(3, len(global_examples[(cur_enc, act_enc)])))
-        for orig, fixed in examples:
-            print(f"     {orig}  =>  {fixed}")
+    sorted_global = sorted(global_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # 统计输出
+    print(f"\n总文件数: {total_files} , 总目录数: {total_dirs}")
+    print(f"是否使用字典: {'是' if dict_used else '否'}")
     print("============================\n")
 
-    if sorted_global:
-        choice = input("输入要使用的方案编号 (1-10)；其他任意键取消: ").strip()
-        if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(sorted_global):
-                cur_enc, act_enc = sorted_global[idx - 1][0]
-                print(f"开始修复，方案 [{cur_enc}->{act_enc}]")
-                logger.info(f"Chosen conversion {cur_enc}->{act_enc}")
-                fixed_files, fixed_dirs = fix_mode(directory, cur_enc, act_enc)
-                print(f"修复完成：文件 {fixed_files} 个，目录 {fixed_dirs} 个")
-                logger.info(f"Fix done: files {fixed_files}, dirs {fixed_dirs}")
-            else:
-                print("取消修复")
+    if not sorted_global:
+        print("未生成任何转换候选，终止。")
+        return
+
+    # 分数最高方案
+    top_key, top_score = sorted_global[0]
+    cur_enc, act_enc = top_key
+    print(f"分数最高方案: [{cur_enc}->{act_enc}] 累计分数 {top_score}")
+
+    # 取该方案贡献最高的前 3 条示例
+    for s, o, f in sorted(global_examples[top_key], key=lambda x: x[0],
+                        reverse=True)[:3]:
+        print(f"示例: {o}  =>  {f}  (分数 {s})")
+    print()
+
+
+    use_top = input("是否直接使用该方案? (y/N): ").strip().lower() == "y"
+    if use_top:
+        print(f"开始修复，方案 [{cur_enc}->{act_enc}]")
+        logger.info(f"Chosen top conversion {cur_enc}->{act_enc}")
+        fixed_files, fixed_dirs = fix_mode(directory, cur_enc, act_enc)
+        print(f"修复完成：文件 {fixed_files} 个，目录 {fixed_dirs} 个")
+        logger.info(f"Fix done: files {fixed_files}, dirs {fixed_dirs}")
+        return
+
+    # 展示前十方案供选择
+    print("前十方案列表：")
+    for idx, ((cur_enc, act_enc), total_score) in enumerate(sorted_global[:10], 1):
+        print(f"\n{idx:>2}. [{cur_enc:>9}->{act_enc:<9}] {total_score}")
+        # 取当前方案贡献最高的前 3 条示例
+        for s, o, f in sorted(global_examples[(cur_enc, act_enc)],
+                            key=lambda x: x[0], reverse=True)[:3]:
+            print(f"     {o}  =>  {f}  (分数 {s})")
+
+    choice = input("输入要使用的方案编号 (1-10)；其他任意键取消: ").strip()
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= min(10, len(sorted_global)):
+            cur_enc, act_enc = sorted_global[idx - 1][0]
+            print(f"开始修复，方案 [{cur_enc}->{act_enc}]")
+            logger.info(f"Chosen conversion {cur_enc}->{act_enc}")
+            fixed_files, fixed_dirs = fix_mode(directory, cur_enc, act_enc)
+            print(f"修复完成：文件 {fixed_files} 个，目录 {fixed_dirs} 个")
+            logger.info(f"Fix done: files {fixed_files}, dirs {fixed_dirs}")
         else:
             print("取消修复")
+    else:
+        print("取消修复")
 
 
 def fix_mode(directory, current_enc, actual_enc):
