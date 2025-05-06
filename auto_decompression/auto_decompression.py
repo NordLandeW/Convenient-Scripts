@@ -9,8 +9,11 @@ import send2trash
 from rich.console import Console
 from rich.progress import Progress
 import rich.progress
+import requests
+import datetime as _dt
+import atexit
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 console = Console()
 extract_to_base_folder = False
 pwdOldFilename = "dict.txt"
@@ -18,6 +21,99 @@ pwdFilename = "dict.json"
 pwdDictionary = {}
 RECOVER_SUFFIX = ".AutoDecRecovered"
 
+GIST_CONFIG_FILE = "gist_config.json"
+_gist_cfg = None  # {token:str, gist_id:str, file:str}
+_gist_remote_ts = None  # 上一次拉取时远程文件 updated_at（datetime）
+
+
+def _cfg_path(fname):
+    return os.path.join(sys.path[0], fname)
+
+def _load_gist_config():
+    cfg_path = _cfg_path(GIST_CONFIG_FILE)
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def _save_gist_config(cfg):
+    cfg_path = _cfg_path(GIST_CONFIG_FILE)
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print_warning(f"保存 Gist 配置失败喵：{e}")
+
+def _gist_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+def _fetch_from_gist(cfg):
+    """返回 (dict, gist_updated_at str) 或 (None, None)"""
+    try:
+        r = requests.get(
+            f"https://api.github.com/gists/{cfg['gist_id']}",
+            headers=_gist_headers(cfg['token']),
+        )
+        if r.status_code == 200:
+            gist = r.json()
+            file_info = gist["files"].get(cfg["file"])
+            if file_info and file_info.get("content") is not None:
+                # ↳ 文件对象本身没有 updated_at，使用 gist 的 updated_at 字段
+                return json.loads(file_info["content"] or "{}"), gist["updated_at"]
+    except Exception as e:
+        print_warning(f"拉取 Gist 时出错喵：{e}")
+    return None, None
+
+def _update_gist(cfg, content_str):
+    try:
+        payload = {"files": {cfg["file"]: {"content": content_str}}}
+        r = requests.patch(
+            f"https://api.github.com/gists/{cfg['gist_id']}",
+            headers=_gist_headers(cfg['token']),
+            json=payload,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        print_warning(f"更新 Gist 时出错喵：{e}")
+        return False
+
+def _create_new_gist(token, file_name):
+    payload = {
+        "description": "password‑dict sync",
+        "public": False,
+        "files": {file_name: {"content": "{}"}},
+    }
+    r = requests.post("https://api.github.com/gists", headers=_gist_headers(token), json=payload)
+    if r.status_code == 201:
+        return r.json()["id"]
+    print_error(f"创建 Gist 失败喵：{r.text}")
+    sys.exit(1)
+
+def _setup_gist_interactive():
+    console.print("[cyan][b]检测到未配置 Gist，同步向导启动喵~")
+    console.print("[cyan][b]请输入 GitHub Token（需 gist 权限）喵：", end="")
+    token = input().strip()
+    console.print("[cyan][b]请输入已有 Gist ID 或直接回车自动创建喵：", end="")
+    gist_id = input().strip()
+    file_name = pwdFilename
+    if gist_id == "":
+        gist_id = _create_new_gist(token, file_name)
+        print_success(f"已创建新的私密 Gist：{gist_id} 喵！")
+    cfg = {"token": token, "gist_id": gist_id, "file": file_name}
+    _save_gist_config(cfg)
+    return cfg
+
+def _ensure_gist_config():
+    cfg = _load_gist_config()
+    if cfg is None:
+        cfg = _setup_gist_interactive()
+    return cfg
 
 def append_scr_path(relative_path):
     return os.path.join(sys.path[0], relative_path)
@@ -136,11 +232,29 @@ def save_passwords():
         print_warning(f"保存密码时出错喵！请检查文件权限或路径。错误信息：{e}")
 
 
+def _pull_from_gist_if_possible():
+    """在本地文件缺失的情况下尝试从 Gist 拉取密码本，成功返回 True"""
+    global _gist_cfg, _gist_remote_ts, pwdDictionary
+    if _gist_cfg is None:
+        return False
+    remote_dict, ts = _fetch_from_gist(_gist_cfg)
+    if remote_dict is not None:
+        pwdDictionary = remote_dict
+        _gist_remote_ts = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+        save_passwords()
+        print_success("已从 Gist 拉取密码本喵！")
+        return True
+    return False
+
+
 def check_passwords():
     global pwdDictionary
     pwdPath = os.path.join(sys.path[0], pwdFilename)
     pwdOldPath = os.path.join(sys.path[0], pwdOldFilename)
     if not os.path.exists(pwdPath):
+        # 若本地缺失则优先尝试从 Gist 获取
+        if _pull_from_gist_if_possible():
+            return
         # Check if a old version file exists.
         if os.path.exists(pwdOldPath):
             convert_old_pwd_to_new_pwd(read_passwords_old())
@@ -149,6 +263,34 @@ def check_passwords():
     else:
         read_passwords()
 
+
+def _sync_to_gist_before_exit():
+    global _gist_cfg, _gist_remote_ts
+    if _gist_cfg is None:
+        return
+    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    if not os.path.exists(pwdPath):
+        return
+    local_mtime = _dt.datetime.fromtimestamp(os.path.getmtime(pwdPath), tz=_dt.timezone.utc)
+    remote_dict, remote_ts_str = _fetch_from_gist(_gist_cfg)
+    if remote_ts_str:
+        remote_ts = _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00"))
+    else:
+        remote_ts = None
+
+    if remote_ts and _gist_remote_ts and remote_ts > _gist_remote_ts and remote_ts > local_mtime:
+        print_warning("检测到远程密码本在本次会话期间发生更新，可能与本地冲突喵！")
+        print_warning(f"远程最后更新时间：{remote_ts.isoformat()} 本地最后更新时间：{local_mtime.isoformat()}")
+        # 冲突时依旧继续上传由用户自行决定，示例中选择继续
+
+    if _update_gist(_gist_cfg, json.dumps(pwdDictionary, ensure_ascii=False, indent=4)):
+        print_success("已同步密码本到 Gist 喵！")
+    else:
+        print_warning("同步到 Gist 失败喵，请稍后重试！")
+    time.sleep(1)
+
+# 注册到 atexit，以便任何正常退出路径都会尝试同步
+atexit.register(_sync_to_gist_before_exit)
 
 def add_password(pwd, count=1):
     if pwd == None:
@@ -461,9 +603,11 @@ class FileManager:
         self.stop()
 
 
-# Modified main function to support singleton behavior
 def main():
-    global extract_to_base_folder
+    global extract_to_base_folder, _gist_cfg, _gist_remote_ts
+
+    # ① 确保 Gist 配置可用
+    _gist_cfg = _ensure_gist_config()
 
     manager = FileManager()
 
@@ -493,7 +637,7 @@ def main():
                         base_folder, file_path, global_last_success_password
                     )
                     remove_autodec_files(base_folder)
-                save_passwords()
+                save_passwords()  # 保存到本地
                 if not manager.files_to_process:
                     break
                 files_to_process.extend(manager.files_to_process)
