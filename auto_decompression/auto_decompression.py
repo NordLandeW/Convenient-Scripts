@@ -12,6 +12,7 @@ import rich.progress
 import requests
 import datetime as _dt
 import atexit
+import time
 
 __version__ = "1.1.0"
 console = Console()
@@ -96,16 +97,71 @@ def _create_new_gist(token, file_name):
     sys.exit(1)
 
 def _setup_gist_interactive():
+    global pwdDictionary
+    global _gist_remote_ts
     console.print("[cyan][b]检测到未配置 Gist，同步向导启动喵~")
     console.print("[cyan][b]请输入 GitHub Token（需 gist 权限）喵：", end="")
     token = input().strip()
     console.print("[cyan][b]请输入已有 Gist ID 或直接回车自动创建喵：", end="")
     gist_id = input().strip()
     file_name = pwdFilename
-    if gist_id == "":
-        gist_id = _create_new_gist(token, file_name)
-        print_success(f"已创建新的私密 Gist：{gist_id} 喵！")
+    
+    # 创建配置对象
     cfg = {"token": token, "gist_id": gist_id, "file": file_name}
+    
+    # 检查是否提供了已有的 Gist ID
+    if gist_id != "":
+        # 检查本地是否有密码本
+        local_pwd_path = os.path.join(sys.path[0], pwdFilename)
+        has_local_pwd = os.path.exists(local_pwd_path)
+        
+        # 尝试获取远程密码本信息
+        remote_dict, remote_ts_str = _fetch_from_gist(cfg)
+        
+        if remote_dict is not None:
+            # 远程 Gist 存在且可访问
+            if has_local_pwd:
+                # 本地和远程都存在，询问用户选择
+                local_mtime = _dt.datetime.fromtimestamp(os.path.getmtime(local_pwd_path), tz=_dt.timezone.utc)
+                remote_ts = _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00")) if remote_ts_str else None
+                
+                print_info(f"检测到本地密码本（最后修改时间：{local_mtime.astimezone().strftime('%Y-%m-%d %H:%M:%S')}）")
+                print_info(f"远程密码本（最后修改时间：{remote_ts.astimezone().strftime('%Y-%m-%d %H:%M:%S') if remote_ts else '未知'}）")
+                
+                console.print("[cyan][b]请选择操作：[1] 拉取远程密码本 [2] 上传本地密码本 [默认:1]：", end="")
+                choice = input().strip()
+                
+                if choice == "2":
+                    # 用户选择上传本地密码本
+                    print_info("将使用本地密码本并上传到 Gist")
+                    # 配置已创建，保存后会在退出时自动上传
+                else:
+                    # 用户选择拉取远程密码本或默认选项
+                    pwdDictionary = remote_dict
+                    _gist_remote_ts = remote_ts
+                    save_passwords()
+                    print_success("已从 Gist 拉取密码本喵！")
+            else:
+                # 本地不存在但远程存在，直接拉取
+                pwdDictionary = remote_dict
+                _gist_remote_ts = _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00")) if remote_ts_str else None
+                save_passwords()
+                print_success("已从 Gist 拉取密码本喵！")
+        else:
+            # 远程 Gist 不存在或无法访问
+            print_warning(f"无法访问指定的 Gist ID：{gist_id}，请检查 ID 是否正确或网络连接是否正常")
+            console.print("[cyan][b]是否要创建新的 Gist？[Y/n]：", end="")
+            create_new = input().strip().lower()
+            if create_new != "n":
+                gist_id = _create_new_gist(token, file_name)
+                cfg["gist_id"] = gist_id
+                print_success(f"已创建新的私密 Gist：{gist_id} 喵！")
+    else:
+        # 用户没有提供 Gist ID，创建新的
+        gist_id = _create_new_gist(token, file_name)
+        cfg["gist_id"] = gist_id
+        print_success(f"已创建新的私密 Gist：{gist_id} 喵！")
+    
     _save_gist_config(cfg)
     return cfg
 
