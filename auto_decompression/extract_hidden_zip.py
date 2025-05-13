@@ -3,9 +3,16 @@ import sys
 import os
 import json
 import subprocess
+import re
 
 # 可调整参数
 CHUNK_SIZE = 256 * 1024 * 1024  # 256 MB
+
+# 文件魔法头定义
+MAGIC_SIGNATURES = {
+    "zip": b"PK\x03\x04"  # ZIP文件的魔法头
+    # 未来可以在这里添加其他文件类型的魔法头
+}
 
 # 用于缓存 binwalk 安装检测结果，避免重复检测
 _BINWALK_INSTALLED = None
@@ -121,12 +128,60 @@ def has_embedded_signature(filename, signature):
     return confidence > 200
 
 
+def _find_first_magic_signature(input_file, signature_type):
+    """
+    在文件中查找指定类型的第一个魔法头，并返回其偏移量。
+    如果找不到，则返回 None。
+    
+    Args:
+        input_file: 输入文件路径
+        signature_type: 签名类型，如 "zip"
+    
+    Returns:
+        int: 魔法头的偏移量，如果找不到则返回 None
+    """
+    if signature_type not in MAGIC_SIGNATURES:
+        return None
+    
+    magic_bytes = MAGIC_SIGNATURES[signature_type]
+    
+    with open(input_file, 'rb') as f:
+        # 读取文件并查找魔法头
+        data = f.read()
+        offset = data.find(magic_bytes)
+        return offset if offset != -1 else None
+
 def extract_embedded_file(input_file, output_file, signature):
     """
     在符合的 signature 结果中找置信度最高的进行提取。
     注意：此处并未对 confidence 做限制，如果需要也可再加判断。
     若未找到符合的，则抛出 ValueError。
+    
+    对于ZIP文件，由于binwalk可能会忽略第一个魔法头，我们添加了特殊处理。
     """
+    # 对ZIP文件的特殊处理
+    if signature.lower() == "zip":
+        # 尝试直接查找ZIP文件的魔法头
+        offset = _find_first_magic_signature(input_file, "zip")
+        if offset is not None:
+            # 找到了ZIP魔法头，从这里开始提取到文件末尾
+            file_size = os.path.getsize(input_file)
+            size = file_size - offset
+            
+            with open(input_file, 'rb') as f_in, open(output_file, 'wb') as f_out:
+                f_in.seek(offset)
+                bytes_left = size
+                while bytes_left > 0:
+                    chunk_size = min(CHUNK_SIZE, bytes_left)
+                    data = f_in.read(chunk_size)
+                    if not data:
+                        break
+                    f_out.write(data)
+                    bytes_left -= len(data)
+                
+                return  # 成功提取，直接返回
+    
+    # 如果不是ZIP文件或者ZIP特殊处理失败，则使用原来的方法
     chosen = _pick_highest_confidence(input_file, signature)
     if chosen is None:
         raise ValueError(f"无法找到指定格式({signature})的嵌入文件：{input_file}")
