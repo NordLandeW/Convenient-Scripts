@@ -529,6 +529,87 @@ def manual_password_entry(file_path, extract_to, level):
         print_warning("密码错误，请重新输入喵！")
 
 
+def get_archive_base_name(filename):
+    """Intelligently get the base name of a file, handling multi-volume archive extensions."""
+    basename = os.path.basename(filename)
+    
+    # Regex for different archive parts, same as in group_archive_files
+    part_regex = re.compile(r'(.+)\.part\d+\.rar$', re.IGNORECASE)
+    r_regex = re.compile(r'(.+)\.r\d+$', re.IGNORECASE)
+    num_regex = re.compile(r'(.+)\.(7z|zip)\.\d+$', re.IGNORECASE)
+    z_regex = re.compile(r'(.+)\.z\d+$', re.IGNORECASE)
+    
+    match = part_regex.match(basename) or \
+            r_regex.match(basename) or \
+            num_regex.match(basename) or \
+            z_regex.match(basename)
+            
+    if match:
+        # If it's a known multi-volume format, return the captured base name
+        return match.group(1)
+    else:
+        # Fallback for regular files (e.g., .zip, .rar, .7z)
+        return os.path.splitext(basename)[0]
+
+
+def group_archive_files(directory):
+    """
+    Groups files in a directory into logical archives, handling multi-volume archives.
+    Returns a list of primary files (first volume of a set or regular files).
+    """
+    files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+    
+    # Regex for different archive parts
+    # 1. .part1.rar, .part01.rar, .part001.rar etc.
+    # 2. .r00, .r01, ...
+    # 3. .7z.001, .zip.001, ...
+    # 4. .z01, .z02, ... (first file is .zip)
+    part_regex = re.compile(r'(.+)\.part\d+\.rar$', re.IGNORECASE)
+    r_regex = re.compile(r'(.+)\.r\d+$', re.IGNORECASE)
+    num_regex = re.compile(r'(.+)\.(7z|zip)\.\d+$', re.IGNORECASE)
+    z_regex = re.compile(r'(.+)\.z\d+$', re.IGNORECASE)
+
+    archives = {} # key: base_name, value: list of parts
+    
+    # First pass: group all volume parts
+    for f in files:
+        match = part_regex.match(f) or r_regex.match(f) or num_regex.match(f) or z_regex.match(f)
+        if match:
+            base_name = match.group(1)
+            if base_name not in archives:
+                archives[base_name] = []
+            archives[base_name].append(f)
+
+    # Identify primary files
+    primary_files = []
+    processed_files = set()
+
+    # Add the first part of each archive group
+    for base_name, parts in archives.items():
+        parts.sort() # Sort to find the first part reliably
+        first_part = parts[0]
+        
+        # For .z01 style, the .zip file is the primary
+        if z_regex.match(first_part):
+            zip_file = f"{base_name}.zip"
+            if zip_file in files:
+                primary_files.append(zip_file)
+                processed_files.add(zip_file)
+            else: # If .zip is missing, use the first part
+                primary_files.append(first_part)
+        else:
+            primary_files.append(first_part)
+        
+        processed_files.update(parts)
+
+    # Add all other non-volume files
+    for f in files:
+        if f not in processed_files:
+            primary_files.append(f)
+            
+    return primary_files
+
+
 global_last_success_password = None
 
 
@@ -544,7 +625,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
     global extract_to_base_folder
     """递归解压文件，处理密码保护的压缩文件喵"""
     temp_folder = create_unique_directory(base_folder, "temp_extract")
-    last_compressed_file_name = os.path.splitext(os.path.basename(file_path))[0]
+    last_compressed_file_name = get_archive_base_name(file_path)
 
     passwords = sorted(pwdDictionary.items(), key=lambda item: item[1], reverse=True)
     password = (
@@ -578,17 +659,28 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
     global_last_success_password = password
     add_password(password)
 
-    files = os.listdir(temp_folder)
-    orig_temp_folder = temp_folder
-    while len(files) == 1 and os.path.isdir(os.path.join(temp_folder, files[0])):
-        deeper_folder = os.path.join(temp_folder, files[0])
-        files = os.listdir(deeper_folder)
-        temp_folder = deeper_folder
-        last_compressed_file_name = os.path.basename(temp_folder)
+    # Scan the temporary folder for files and group multi-volume archives
+    try:
+        grouped_files = group_archive_files(temp_folder)
+        # If the only item is a directory, go deeper.
+        while len(grouped_files) == 0 and len(os.listdir(temp_folder)) == 1:
+            only_item_name = os.listdir(temp_folder)[0]
+            deeper_folder = os.path.join(temp_folder, only_item_name)
+            if os.path.isdir(deeper_folder):
+                temp_folder = deeper_folder
+                last_compressed_file_name = os.path.basename(temp_folder)
+                grouped_files = group_archive_files(temp_folder)
+            else:
+                break # Not a directory, stop digging
+    except FileNotFoundError:
+        # This can happen if extraction yields an empty folder that gets deleted.
+        grouped_files = []
 
+    orig_temp_folder = temp_folder
+    
     finished = False
-    if len(files) == 1:
-        new_file_path = os.path.join(temp_folder, files[0])
+    if len(grouped_files) == 1:
+        new_file_path = os.path.join(temp_folder, grouped_files[0])
         finished = recursive_extract(base_folder, new_file_path, password, level + 1)
         if not finished:
             try:
@@ -597,6 +689,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
                 pass
     else:
         finished = True
+
     if finished:
         if extract_to_base_folder:
             target_folder = base_folder
@@ -604,9 +697,13 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
             target_folder = create_unique_directory(
                 base_folder, last_compressed_file_name
             )
-        for f in files:
+        
+        # Move all contents from the final temp_folder to target
+        all_contents = os.listdir(temp_folder)
+        for f in all_contents:
             shutil.move(os.path.join(temp_folder, f), target_folder)
         print_success(f"最终文件被移动到：{target_folder}")
+
     try_remove_directory(orig_temp_folder)
     return False
 
