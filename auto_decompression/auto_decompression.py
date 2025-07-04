@@ -625,6 +625,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
     global extract_to_base_folder
     """递归解压文件，处理密码保护的压缩文件喵"""
     temp_folder = create_unique_directory(base_folder, "temp_extract")
+    orig_temp_folder = temp_folder  # 保存最初创建的临时目录路径
     last_compressed_file_name = get_archive_base_name(file_path)
 
     passwords = sorted(pwdDictionary.items(), key=lambda item: item[1], reverse=True)
@@ -651,7 +652,7 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
                     file_path = file_path + RECOVER_SUFFIX
                     break
                 else:
-                    try_remove_directory(temp_folder)
+                    try_remove_directory(orig_temp_folder)
                     return True
         else:
             break
@@ -676,8 +677,6 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
         # This can happen if extraction yields an empty folder that gets deleted.
         grouped_files = []
 
-    orig_temp_folder = temp_folder
-    
     finished = False
     if len(grouped_files) == 1:
         new_file_path = os.path.join(temp_folder, grouped_files[0])
