@@ -24,7 +24,7 @@ def compute_score(img_path, screen_ratio, max_area, max_size):
         return -10000
     width, height, ratio, file_size = info
 
-    # 1. 比例评分（最高100分）
+    # 1. 比例评分
     score_aspect = aspect_ratio_score(ratio, screen_ratio)
 
     # 2. 格式评分（保持原有逻辑）
@@ -38,9 +38,9 @@ def compute_score(img_path, screen_ratio, max_area, max_size):
     else:
         score_format = 0
 
-    # 3. 分辨率评分（最高60分）
+    # 3. 分辨率评分（最高45分）
     if width * height >= 3840 * 2160:  # 4K
-        score_resolution = 60
+        score_resolution = 45
     elif width * height >= 2560 * 1440:  # 2K
         score_resolution = 40
     elif width * height >= 1920 * 1080:  # 1K
@@ -50,19 +50,33 @@ def compute_score(img_path, screen_ratio, max_area, max_size):
     else:
         score_resolution = -40
 
-    # 4. 文件大小评分（最高30分）
-    score_filesize = 30 * (file_size / max_size) if max_size > 0 else 0
+    # 4. 文件大小评分（最高20分）
+    score_filesize = 20 * (file_size / max_size) if max_size > 0 else 0
 
     return score_aspect + score_format + score_resolution + score_filesize
 
 
 def aspect_ratio_score(image_ratio, desired_ratio):
-    ratio_factor = max(image_ratio / desired_ratio, desired_ratio / image_ratio)
-    alpha = 2.0
-    max_score = 100.0
-    diff = math.log(ratio_factor)
-    raw_score = max_score * math.exp(-alpha * (diff ** 2))
-    return raw_score
+    """
+    计算比例评分：以覆盖方式放置壁纸时，计算无法显示的部分占比
+    X% 的部分无法显示，X越大扣分越多
+    """
+    if desired_ratio <= 0 or image_ratio <= 0:
+        return 0
+    
+    scale_factor = max(1.0 / image_ratio, desired_ratio)
+    
+    if image_ratio > desired_ratio:
+        visible_ratio = desired_ratio / image_ratio
+    else:
+        visible_ratio = image_ratio / desired_ratio
+    
+    invisible_ratio = 1.0 - visible_ratio
+    
+    max_score = 200.0
+    score = max_score * (1.0 - invisible_ratio)
+    
+    return score
 
 
 def get_image_info(filepath):
@@ -191,6 +205,14 @@ class ImageBrowser:
         self.page_label.pack(side=tk.LEFT, padx=5)
         next_button = tk.Button(top_frame, text="下一页", command=self.next_page)
         next_button.pack(side=tk.LEFT, padx=5)
+        
+        # 添加屏幕比例预览勾选框
+        self.show_overlay_var = tk.BooleanVar(value=False)
+        overlay_checkbox = tk.Checkbutton(top_frame, text="显示屏幕比例遮挡", 
+                                         variable=self.show_overlay_var, 
+                                         command=self.display_page)
+        overlay_checkbox.pack(side=tk.LEFT, padx=10)
+        
         self.middle_frame = tk.Frame(self.master)
         self.middle_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.middle_frame.bind("<Configure>", lambda event: self.display_page())
@@ -270,14 +292,99 @@ class ImageBrowser:
             cur_index = start_index + idx
             cell_canvas = tk.Canvas(self.middle_frame, width=target_size[0], height=target_size[1], highlightthickness=0)
             cell_canvas.create_image(target_size[0] // 2, target_size[1] // 2, image=thumb)
-            score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size)
-            cell_canvas.create_text(target_size[0] - 4, target_size[1] - 4, text=str(int(score)), anchor="se", fill="green", font=("Arial", 10, "bold"))
+            
+            # 计算总分数和比例评分
+            total_score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size)
+            info = get_image_info(img_path)
+            if info is not None:
+                _, _, ratio, _ = info
+                aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
+                score_text = f"{int(total_score)}\n({int(aspect_score)})"
+            else:
+                score_text = str(int(total_score))
+            
+            cell_canvas.create_text(target_size[0] - 4, target_size[1] - 4, text=score_text, anchor="se", fill="green", font=("Arial", 9, "bold"))
             cell_canvas.grid(row=row, column=col, padx=pad, pady=pad, sticky="nsew")
             cell_canvas.bind("<Button-1>", lambda event, path=img_path, idx=cur_index: self.open_preview(path, idx))
             cell_canvas.bind("<Button-3>", lambda event, path=img_path: open_external_and_copy(path))
             self.middle_frame.grid_columnconfigure(col, weight=1)
+        
+        # 绘制屏幕比例遮挡效果
+        if self.show_overlay_var.get():
+            for idx, img_path in enumerate(page_images):
+                row = idx // columns
+                col = idx % columns
+                thumb = self.get_thumbnail(img_path, target_size)
+                if thumb is None:
+                    thumb = self.placeholder_image
+                cur_index = start_index + idx
+                cell_canvas = self.middle_frame.grid_slaves(row=row, column=col)[0]
+                self.draw_thumbnail_overlay(cell_canvas, img_path, target_size)
+        
         total_pages = (len(self.sorted_images) + self.page_size - 1) // self.page_size
         self.page_label.config(text=f"Page {self.current_page + 1}/{total_pages}")
+
+    def draw_thumbnail_overlay(self, canvas, img_path, target_size):
+        """在缩略图上绘制屏幕比例遮挡效果"""
+        try:
+            info = get_image_info(img_path)
+            if info is None:
+                return
+            
+            orig_width, orig_height, image_ratio, _ = info
+            canvas_width, canvas_height = target_size
+            
+            # 计算缩略图的实际显示区域（因为 thumbnail 会保持比例）
+            scale = min(canvas_width / orig_width, canvas_height / orig_height)
+            thumb_width = orig_width * scale
+            thumb_height = orig_height * scale
+            
+            # 缩略图在 canvas 中的位置（居中）
+            thumb_x1 = (canvas_width - thumb_width) / 2
+            thumb_y1 = (canvas_height - thumb_height) / 2
+            thumb_x2 = thumb_x1 + thumb_width
+            thumb_y2 = thumb_y1 + thumb_height
+            
+            # 计算可见区域
+            if image_ratio > self.screen_ratio:
+                # 图片比屏幕更宽，会裁剪左右部分
+                visible_width_ratio = self.screen_ratio / image_ratio
+                visible_width = thumb_width * visible_width_ratio
+                
+                # 可见区域居中
+                visible_x1 = thumb_x1 + (thumb_width - visible_width) / 2
+                visible_x2 = visible_x1 + visible_width
+                
+                # 绘制左右遮挡区域
+                if visible_x1 > thumb_x1:
+                    canvas.create_rectangle(thumb_x1, thumb_y1, visible_x1, thumb_y2,
+                                          fill="black", stipple="gray25", outline="",
+                                          tags="thumbnail_overlay")
+                if visible_x2 < thumb_x2:
+                    canvas.create_rectangle(visible_x2, thumb_y1, thumb_x2, thumb_y2,
+                                          fill="black", stipple="gray25", outline="",
+                                          tags="thumbnail_overlay")
+            else:
+                # 图片比屏幕更高，会裁剪上下部分
+                visible_height_ratio = image_ratio / self.screen_ratio
+                visible_height = thumb_height * visible_height_ratio
+                
+                # 可见区域居中
+                visible_y1 = thumb_y1 + (thumb_height - visible_height) / 2
+                visible_y2 = visible_y1 + visible_height
+                
+                # 绘制上下遮挡区域
+                if visible_y1 > thumb_y1:
+                    canvas.create_rectangle(thumb_x1, thumb_y1, thumb_x2, visible_y1,
+                                          fill="black", stipple="gray25", outline="",
+                                          tags="thumbnail_overlay")
+                if visible_y2 < thumb_y2:
+                    canvas.create_rectangle(thumb_x1, visible_y2, thumb_x2, thumb_y2,
+                                          fill="black", stipple="gray25", outline="",
+                                          tags="thumbnail_overlay")
+                                          
+        except Exception as e:
+            print(f"绘制缩略图遮挡失败: {e}")
 
     def get_thumbnail(self, img_path, target_size):
         key = (img_path, target_size)
@@ -357,6 +464,14 @@ class PreviewWindow:
         self.slider = tk.Scale(self.top, from_=0.1, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, label="额外缩放", command=self.update_zoom)
         self.slider.set(1.0)
         self.slider.pack(fill=tk.X)
+        
+        # 添加显示屏幕比例遮挡的勾选框
+        self.show_screen_ratio_var = tk.BooleanVar(value=False)
+        self.screen_ratio_checkbox = tk.Checkbutton(self.top, text="显示屏幕比例遮挡",
+                                                   variable=self.show_screen_ratio_var,
+                                                   command=self.display_image)
+        self.screen_ratio_checkbox.pack(fill=tk.X, padx=5)
+        
         self.info_label = tk.Label(self.top, text="", anchor="w")
         self.info_label.pack(fill=tk.X, padx=5, pady=5)
         btn_frame = tk.Frame(self.top)
@@ -370,6 +485,35 @@ class PreviewWindow:
         self.top.bind("<Left>", lambda event: self.prev_image())
         self.top.bind("<Right>", lambda event: self.next_image())
         self.top.bind("<Control-c>", lambda event: self.copy_current_file())
+
+        # 拖动状态
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+        self.view_offset_x = 0
+        self.view_offset_y = 0
+
+        # 绑定拖动事件
+        self.canvas.bind("<ButtonPress-1>", self.start_drag)
+        self.canvas.bind("<B1-Motion>", self.do_drag)
+
+        self.display_image()
+
+    def start_drag(self, event):
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+
+    def do_drag(self, event):
+        if not self.show_screen_ratio_var.get():
+            return
+
+        dx = event.x - self.drag_start_x
+        dy = event.y - self.drag_start_y
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+
+        # 更新偏移量并重绘
+        self.view_offset_x += dx
+        self.view_offset_y += dy
         self.display_image()
 
     def display_image(self):
@@ -393,18 +537,27 @@ class PreviewWindow:
             return
         self.canvas.delete("all")
         self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
+        
+        # 如果勾选了显示屏幕比例遮挡，则绘制遮挡
+        if self.show_screen_ratio_var.get():
+            self.draw_screen_ratio_overlay(canvas_width, canvas_height, new_size)
+            
         self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
         self.top.title(f"预览: {os.path.basename(self.img_path)}")
         info = get_image_info(self.img_path)
         if info is not None:
             width, height, ratio, file_size = info
-            score = compute_score(self.img_path, self.screen_ratio, self.max_area, self.max_size)
-            info_text = f"尺寸: {width}x{height}, 大小: {file_size} bytes, 分数: {score:.1f}"
+            total_score = compute_score(self.img_path, self.screen_ratio, self.max_area, self.max_size)
+            aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
+            info_text = f"尺寸: {width}x{height}, 大小: {file_size} bytes, 总分: {total_score:.1f}, 比例分: {aspect_score:.1f}"
             self.info_label.config(text=info_text)
 
     def update_zoom(self, val):
         try:
             self.zoom_level = float(val)
+            # 缩放时重置偏移量
+            self.view_offset_x = 0
+            self.view_offset_y = 0
             self.display_image()
         except Exception as e:
             print("更新缩放出错:", e)
@@ -428,6 +581,9 @@ class PreviewWindow:
             return
         self.slider.set(1.0)
         self.zoom_level = 1.0
+        # 重置偏移量
+        self.view_offset_x = 0
+        self.view_offset_y = 0
         self.display_image()
 
     def open_external_and_copy(self):
@@ -435,6 +591,75 @@ class PreviewWindow:
 
     def copy_current_file(self):
         copy_file_to_clipboard(self.img_path)
+
+    def draw_screen_ratio_overlay(self, canvas_width, canvas_height, image_size):
+        """
+        绘制屏幕比例的半透明遮挡，显示以覆盖模式显示时能够看到的部分
+        """
+        try:
+            orig_width, orig_height = self.original_image.size
+            image_ratio = orig_width / orig_height
+            img_display_width, img_display_height = image_size
+
+            # 计算可见区域的尺寸
+            if image_ratio > self.screen_ratio:
+                visible_width = img_display_height * self.screen_ratio
+                visible_height = img_display_height
+            else:
+                visible_width = img_display_width
+                visible_height = img_display_width / self.screen_ratio
+
+            # 图片在画布中的边界
+            img_x1 = (canvas_width - img_display_width) / 2
+            img_y1 = (canvas_height - img_display_height) / 2
+            img_x2 = img_x1 + img_display_width
+            img_y2 = img_y1 + img_display_height
+
+            # 拖动边界检查
+            max_offset_x = (img_display_width - visible_width) / 2
+            max_offset_y = (img_display_height - visible_height) / 2
+            self.view_offset_x = max(-max_offset_x, min(max_offset_x, self.view_offset_x))
+            self.view_offset_y = max(-max_offset_y, min(max_offset_y, self.view_offset_y))
+
+            # 计算可见区域位置（考虑拖动偏移）
+            center_x = canvas_width / 2 + self.view_offset_x
+            center_y = canvas_height / 2 + self.view_offset_y
+            visible_x1 = center_x - visible_width / 2
+            visible_y1 = center_y - visible_height / 2
+            visible_x2 = visible_x1 + visible_width
+            visible_y2 = visible_y1 + visible_height
+            
+            # 确保可见区域不会超出图片范围
+            visible_x1 = max(visible_x1, img_x1)
+            visible_y1 = max(visible_y1, img_y1)
+            visible_x2 = min(visible_x2, img_x2)
+            visible_y2 = min(visible_y2, img_y2)
+
+            # 绘制四个方向的遮挡层
+            # stipple='gray50' or 'gray25' can create a semi-transparent effect
+            overlay_fill = "black"
+            overlay_stipple = "gray50"
+            overlay_tag = "screen_ratio_overlay"
+
+            # Top overlay
+            self.canvas.create_rectangle(img_x1, img_y1, img_x2, visible_y1,
+                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                       tags=overlay_tag)
+            # Bottom overlay
+            self.canvas.create_rectangle(img_x1, visible_y2, img_x2, img_y2,
+                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                       tags=overlay_tag)
+            # Left overlay
+            self.canvas.create_rectangle(img_x1, visible_y1, visible_x1, visible_y2,
+                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                       tags=overlay_tag)
+            # Right overlay
+            self.canvas.create_rectangle(visible_x2, visible_y1, img_x2, visible_y2,
+                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                       tags=overlay_tag)
+
+        except Exception as e:
+            print(f"绘制屏幕比例遮挡失败: {e}")
 
 
 def main():
