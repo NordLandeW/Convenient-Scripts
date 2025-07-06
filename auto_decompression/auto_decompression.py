@@ -508,6 +508,135 @@ def extract_with_7zip(file_path, extract_to, password: str = None):
     return result
 
 
+def extract_with_bandizip(file_path, extract_to, password=None):
+    """使用 Bandizip 命令行版本 (bz.exe) 尝试解压文件喵
+    
+    返回值：
+    1: 成功解压
+    -1: 密码错误
+    -2: 无法打开文件（不是压缩文件或文件损坏）
+    -3: 其他错误
+    """
+    # 构建命令，避免在参数内使用引号，让subprocess处理路径
+    command = ["bz", "x", f"-o:{extract_to}", "-aoa", "-y"]
+    if password:
+        command.append(f"-p:{password}")
+    command.append(file_path)
+
+    # Get directory contents before extraction
+    try:
+        before_files = set(os.listdir(extract_to))
+    except FileNotFoundError:
+        before_files = set()
+
+    # 执行 Bandizip 解压
+    process = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+    
+    # 分析错误输出以确定具体错误类型
+    stderr_output = process.stderr.lower()
+    stdout_output = process.stdout.lower()
+    combined_output = stderr_output + stdout_output
+    
+    # 检查是否为密码错误
+    if "invalid password" in combined_output or "0xa0000021" in combined_output:
+        return -1
+    
+    # 检查是否为无法打开文件的错误
+    if ("cannot open" in combined_output or 
+        "not archive" in combined_output or 
+        "unsupported" in combined_output or
+        "corrupted" in combined_output or
+        "系统找不到指定的文件" in combined_output or
+        "file not found" in combined_output):
+        return -2
+
+    # Get directory contents after extraction
+    try:
+        after_files = set(os.listdir(extract_to))
+    except FileNotFoundError:
+        after_files = set()
+
+    new_files = after_files - before_files
+
+    if not new_files:
+        # 如果返回码不为0且没有新文件，可能是其他错误
+        if process.returncode != 0:
+            # 输出详细的错误信息
+            print_error("Bandizip 执行出现未知错误喵：")
+            print_error(f"命令: {' '.join(command)}")
+            print_error(f"返回码: {process.returncode}")
+            if process.stdout.strip():
+                print_error(f"标准输出: {process.stdout}")
+            if process.stderr.strip():
+                print_error(f"错误输出: {process.stderr}")
+            return -3
+        return -2  # 没有新文件，可能不是压缩文件
+
+    # Check if any new file has size > 0
+    for item in new_files:
+        full_item_path = os.path.join(extract_to, item)
+        if os.path.isfile(full_item_path) and os.path.getsize(full_item_path) > 0:
+            return 1  # 成功
+        if os.path.isdir(full_item_path):
+            for root, _, files_in_dir in os.walk(full_item_path):
+                for f_in_dir in files_in_dir:
+                    if os.path.getsize(os.path.join(root, f_in_dir)) > 0:
+                        return 1  # 成功
+
+    # 解压了文件但都是空文件，可能是某种错误
+    print_error("Bandizip 解压了文件但都是空文件，出现未知错误喵：")
+    print_error(f"命令: {' '.join(command)}")
+    print_error(f"返回码: {process.returncode}")
+    if process.stdout.strip():
+        print_error(f"标准输出: {process.stdout}")
+    if process.stderr.strip():
+        print_error(f"错误输出: {process.stderr}")
+    return -3
+
+
+def handle_bandizip_extraction(file_path, temp_folder, passwords, level):
+    """
+    使用 Bandizip 处理解压，会遍历密码字典并支持手动输入。
+    成功则返回密码，失败则返回 None。
+    """
+    print_info("7zip 打不开这个提取出来的文件，换用 Bandizip 试试喵...")
+    # 1. 尝试密码字典中的所有密码
+    for pwd_item in passwords:
+        pwd = pwd_item[0]
+        result = extract_with_bandizip(file_path, temp_folder, pwd)
+        if result == 1:  # 成功
+            print_success(f"Bandizip 使用密码 '{pwd}' 解压成功喵！")
+            return pwd
+        elif result == -1:  # 密码错误，继续尝试下一个
+            print_info(f"密码 '{pwd}' 错误喵。")
+        elif result == -2:  # 无法打开文件
+            print_warning("Bandizip 无法打开此文件，可能不是压缩文件或文件已损坏喵。")
+            return None
+        else:  # 其他错误，不再继续尝试
+            print_warning("Bandizip 遇到未知错误，停止尝试喵。")
+            return None
+
+    # 2. 如果字典密码都失败了，请求手动输入
+    while True:
+        console.print(f"[cyan][b]（Bandizip）请输入第{level}层文件的解压密码喵：", end="")
+        password = input()
+        if not password:  # 用户直接回车，取消操作
+            print_warning("用户取消了手动输入密码。")
+            return None
+        
+        result = extract_with_bandizip(file_path, temp_folder, password)
+        if result == 1:  # 成功
+            return password
+        elif result == -1:  # 密码错误
+            print_warning("密码错误，请重新输入喵！")
+        elif result == -2:  # 无法打开文件
+            print_warning("Bandizip 无法打开此文件，可能不是压缩文件或文件已损坏喵。")
+            return None
+        else:  # 其他错误，不再继续尝试
+            print_warning("Bandizip 遇到未知错误，停止尝试喵。")
+            return None
+
+
 def try_passwords(file_path, extract_to, passwords, last_tried_password):
     """尝试一系列密码解压文件喵，如果没有有效密码则返回None"""
     for password in passwords:
@@ -641,8 +770,23 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
             ) or manual_password_entry(file_path, temp_folder, level)
             break
         elif tryResult == -2:
+            # 7zip 无法打开文件，尝试其他方法
+            if file_path.endswith(RECOVER_SUFFIX):
+                # 这是一个从隐藏zip中提取的文件，7zip打不开，需要用Bandizip处理
+                new_password = handle_bandizip_extraction(file_path, temp_folder, passwords, level)
+                if new_password:
+                    password = new_password # 更新当前密码
+                    break  # Bandizip成功，跳出while循环，继续后续处理
+                else:
+                    # Bandizip也失败了，这个文件没救了
+                    print_warning("Bandizip 也无法处理这个文件喵。")
+                    try_remove_directory(orig_temp_folder)
+                    return True # 结束当前分支的解压
+
+            # 如果不是RECOVER_SUFFIX文件，或者Bandizip失败了，走原来的隐藏文件检测逻辑
+            found_embedded = False
             for fmt in ["zip", "rar", "7z", "*"]:
-                if level == 1 and RECOVER_SUFFIX not in file_path and hiddenZip.has_embedded_signature(file_path, fmt):
+                if level <= 2 and RECOVER_SUFFIX not in file_path and hiddenZip.has_embedded_signature(file_path, fmt):
                     print_info(
                         f"发现文件嵌入了隐藏{"的某个文件" if fmt == "*" else fmt.upper()}喵，准备处理喵！"
                     )
@@ -650,10 +794,15 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
                         file_path, file_path + RECOVER_SUFFIX, fmt
                     )
                     file_path = file_path + RECOVER_SUFFIX
-                    break
-                else:
-                    try_remove_directory(orig_temp_folder)
-                    return True
+                    found_embedded = True
+                    break # 跳出 for 循环，进入下一个 while 循环再次尝试解压
+            
+            if found_embedded:
+                continue # 重新开始 while 循环，用 7zip 尝试解压新提取的文件
+
+            # 如果以上所有尝试都失败了
+            try_remove_directory(orig_temp_folder)
+            return True
         else:
             break
 
