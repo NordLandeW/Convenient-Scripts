@@ -543,7 +543,7 @@ def extract_with_bandizip(file_path, extract_to, password=None):
     
     # 检查是否为无法打开文件的错误
     if ("cannot open" in combined_output or 
-        "not archive" in combined_output or 
+        "Unknown archive" in combined_output or 
         "unsupported" in combined_output or
         "corrupted" in combined_output or
         "系统找不到指定的文件" in combined_output or
