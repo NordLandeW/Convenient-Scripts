@@ -18,8 +18,8 @@ def _print_progress(cur, total, prefix=""):
     sys.stdout.write(f"\r{prefix}{cur}/{total}  {pct}%")
     sys.stdout.flush()
 
-def compute_score(img_path, screen_ratio, max_area, max_size):
-    info = get_image_info(img_path)
+def compute_score(img_path, screen_ratio, max_area, max_size, preloaded_info=None):
+    info = preloaded_info if preloaded_info is not None else get_image_info(img_path)
     if info is None:
         return -10000
     width, height, ratio, file_size = info
@@ -179,6 +179,8 @@ class ImageBrowser:
         self.sorted_images = []
         self.thumbnails = {}
         self.thumbnail_futures = {}
+        self.image_info_cache = {}
+        self.score_cache = {}
         self.current_page = 0
         self.current_columns = 3
         self.desired_ratio = desired_ratio
@@ -238,35 +240,60 @@ class ImageBrowser:
         screen_height = self.master.winfo_screenheight()
         self.screen_ratio = screen_width / screen_height
 
-        # 阶段一：读取图片信息并统计 max_area / max_size
+        # 阶段一：并行读取图片信息并统计 max_area / max_size
+        self.image_info_cache.clear()
+        self.score_cache.clear()
         self.max_area = 0
         self.max_size = 0
-        for idx, path in enumerate(self.images, 1):
-            info = get_image_info(path)
-            if info is not None:
-                w, h, _, sz = info
-                area = w * h
-                if area > self.max_area:
-                    self.max_area = area
-                if sz > self.max_size:
-                    self.max_size = sz
-            _print_progress(idx, total, "读取信息 ")
+        max_workers = min(32, max(4, (os.cpu_count() or 1) * 2))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(get_image_info, path): path for path in self.images}
+            for idx, fut in enumerate(as_completed(futures), 1):
+                path = futures[fut]
+                try:
+                    info = fut.result()
+                except Exception:
+                    logger.exception("读取图片信息失败: {}", path)
+                    info = None
+                if info is not None:
+                    self.image_info_cache[path] = info
+                    w, h, _, sz = info
+                    area = w * h
+                    if area > self.max_area:
+                        self.max_area = area
+                    if sz > self.max_size:
+                        self.max_size = sz
+                _print_progress(idx, total, "读取信息 ")
 
         print()  # 换行
 
         # 阶段二：多线程计算评分
         score_dict = {}
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        score_workers = min(32, max(4, (os.cpu_count() or 1) * 2))
+        with ThreadPoolExecutor(max_workers=score_workers) as pool:
             futures = {pool.submit(compute_score, p, self.screen_ratio,
-                                self.max_area, self.max_size): p for p in self.images}
+                                self.max_area, self.max_size, self.image_info_cache.get(p)): p for p in self.images}
             for idx, fut in enumerate(as_completed(futures), 1):
                 p = futures[fut]
-                score_dict[p] = fut.result()
+                try:
+                    score_dict[p] = fut.result()
+                except Exception:
+                    logger.exception("计算评分失败: {}", p)
+                    score_dict[p] = -10000
                 _print_progress(idx, total, "计算评分 ")
         print()  # 换行
 
         # 根据评分排序
+        self.score_cache = score_dict
         self.sorted_images = sorted(self.images, key=lambda x: score_dict[x], reverse=True)
+
+    def get_cached_image_info(self, img_path):
+        info = self.image_info_cache.get(img_path)
+        if info is None:
+            info = get_image_info(img_path)
+            if info is not None:
+                self.image_info_cache[img_path] = info
+        return info
 
     def display_page(self):
         for widget in self.middle_frame.winfo_children():
@@ -313,10 +340,13 @@ class ImageBrowser:
             cell_canvas = tk.Canvas(self.middle_frame, width=target_size[0], height=target_size[1], highlightthickness=0)
             cell_canvas.create_image(target_size[0] // 2, target_size[1] // 2, image=thumb)
             
-            total_score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size)
-            info = get_image_info(img_path)
-            if info is not None:
-                _, _, ratio, _ = info
+            cached_info = self.get_cached_image_info(img_path)
+            total_score = self.score_cache.get(img_path)
+            if total_score is None:
+                total_score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size, cached_info)
+                self.score_cache[img_path] = total_score
+            if cached_info is not None:
+                _, _, ratio, _ = cached_info
                 aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
                 score_text = f"{int(total_score)}\n({int(aspect_score)})"
             else:
@@ -340,7 +370,7 @@ class ImageBrowser:
     def draw_thumbnail_overlay(self, canvas, img_path, target_size):
         """在缩略图上绘制屏幕比例遮挡效果"""
         try:
-            info = get_image_info(img_path)
+            info = self.get_cached_image_info(img_path)
             if info is None:
                 return
             
@@ -441,11 +471,11 @@ class ImageBrowser:
             self.display_page()
 
     def open_preview(self, img_path, index):
-        PreviewWindow(self.master, self.sorted_images, index, self.screen_ratio, self.max_area, self.max_size)
+        PreviewWindow(self.master, self.sorted_images, index, self.screen_ratio, self.max_area, self.max_size, self.image_info_cache, self.score_cache)
 
 
 class PreviewWindow:
-    def __init__(self, master, image_list, index, screen_ratio, max_area, max_size):
+    def __init__(self, master, image_list, index, screen_ratio, max_area, max_size, info_cache, score_cache):
         self.screen_ratio = screen_ratio
         self.max_area = max_area
         self.max_size = max_size
@@ -453,6 +483,8 @@ class PreviewWindow:
         self.image_list = image_list
         self.index = index
         self.img_path = self.image_list[self.index]
+        self.info_cache = info_cache
+        self.score_cache = score_cache
         self.top = tk.Toplevel(master)
         self.top.title(f"预览: {os.path.basename(self.img_path)}")
         self.top.focus_force()
@@ -628,10 +660,10 @@ class PreviewWindow:
         self._update_canvas_position(redraw_overlay=True)
 
         self.top.title(f"预览: {os.path.basename(self.img_path)}")
-        info = get_image_info(self.img_path)
+        info = self.get_cached_image_info(self.img_path)
         if info is not None:
             width, height, ratio, file_size = info
-            total_score = compute_score(self.img_path, self.screen_ratio, self.max_area, self.max_size)
+            total_score = self.get_cached_score(self.img_path, info)
             aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
             info_text = f"尺寸: {width}x{height}, 大小: {file_size} bytes, 总分: {total_score:.1f}, 比例分: {aspect_score:.1f}"
             self.info_label.config(text=info_text)
@@ -734,6 +766,28 @@ class PreviewWindow:
 
     def copy_current_file(self):
         copy_file_to_clipboard(self.img_path)
+
+    def get_cached_image_info(self, img_path):
+        info = None
+        if self.info_cache is not None:
+            info = self.info_cache.get(img_path)
+        if info is None:
+            info = get_image_info(img_path)
+            if info is not None and self.info_cache is not None:
+                self.info_cache[img_path] = info
+        return info
+
+    def get_cached_score(self, img_path, info=None):
+        score = None
+        if self.score_cache is not None:
+            score = self.score_cache.get(img_path)
+        if score is None:
+            if info is None:
+                info = self.get_cached_image_info(img_path)
+            score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size, info)
+            if self.score_cache is not None:
+                self.score_cache[img_path] = score
+        return score
 
     def draw_screen_ratio_overlay(self, canvas_width, canvas_height, image_size, image_center, visible_size):
         """
