@@ -228,6 +228,9 @@ class ImageBrowser:
         self.images = collect_images(folder)
         if not self.images:
             messagebox.showinfo("提示", "该文件夹下没有找到图片！")
+            self.sorted_images = []
+            self.current_page = 0
+            self.display_page()
             return
 
         total = len(self.images)
@@ -268,21 +271,38 @@ class ImageBrowser:
     def display_page(self):
         for widget in self.middle_frame.winfo_children():
             widget.destroy()
+
+        total_images = len(self.sorted_images)
+        total_pages = (total_images + self.page_size - 1) // self.page_size if total_images else 0
+
+        if total_pages == 0:
+            self.page_label.config(text="Page 0/0")
+            return
+
+        if self.current_page >= total_pages:
+            self.current_page = max(total_pages - 1, 0)
+
         start_index = self.current_page * self.page_size
         end_index = start_index + self.page_size
         page_images = self.sorted_images[start_index:end_index]
+
+        if not page_images:
+            self.page_label.config(text=f"Page {self.current_page + 1}/{total_pages}")
+            return
+
         columns = self.current_columns
-        rows = math.ceil(len(page_images) / columns)
+        rows = max(1, math.ceil(len(page_images) / columns))
         frame_width = self.middle_frame.winfo_width()
         frame_height = self.middle_frame.winfo_height()
+        outer_pad = 5
         if frame_width <= 0 or frame_height <= 0:
             cell_width, cell_height = 150, 150
         else:
-            pad = 5
-            cell_width = (frame_width - (columns + 1) * pad) / columns
-            cell_height = (frame_height - (rows + 1) * pad) / rows
+            cell_width = (frame_width - (columns + 1) * outer_pad) / columns
+            cell_height = (frame_height - (rows + 1) * outer_pad) / rows
         target_size = (int(cell_width), int(cell_height))
-        pad = 2
+        cell_pad = 2
+
         for idx, img_path in enumerate(page_images):
             row = idx // columns
             col = idx % columns
@@ -293,7 +313,6 @@ class ImageBrowser:
             cell_canvas = tk.Canvas(self.middle_frame, width=target_size[0], height=target_size[1], highlightthickness=0)
             cell_canvas.create_image(target_size[0] // 2, target_size[1] // 2, image=thumb)
             
-            # 计算总分数和比例评分
             total_score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size)
             info = get_image_info(img_path)
             if info is not None:
@@ -304,24 +323,18 @@ class ImageBrowser:
                 score_text = str(int(total_score))
             
             cell_canvas.create_text(target_size[0] - 4, target_size[1] - 4, text=score_text, anchor="se", fill="green", font=("Arial", 9, "bold"))
-            cell_canvas.grid(row=row, column=col, padx=pad, pady=pad, sticky="nsew")
+            cell_canvas.grid(row=row, column=col, padx=cell_pad, pady=cell_pad, sticky="nsew")
             cell_canvas.bind("<Button-1>", lambda event, path=img_path, idx=cur_index: self.open_preview(path, idx))
             cell_canvas.bind("<Button-3>", lambda event, path=img_path: open_external_and_copy(path))
             self.middle_frame.grid_columnconfigure(col, weight=1)
         
-        # 绘制屏幕比例遮挡效果
         if self.show_overlay_var.get():
             for idx, img_path in enumerate(page_images):
                 row = idx // columns
                 col = idx % columns
-                thumb = self.get_thumbnail(img_path, target_size)
-                if thumb is None:
-                    thumb = self.placeholder_image
-                cur_index = start_index + idx
                 cell_canvas = self.middle_frame.grid_slaves(row=row, column=col)[0]
                 self.draw_thumbnail_overlay(cell_canvas, img_path, target_size)
         
-        total_pages = (len(self.sorted_images) + self.page_size - 1) // self.page_size
         self.page_label.config(text=f"Page {self.current_page + 1}/{total_pages}")
 
     def draw_thumbnail_overlay(self, canvas, img_path, target_size):
@@ -464,6 +477,10 @@ class PreviewWindow:
         self.slider = tk.Scale(self.top, from_=0.1, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, label="额外缩放", command=self.update_zoom)
         self.slider.set(1.0)
         self.slider.pack(fill=tk.X)
+
+        self.min_zoom = float(self.slider["from"])
+        self.max_zoom = float(self.slider["to"])
+        self._ignore_zoom_callback = False
         
         # 添加显示屏幕比例遮挡的勾选框
         self.show_screen_ratio_var = tk.BooleanVar(value=False)
@@ -492,29 +509,65 @@ class PreviewWindow:
         self.view_offset_x = 0
         self.view_offset_y = 0
 
-        # 绑定拖动事件
+        self.photo = None
+        self.cached_image_size = None
+        self.cached_canvas_size = None
+        self.image_item = None
+        self.visible_size = None
+        self.max_offset_x = 0
+        self.max_offset_y = 0
+
+        self.canvas.configure(cursor="fleur")
+
+        # 绑定拖动与缩放事件
         self.canvas.bind("<ButtonPress-1>", self.start_drag)
         self.canvas.bind("<B1-Motion>", self.do_drag)
+        self.canvas.bind("<MouseWheel>", self.on_mousewheel)
+        self.canvas.bind("<Button-4>", lambda event: self.on_mousewheel(event, wheel_delta=1))
+        self.canvas.bind("<Button-5>", lambda event: self.on_mousewheel(event, wheel_delta=-1))
+        self.canvas.bind("<Enter>", lambda event: self.canvas.focus_set())
 
         self.display_image()
 
     def start_drag(self, event):
+        self.canvas.focus_set()
         self.drag_start_x = event.x
         self.drag_start_y = event.y
 
     def do_drag(self, event):
-        if not self.show_screen_ratio_var.get():
-            return
-
         dx = event.x - self.drag_start_x
         dy = event.y - self.drag_start_y
         self.drag_start_x = event.x
         self.drag_start_y = event.y
 
-        # 更新偏移量并重绘
         self.view_offset_x += dx
         self.view_offset_y += dy
-        self.display_image()
+        self._clamp_offsets()
+        self._update_canvas_position()
+
+    def _clamp_offsets(self):
+        self.view_offset_x = max(-self.max_offset_x, min(self.max_offset_x, self.view_offset_x))
+        self.view_offset_y = max(-self.max_offset_y, min(self.max_offset_y, self.view_offset_y))
+
+    def _update_canvas_position(self, redraw_overlay=True):
+        if self.image_item is None or self.cached_canvas_size is None:
+            return
+        canvas_width, canvas_height = self.cached_canvas_size
+        image_center_x = canvas_width / 2 + self.view_offset_x
+        image_center_y = canvas_height / 2 + self.view_offset_y
+        self.canvas.coords(self.image_item, image_center_x, image_center_y)
+
+        if redraw_overlay:
+            self.canvas.delete("screen_ratio_overlay")
+            if self.show_screen_ratio_var.get() and self.visible_size is not None:
+                self.draw_screen_ratio_overlay(canvas_width, canvas_height, self.cached_image_size, (image_center_x, image_center_y), self.visible_size)
+        else:
+            if not self.show_screen_ratio_var.get():
+                self.canvas.delete("screen_ratio_overlay")
+
+        bbox = self.canvas.bbox(self.image_item)
+        if bbox:
+            self.canvas.config(scrollregion=bbox)
 
     def display_image(self):
         canvas_width = self.canvas.winfo_width()
@@ -526,23 +579,54 @@ class PreviewWindow:
         except Exception as e:
             print("获取图片尺寸失败:", e)
             return
+
         base_zoom = min(canvas_width / orig_width, canvas_height / orig_height)
         effective_zoom = base_zoom * self.zoom_level
-        new_size = (int(orig_width * effective_zoom), int(orig_height * effective_zoom))
-        try:
-            resized = self.original_image.resize(new_size, Image.Resampling.HAMMING)
-            self.photo = ImageTk.PhotoImage(resized)
-        except Exception as e:
-            print("图片缩放失败:", e)
-            return
-        self.canvas.delete("all")
-        self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
-        
-        # 如果勾选了显示屏幕比例遮挡，则绘制遮挡
+        new_width = max(int(orig_width * effective_zoom), 1)
+        new_height = max(int(orig_height * effective_zoom), 1)
+        new_size = (new_width, new_height)
+
+        needs_resample = self.cached_image_size != new_size or self.photo is None
+        if needs_resample:
+            try:
+                resized = self.original_image.resize(new_size, Image.Resampling.HAMMING)
+                self.photo = ImageTk.PhotoImage(resized)
+            except Exception as e:
+                print("图片缩放失败:", e)
+                return
+            if self.image_item is None:
+                self.image_item = self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
+            else:
+                self.canvas.itemconfigure(self.image_item, image=self.photo)
+            self.cached_image_size = new_size
+        elif self.image_item is None:
+            self.image_item = self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
+
+        self.max_offset_x = max((new_width - canvas_width) / 2, 0)
+        self.max_offset_y = max((new_height - canvas_height) / 2, 0)
+        self.cached_canvas_size = (canvas_width, canvas_height)
+
+        visible_size = None
         if self.show_screen_ratio_var.get():
-            self.draw_screen_ratio_overlay(canvas_width, canvas_height, new_size)
-            
-        self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
+            try:
+                image_ratio = orig_width / orig_height
+            except ZeroDivisionError:
+                image_ratio = 0
+            if image_ratio > 0:
+                if image_ratio > self.screen_ratio:
+                    visible_width = new_height * self.screen_ratio
+                    visible_height = new_height
+                else:
+                    visible_width = new_width
+                    visible_height = new_width / self.screen_ratio
+                visible_width = min(visible_width, new_width)
+                visible_height = min(visible_height, new_height)
+                visible_size = (visible_width, visible_height)
+        self.visible_size = visible_size
+
+        self._clamp_offsets()
+        self._update_canvas_position(redraw_overlay=True)
+
         self.top.title(f"预览: {os.path.basename(self.img_path)}")
         info = get_image_info(self.img_path)
         if info is not None:
@@ -553,14 +637,73 @@ class PreviewWindow:
             self.info_label.config(text=info_text)
 
     def update_zoom(self, val):
+        if self._ignore_zoom_callback:
+            return
         try:
-            self.zoom_level = float(val)
-            # 缩放时重置偏移量
-            self.view_offset_x = 0
-            self.view_offset_y = 0
-            self.display_image()
+            zoom_value = float(val)
         except Exception as e:
             print("更新缩放出错:", e)
+            return
+        self.change_zoom(zoom_value)
+
+    def change_zoom(self, new_zoom, focal_point=None, update_slider=False, reset_offsets=False):
+        new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
+        try:
+            orig_width, orig_height = self.original_image.size
+        except Exception as e:
+            print("获取图片尺寸失败:", e)
+            return
+
+        if reset_offsets:
+            self.view_offset_x = 0
+            self.view_offset_y = 0
+
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        if canvas_width > 1 and canvas_height > 1:
+            base_zoom = min(canvas_width / orig_width, canvas_height / orig_height)
+            old_effective_zoom = base_zoom * self.zoom_level
+            new_effective_zoom = base_zoom * new_zoom
+            old_width = orig_width * old_effective_zoom
+            old_height = orig_height * old_effective_zoom
+            new_width = orig_width * new_effective_zoom
+            new_height = orig_height * new_effective_zoom
+
+            if not reset_offsets and old_width > 0 and old_height > 0:
+                image_center_x = canvas_width / 2 + self.view_offset_x
+                image_center_y = canvas_height / 2 + self.view_offset_y
+                if focal_point is not None:
+                    rel_x = focal_point[0] - image_center_x
+                    rel_y = focal_point[1] - image_center_y
+                    ratio_x = rel_x / old_width
+                    ratio_y = rel_y / old_height
+                    new_center_x = focal_point[0] - ratio_x * new_width
+                    new_center_y = focal_point[1] - ratio_y * new_height
+                    self.view_offset_x = new_center_x - canvas_width / 2
+                    self.view_offset_y = new_center_y - canvas_height / 2
+                else:
+                    scale_x = new_width / old_width if old_width != 0 else 1
+                    scale_y = new_height / old_height if old_height != 0 else 1
+                    self.view_offset_x *= scale_x
+                    self.view_offset_y *= scale_y
+
+        self.zoom_level = new_zoom
+        if update_slider:
+            self._ignore_zoom_callback = True
+            try:
+                self.slider.set(round(new_zoom, 3))
+            finally:
+                self._ignore_zoom_callback = False
+
+        self.display_image()
+
+    def on_mousewheel(self, event, wheel_delta=None):
+        delta = wheel_delta if wheel_delta is not None else event.delta
+        if delta == 0:
+            return
+        step = 1.1 if delta > 0 else 1 / 1.1
+        new_zoom = self.zoom_level * step
+        self.change_zoom(new_zoom, focal_point=(event.x, event.y), update_slider=True)
 
     def prev_image(self):
         if self.index > 0:
@@ -579,12 +722,12 @@ class PreviewWindow:
         except Exception as e:
             print(f"无法打开图片: {self.img_path}\n{e}")
             return
-        self.slider.set(1.0)
-        self.zoom_level = 1.0
-        # 重置偏移量
+        self.photo = None
+        self.cached_image_size = None
+        self.visible_size = None
         self.view_offset_x = 0
         self.view_offset_y = 0
-        self.display_image()
+        self.change_zoom(1.0, update_slider=True, reset_offsets=True)
 
     def open_external_and_copy(self):
         open_external_and_copy(self.img_path)
@@ -592,71 +735,46 @@ class PreviewWindow:
     def copy_current_file(self):
         copy_file_to_clipboard(self.img_path)
 
-    def draw_screen_ratio_overlay(self, canvas_width, canvas_height, image_size):
+    def draw_screen_ratio_overlay(self, canvas_width, canvas_height, image_size, image_center, visible_size):
         """
         绘制屏幕比例的半透明遮挡，显示以覆盖模式显示时能够看到的部分
         """
         try:
-            orig_width, orig_height = self.original_image.size
-            image_ratio = orig_width / orig_height
             img_display_width, img_display_height = image_size
+            visible_width, visible_height = visible_size
+            image_center_x, image_center_y = image_center
 
-            # 计算可见区域的尺寸
-            if image_ratio > self.screen_ratio:
-                visible_width = img_display_height * self.screen_ratio
-                visible_height = img_display_height
-            else:
-                visible_width = img_display_width
-                visible_height = img_display_width / self.screen_ratio
+            img_x1 = image_center_x - img_display_width / 2
+            img_y1 = image_center_y - img_display_height / 2
+            img_x2 = image_center_x + img_display_width / 2
+            img_y2 = image_center_y + img_display_height / 2
 
-            # 图片在画布中的边界
-            img_x1 = (canvas_width - img_display_width) / 2
-            img_y1 = (canvas_height - img_display_height) / 2
-            img_x2 = img_x1 + img_display_width
-            img_y2 = img_y1 + img_display_height
+            visible_x1 = image_center_x - visible_width / 2
+            visible_y1 = image_center_y - visible_height / 2
+            visible_x2 = image_center_x + visible_width / 2
+            visible_y2 = image_center_y + visible_height / 2
 
-            # 拖动边界检查
-            max_offset_x = (img_display_width - visible_width) / 2
-            max_offset_y = (img_display_height - visible_height) / 2
-            self.view_offset_x = max(-max_offset_x, min(max_offset_x, self.view_offset_x))
-            self.view_offset_y = max(-max_offset_y, min(max_offset_y, self.view_offset_y))
-
-            # 计算可见区域位置（考虑拖动偏移）
-            center_x = canvas_width / 2 + self.view_offset_x
-            center_y = canvas_height / 2 + self.view_offset_y
-            visible_x1 = center_x - visible_width / 2
-            visible_y1 = center_y - visible_height / 2
-            visible_x2 = visible_x1 + visible_width
-            visible_y2 = visible_y1 + visible_height
-            
-            # 确保可见区域不会超出图片范围
             visible_x1 = max(visible_x1, img_x1)
             visible_y1 = max(visible_y1, img_y1)
             visible_x2 = min(visible_x2, img_x2)
             visible_y2 = min(visible_y2, img_y2)
 
-            # 绘制四个方向的遮挡层
-            # stipple='gray50' or 'gray25' can create a semi-transparent effect
             overlay_fill = "black"
             overlay_stipple = "gray50"
             overlay_tag = "screen_ratio_overlay"
 
-            # Top overlay
             self.canvas.create_rectangle(img_x1, img_y1, img_x2, visible_y1,
-                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
-                                       tags=overlay_tag)
-            # Bottom overlay
+                                         fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                         tags=overlay_tag)
             self.canvas.create_rectangle(img_x1, visible_y2, img_x2, img_y2,
-                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
-                                       tags=overlay_tag)
-            # Left overlay
+                                         fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                         tags=overlay_tag)
             self.canvas.create_rectangle(img_x1, visible_y1, visible_x1, visible_y2,
-                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
-                                       tags=overlay_tag)
-            # Right overlay
+                                         fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                         tags=overlay_tag)
             self.canvas.create_rectangle(visible_x2, visible_y1, img_x2, visible_y2,
-                                       fill=overlay_fill, stipple=overlay_stipple, outline="",
-                                       tags=overlay_tag)
+                                         fill=overlay_fill, stipple=overlay_stipple, outline="",
+                                         tags=overlay_tag)
 
         except Exception as e:
             print(f"绘制屏幕比例遮挡失败: {e}")
