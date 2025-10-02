@@ -4,6 +4,7 @@ import os
 import sys
 import shutil
 import traceback
+import argparse
 import extract_hidden_zip as hiddenZip
 import send2trash
 from rich.console import Console
@@ -21,6 +22,9 @@ pwdOldFilename = "dict.txt"
 pwdFilename = "dict.json"
 pwdDictionary = {}
 RECOVER_SUFFIX = ".AutoDecRecovered"
+DEFAULT_EMBEDDED_SCAN_MAX_LEVEL = 2  # 小于等于该层级时尝试执行隐藏文件判定与提取
+embedded_scan_depth_setting = DEFAULT_EMBEDDED_SCAN_MAX_LEVEL
+CLI_ARGS = None
 
 GIST_CONFIG_FILE = "gist_config.json"
 _gist_cfg = None  # {token:str, gist_id:str, file:str}
@@ -173,6 +177,28 @@ def _ensure_gist_config():
 
 def append_scr_path(relative_path):
     return os.path.join(sys.path[0], relative_path)
+
+
+def parse_cli_arguments(argv):
+    parser = argparse.ArgumentParser(
+        prog="auto_decompression",
+        description="自动解压压缩包并支持嵌入内容提取的小工具喵",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-e",
+        "--embedded-scan-depth",
+        type=int,
+        default=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL,
+        metavar="K",
+        help="在递归层级小于等于 K 时尝试检测及提取隐藏嵌入文件，设为 0 可禁用此功能",
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help="需解压的压缩文件路径，可直接拖拽物件到脚本上喵",
+    )
+    return parser.parse_args(argv)
 
 
 def print_info(message):
@@ -621,7 +647,7 @@ def handle_bandizip_extraction(file_path, temp_folder, passwords, level):
         console.print(f"[cyan][b]（Bandizip）请输入第{level}层文件的解压密码喵：", end="")
         password = input()
         if not password:  # 用户直接回车，取消操作
-            print_warning("用户取消了手动输入密码。")
+            print_warning(f"用户跳过了文件 {file_path} 的手动密码输入喵，将跳过该文件。")
             return None
         
         result = extract_with_bandizip(file_path, temp_folder, password)
@@ -653,6 +679,9 @@ def manual_password_entry(file_path, extract_to, level):
     while True:
         console.print(f"[cyan][b]请输入第{level}层文件的解压密码喵：", end="")
         password = input()
+        if password == "":
+            print_warning(f"用户跳过了文件 {file_path} 的手动密码输入喵，将跳过该文件。")
+            return None
         if extract_with_7zip(file_path, extract_to, password) > 0:
             return password
         print_warning("密码错误，请重新输入喵！")
@@ -749,7 +778,13 @@ def try_remove_directory(dir):
         pass
 
 
-def recursive_extract(base_folder, file_path, last_success_password=None, level=1):
+def recursive_extract(
+    base_folder,
+    file_path,
+    last_success_password=None,
+    level=1,
+    embedded_scan_depth=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL,
+):
     global global_last_success_password
     global extract_to_base_folder
     """递归解压文件，处理密码保护的压缩文件喵"""
@@ -765,9 +800,14 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
     while True:
         tryResult = extract_with_7zip(file_path, temp_folder, password)
         if tryResult == -1:
-            password = try_passwords(
+            next_password = try_passwords(
                 file_path, temp_folder, passwords, password
             ) or manual_password_entry(file_path, temp_folder, level)
+            if next_password is None:
+                print_warning(f"用户跳过了文件 {file_path} 的密码输入喵，将跳过该文件。")
+                try_remove_directory(orig_temp_folder)
+                return True
+            password = next_password
             break
         elif tryResult == -2:
             # 7zip 无法打开文件，尝试其他方法
@@ -786,7 +826,11 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
             # 如果不是RECOVER_SUFFIX文件，或者Bandizip失败了，走原来的隐藏文件检测逻辑
             found_embedded = False
             for fmt in ["zip", "rar", "7z", "*"]:
-                if level <= 2 and RECOVER_SUFFIX not in file_path and hiddenZip.has_embedded_signature(file_path, fmt):
+                if (
+                    level <= embedded_scan_depth
+                    and RECOVER_SUFFIX not in file_path
+                    and hiddenZip.has_embedded_signature(file_path, fmt)
+                ):
                     print_info(
                         f"发现文件嵌入了隐藏{"的某个文件" if fmt == "*" else fmt.upper()}喵，准备处理喵！"
                     )
@@ -829,7 +873,13 @@ def recursive_extract(base_folder, file_path, last_success_password=None, level=
     finished = False
     if len(grouped_files) == 1:
         new_file_path = os.path.join(temp_folder, grouped_files[0])
-        finished = recursive_extract(base_folder, new_file_path, password, level + 1)
+        finished = recursive_extract(
+            base_folder,
+            new_file_path,
+            password,
+            level + 1,
+            embedded_scan_depth=embedded_scan_depth,
+        )
         if not finished:
             try:
                 os.remove(new_file_path)
@@ -904,8 +954,8 @@ class FileManager:
         self.stop()
 
 
-def main():
-    global extract_to_base_folder, _gist_cfg, _gist_remote_ts
+def main(args):
+    global extract_to_base_folder, _gist_cfg, _gist_remote_ts, embedded_scan_depth_setting
 
     # ① 确保 Gist 配置可用
     _gist_cfg = _ensure_gist_config()
@@ -913,7 +963,18 @@ def main():
     manager = FileManager()
 
     check_passwords()
-    files_to_process = sys.argv[1:]
+
+    embedded_scan_depth_setting = max(0, args.embedded_scan_depth)
+    if args.embedded_scan_depth < 0:
+        print_warning("嵌入检测层级小于 0 喵，已自动调整为 0（禁用嵌入扫描）。")
+    if embedded_scan_depth_setting == 0:
+        print_info("当前已禁用隐藏嵌入文件判定喵。")
+    elif embedded_scan_depth_setting != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
+        print_info(
+            f"隐藏嵌入文件判定最大层级已调整为 {embedded_scan_depth_setting} 层喵。"
+        )
+
+    files_to_process = list(args.files)
 
     try:
         if len(files_to_process) > 0:
@@ -935,7 +996,10 @@ def main():
                             "检测到上一次非正常退出留下的临时文件夹喵！已经把它们全部移动到回收站了喵☆"
                         )
                     recursive_extract(
-                        base_folder, file_path, global_last_success_password
+                        base_folder,
+                        file_path,
+                        global_last_success_password,
+                        embedded_scan_depth=embedded_scan_depth_setting,
                     )
                     remove_autodec_files(base_folder)
                 save_passwords()  # 保存到本地
@@ -967,18 +1031,23 @@ def error_end(e: Exception = None):
 
 
 if __name__ == "__main__":
+    CLI_ARGS = parse_cli_arguments(sys.argv[1:])
     try:
         lock = FileLock(instance_lock)
         with lock.acquire(timeout=0):
             try:
-                main()
+                main(CLI_ARGS)
                 time.sleep(1)
             except Exception as e:
                 error_end(e)
     except Timeout:
-        if len(sys.argv) >= 2:
+        if CLI_ARGS.files:
             # Try to send file paths to the existing instance
-            send_file_to_main_instance(sys.argv[1:])
+            send_file_to_main_instance(CLI_ARGS.files)
+        if CLI_ARGS.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
+            print_warning(
+                "已有实例正在运行，新的嵌入扫描层级参数未被应用喵。请先关闭原实例再重新运行。"
+            )
         print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
         pass
     except Exception:

@@ -4,9 +4,23 @@ import os
 import json
 import subprocess
 import re
+from rich.console import Console
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    FileSizeColumn,
+    TransferSpeedColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 # 可调整参数
 CHUNK_SIZE = 256 * 1024 * 1024  # 256 MB
+COPY_BUFFER_SIZE = 8 * 1024 * 1024  # 8 MB，优化嵌入文件提取性能
+
+console = Console()
 
 # 搜索方式控制变量
 USE_BINWALK = False  # True: 使用 binwalk 搜索, False: 使用手写搜索
@@ -34,6 +48,49 @@ _BINWALK_INSTALLED = None
 
 # 用于缓存针对每个文件的 binwalk 检测结果，避免重复检测
 _BINWALK_RESULTS_CACHE = {}
+
+def _copy_range_with_progress(input_file, output_file, offset, size, signature):
+    """
+    从输入文件指定偏移复制 size 字节到输出文件，并显示进度与速度。
+    """
+    if size <= 0:
+        raise ValueError(f"提取范围大小必须为正数喵：size={size}")
+    total = size
+    buffer = bytearray(COPY_BUFFER_SIZE)
+    mv = memoryview(buffer)
+    display_name = f"{signature.upper()} ➜ {os.path.basename(output_file)}"
+
+    console.print(f"[cyan][b]开始提取嵌入文件：{display_name}[/b][/cyan]")
+
+    with open(input_file, "rb") as f_in, open(output_file, "wb") as f_out:
+        f_in.seek(offset)
+        with Progress(
+            SpinnerColumn(finished_text="✅"),
+            TextColumn("[cyan][b]{task.fields[name]}[/b][/cyan]", justify="left"),
+            BarColumn(),
+            FileSizeColumn(),
+            "•",
+            TransferSpeedColumn(),
+            "•",
+            TimeElapsedColumn(),
+            "/",
+            TimeRemainingColumn(),
+            transient=True,
+            console=console,
+        ) as progress:
+            task = progress.add_task("extract", total=total, name=display_name)
+            remaining = total
+            while remaining > 0:
+                chunk_size = COPY_BUFFER_SIZE if remaining > COPY_BUFFER_SIZE else remaining
+                read_count = f_in.readinto(mv[:chunk_size])
+                if read_count == 0:
+                    raise IOError("在提取嵌入文件时遇到意外的 EOF 喵。")
+                f_out.write(mv[:read_count])
+                remaining -= read_count
+                progress.update(task, advance=read_count)
+
+    del mv
+    console.print(f"[green][b]嵌入文件提取完成：{output_file}[/b][/green]")
 
 def _check_binwalk_installed():
     """
@@ -206,89 +263,45 @@ def _find_first_magic_signature(input_file, signature_type):
 
 def extract_embedded_file(input_file, output_file, signature):
     """
-    根据 USE_BINWALK 变量决定使用哪种提取方式：
-    - True: 使用 binwalk 分析结果进行提取
-    - False: 使用手写搜索进行提取
-    
-    对于手写搜索，支持多种文件格式的提取。
-    若未找到符合的，则抛出 ValueError。
+    根据 USE_BINWALK 变量决定使用哪种提取方式，并在提取过程中展示实时进度和速度。
     """
+    signature_lower = signature.lower()
+    display_signature = signature_lower if signature_lower != "*" else "embedded"
+    offset = None
+    size = None
+
     if USE_BINWALK:
-        # 使用 binwalk 方式提取
-        # 对ZIP文件的特殊处理
-        if signature.lower() == "zip":
-            # 尝试直接查找ZIP文件的魔法头
+        # ZIP 优化：直接通过魔法头定位
+        if signature_lower == "zip":
             offset = _find_first_magic_signature(input_file, "zip")
             if offset is not None:
-                # 找到了ZIP魔法头，从这里开始提取到文件末尾
-                file_size = os.path.getsize(input_file)
-                size = file_size - offset
-                
-                with open(input_file, 'rb') as f_in, open(output_file, 'wb') as f_out:
-                    f_in.seek(offset)
-                    bytes_left = size
-                    while bytes_left > 0:
-                        chunk_size = min(CHUNK_SIZE, bytes_left)
-                        data = f_in.read(chunk_size)
-                        if not data:
-                            break
-                        f_out.write(data)
-                        bytes_left -= len(data)
-                    
-                    return  # 成功提取，直接返回
-        
-        # 如果不是ZIP文件或者ZIP特殊处理失败，则使用原来的方法
-        chosen = _pick_highest_confidence(input_file, signature)
-        if chosen is None:
-            raise ValueError(f"无法找到指定格式({signature})的嵌入文件：{input_file}")
+                size = os.path.getsize(input_file) - offset
 
-        offset, size, name, conf = chosen
-        if size <= 0:
-            raise ValueError(f"从 binwalk 中解析得到的 size={size} 不合法，无法提取。")
+        if offset is None or size is None:
+            chosen = _pick_highest_confidence(input_file, signature)
+            if chosen is None:
+                raise ValueError(f"无法找到指定格式({signature})的嵌入文件：{input_file}")
 
-        with open(input_file, 'rb') as f_in, open(output_file, 'wb') as f_out:
-            f_in.seek(offset)
-            bytes_left = size
-            while bytes_left > 0:
-                chunk_size = min(CHUNK_SIZE, bytes_left)
-                data = f_in.read(chunk_size)
-                if not data:
-                    break
-                f_out.write(data)
-                bytes_left -= len(data)
+            offset, size, name, _ = chosen
+            if name:
+                display_signature = str(name)
     else:
-        # 使用手写搜索提取
-        offset = None
-        signature_lower = signature.lower()
-        
-        # 处理 RAR 文件的特殊情况（RAR5 和 RAR4）
         if signature_lower == "rar":
             offset = _find_first_magic_signature(input_file, "rar5")
             if offset is None:
                 offset = _find_first_magic_signature(input_file, "rar")
         else:
             offset = _find_first_magic_signature(input_file, signature_lower)
-        
+
         if offset is None:
             raise ValueError(f"无法找到指定格式({signature})的嵌入文件：{input_file}")
-        
-        # 从找到的偏移量开始提取到文件末尾
-        file_size = os.path.getsize(input_file)
-        size = file_size - offset
-        
-        if size <= 0:
-            raise ValueError(f"计算得到的提取大小({size})不合法，无法提取。")
-        
-        with open(input_file, 'rb') as f_in, open(output_file, 'wb') as f_out:
-            f_in.seek(offset)
-            bytes_left = size
-            while bytes_left > 0:
-                chunk_size = min(CHUNK_SIZE, bytes_left)
-                data = f_in.read(chunk_size)
-                if not data:
-                    break
-                f_out.write(data)
-                bytes_left -= len(data)
+
+        size = os.path.getsize(input_file) - offset
+
+    if size is None or size <= 0:
+        raise ValueError(f"计算得到的提取大小({size})不合法，无法提取。")
+
+    _copy_range_with_progress(input_file, output_file, offset, size, display_signature)
 
 
 if __name__ == "__main__":
