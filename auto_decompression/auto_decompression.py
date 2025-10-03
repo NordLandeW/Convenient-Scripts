@@ -18,6 +18,7 @@ import time
 __version__ = "1.1.0"
 console = Console()
 extract_to_base_folder = False
+auto_flatten_single_file = True
 pwdOldFilename = "dict.txt"
 pwdFilename = "dict.json"
 pwdDictionary = {}
@@ -179,6 +180,17 @@ def append_scr_path(relative_path):
     return os.path.join(sys.path[0], relative_path)
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = value.strip().lower()
+    if lowered in ("true", "t", "1", "yes", "y"):
+        return True
+    if lowered in ("false", "f", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError("flatten-single-file 期望布尔值喵（true/false）")
+
+
 def parse_cli_arguments(argv):
     parser = argparse.ArgumentParser(
         prog="auto_decompression",
@@ -192,6 +204,13 @@ def parse_cli_arguments(argv):
         default=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL,
         metavar="K",
         help="在递归层级小于等于 K 时尝试检测及提取隐藏嵌入文件，设为 0 可禁用此功能",
+    )
+    parser.add_argument(
+        "--flatten-single-file",
+        type=str2bool,
+        default=True,
+        metavar="{true,false}",
+        help="检测到仅包含与压缩包同名的单个文件时是否自动扁平化喵（默认 true）。",
     )
     parser.add_argument(
         "files",
@@ -270,6 +289,38 @@ def create_unique_directory(base_path, dir_name):
     os.makedirs(os.path.join(base_path, dir_name))
     print_success(f"创建目录：{dir_name}")
     return os.path.join(base_path, dir_name)
+
+
+def move_file_with_unique_suffix(src_path, dest_dir):
+    """移动文件到目标目录，如果重名则追加波浪号计数喵"""
+    file_name = os.path.basename(src_path)
+    name, ext = os.path.splitext(file_name)
+    candidate = file_name
+    counter = 1
+    while os.path.exists(os.path.join(dest_dir, candidate)):
+        candidate = f"{name}~{counter}{ext}"
+        counter += 1
+    destination = os.path.join(dest_dir, candidate)
+    shutil.move(src_path, destination)
+    return destination
+
+
+def detect_single_same_named_file(temp_folder, expected_base_name, entries=None):
+    """检测是否只有一个与压缩包同名的文件，若有则返回其路径喵"""
+    try:
+        items = entries if entries is not None else os.listdir(temp_folder)
+    except FileNotFoundError:
+        return None
+    if len(items) != 1:
+        return None
+    entry = items[0]
+    entry_path = os.path.join(temp_folder, entry)
+    if not os.path.isfile(entry_path):
+        return None
+    entry_base, _ = os.path.splitext(entry)
+    if entry_base.lower() != expected_base_name.lower():
+        return None
+    return entry_path
 
 
 def read_passwords_old():
@@ -787,6 +838,7 @@ def recursive_extract(
 ):
     global global_last_success_password
     global extract_to_base_folder
+    global auto_flatten_single_file
     """递归解压文件，处理密码保护的压缩文件喵"""
     temp_folder = create_unique_directory(base_folder, "temp_extract")
     orig_temp_folder = temp_folder  # 保存最初创建的临时目录路径
@@ -889,18 +941,36 @@ def recursive_extract(
         finished = True
 
     if finished:
-        if extract_to_base_folder:
-            target_folder = base_folder
-        else:
-            target_folder = create_unique_directory(
-                base_folder, last_compressed_file_name
+        flattened_output_path = None
+        try:
+            temp_entries = os.listdir(temp_folder)
+        except FileNotFoundError:
+            temp_entries = []
+        if auto_flatten_single_file and not extract_to_base_folder and temp_entries:
+            single_file_path = detect_single_same_named_file(
+                temp_folder,
+                last_compressed_file_name,
+                entries=temp_entries,
             )
-        
-        # Move all contents from the final temp_folder to target
-        all_contents = os.listdir(temp_folder)
-        for f in all_contents:
-            shutil.move(os.path.join(temp_folder, f), target_folder)
-        print_success(f"最终文件被移动到：{target_folder}")
+            if single_file_path:
+                flattened_output_path = move_file_with_unique_suffix(
+                    single_file_path, base_folder
+                )
+                print_success(
+                    f"检测到 {last_compressed_file_name}/"
+                    f"{os.path.basename(flattened_output_path)} 结构喵，"
+                    f"已直接将文件放置到目标目录：{flattened_output_path}"
+                )
+        if not flattened_output_path:
+            if extract_to_base_folder:
+                target_folder = base_folder
+            else:
+                target_folder = create_unique_directory(
+                    base_folder, last_compressed_file_name
+                )
+            for entry in temp_entries:
+                shutil.move(os.path.join(temp_folder, entry), target_folder)
+            print_success(f"最终文件被移动到：{target_folder}")
 
     try_remove_directory(orig_temp_folder)
     return False
@@ -955,7 +1025,7 @@ class FileManager:
 
 
 def main(args):
-    global extract_to_base_folder, _gist_cfg, _gist_remote_ts, embedded_scan_depth_setting
+    global extract_to_base_folder, _gist_cfg, _gist_remote_ts, embedded_scan_depth_setting, auto_flatten_single_file
 
     # ① 确保 Gist 配置可用
     _gist_cfg = _ensure_gist_config()
@@ -965,6 +1035,9 @@ def main(args):
     check_passwords()
 
     embedded_scan_depth_setting = max(0, args.embedded_scan_depth)
+    auto_flatten_single_file = args.flatten_single_file
+    if not auto_flatten_single_file:
+        print_info("已禁用同名单文件自动扁平化喵。")
     if args.embedded_scan_depth < 0:
         print_warning("嵌入检测层级小于 0 喵，已自动调整为 0（禁用嵌入扫描）。")
     if embedded_scan_depth_setting == 0:
