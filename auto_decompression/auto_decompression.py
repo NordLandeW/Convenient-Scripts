@@ -15,7 +15,7 @@ import datetime as _dt
 import atexit
 import time
 
-__version__ = "1.1.0"
+__version__ = "1.2.1"
 console = Console()
 extract_to_base_folder = False
 auto_flatten_single_file = True
@@ -211,6 +211,13 @@ def parse_cli_arguments(argv):
         default=True,
         metavar="{true,false}",
         help="检测到仅包含与压缩包同名的单个文件时是否自动扁平化喵（默认 true）。",
+    )
+    parser.add_argument(
+        "--trash-on-success",
+        type=str2bool,
+        default=True,
+        metavar="{true,false}",
+        help="当（递归）解压成功时，将被解压的原始压缩文件（含分卷）移动到回收站喵（默认 true）。"
     )
     parser.add_argument(
         "files",
@@ -761,6 +768,110 @@ def get_archive_base_name(filename):
         return os.path.splitext(basename)[0]
 
 
+def list_related_archive_parts(file_path):
+    """
+    列出与指定压缩文件同属一个分卷集合的所有“原始压缩文件”路径（包含自身）。
+    支持：
+      - *.partNN.rar
+      - *.rNN + *.rar
+      - *.7z.001/002...
+      - *.zip.001/002...
+      - *.z01/z02... + *.zip
+      - 单文件 *.zip/*.rar/*.7z
+    """
+    dir_name = os.path.dirname(file_path) or "."
+    base_name = os.path.basename(file_path)
+    files = os.listdir(dir_name)
+
+    paths = set()
+
+    # *.partNN.rar
+    m = re.match(r'(.+)\.part\d+\.rar$', base_name, re.IGNORECASE)
+    if m:
+        base = m.group(1)
+        pat = re.compile(rf'^{re.escape(base)}\.part\d+\.rar$', re.IGNORECASE)
+        for f in files:
+            if pat.match(f):
+                paths.add(os.path.join(dir_name, f))
+        return sorted(paths)
+
+    # *.rNN (+ .rar)
+    m = re.match(r'(.+)\.r\d+$', base_name, re.IGNORECASE)
+    if m:
+        base = m.group(1)
+        rpat = re.compile(rf'^{re.escape(base)}\.r\d+$', re.IGNORECASE)
+        for f in files:
+            if rpat.match(f) or re.match(rf'^{re.escape(base)}\.rar$', f, re.IGNORECASE):
+                paths.add(os.path.join(dir_name, f))
+        if paths:
+            return sorted(paths)
+
+    # *.7z.001 or *.zip.001
+    m = re.match(r'(.+)\.(7z|zip)\.\d+$', base_name, re.IGNORECASE)
+    if m:
+        base, ext = m.group(1), m.group(2)
+        pat = re.compile(rf'^{re.escape(base)}\.{ext}\.\d+$', re.IGNORECASE)
+        for f in files:
+            if pat.match(f):
+                paths.add(os.path.join(dir_name, f))
+        if paths:
+            return sorted(paths)
+
+    # *.z01/z02... (+ .zip)
+    m = re.match(r'(.+)\.z\d+$', base_name, re.IGNORECASE)
+    if m:
+        base = m.group(1)
+        zpat = re.compile(rf'^{re.escape(base)}\.z\d+$', re.IGNORECASE)
+        for f in files:
+            if zpat.match(f) or re.match(rf'^{re.escape(base)}\.zip$', f, re.IGNORECASE):
+                paths.add(os.path.join(dir_name, f))
+        if paths:
+            return sorted(paths)
+
+    # *.zip (maybe with .zNN parts)
+    m = re.match(r'(.+)\.zip$', base_name, re.IGNORECASE)
+    if m:
+        base = m.group(1)
+        has_z = any(re.match(rf'^{re.escape(base)}\.z\d+$', f, re.IGNORECASE) for f in files)
+        paths.add(os.path.join(dir_name, base_name))
+        if has_z:
+            zpat = re.compile(rf'^{re.escape(base)}\.z\d+$', re.IGNORECASE)
+            for f in files:
+                if zpat.match(f):
+                    paths.add(os.path.join(dir_name, f))
+        return sorted(paths)
+
+    # *.rar (maybe with .rNN parts)
+    m = re.match(r'(.+)\.rar$', base_name, re.IGNORECASE)
+    if m:
+        base = m.group(1)
+        has_r = any(re.match(rf'^{re.escape(base)}\.r\d+$', f, re.IGNORECASE) for f in files)
+        paths.add(os.path.join(dir_name, base_name))
+        if has_r:
+            rpat = re.compile(rf'^{re.escape(base)}\.r\d+$', re.IGNORECASE)
+            for f in files:
+                if rpat.match(f):
+                    paths.add(os.path.join(dir_name, f))
+        return sorted(paths)
+
+    # *.7z (maybe with .7z.001 parts)
+    m = re.match(r'(.+)\.7z$', base_name, re.IGNORECASE)
+    if m:
+        base = m.group(1)
+        has_num = any(re.match(rf'^{re.escape(base)}\.7z\.\d+$', f, re.IGNORECASE) for f in files)
+        if has_num:
+            pat = re.compile(rf'^{re.escape(base)}\.7z\.\d+$', re.IGNORECASE)
+            for f in files:
+                if pat.match(f):
+                    paths.add(os.path.join(dir_name, f))
+            return sorted(paths)
+        else:
+            return [os.path.join(dir_name, base_name)]
+
+    # 默认仅返回自身
+    return [file_path]
+
+
 def group_archive_files(directory):
     """
     Groups files in a directory into logical archives, handling multi-volume archives.
@@ -1068,12 +1179,21 @@ def main(args):
                         print_info(
                             "检测到上一次非正常退出留下的临时文件夹喵！已经把它们全部移动到回收站了喵☆"
                         )
-                    recursive_extract(
+                    _ret = recursive_extract(
                         base_folder,
                         file_path,
                         global_last_success_password,
                         embedded_scan_depth=embedded_scan_depth_setting,
                     )
+                    # 解压成功才执行回收站移动；失败（非密码错误导致）则不移动
+                    if _ret is False and hasattr(CLI_ARGS, "trash_on_success") and CLI_ARGS.trash_on_success:
+                        try:
+                            for p in list_related_archive_parts(file_path):
+                                if os.path.exists(p):
+                                    send2trash.send2trash(p)
+                                    print_info(f"已将被解压的原始压缩文件移动到回收站：{p}")
+                        except Exception as e:
+                            print_warning(f"移动原始压缩文件到回收站失败喵：{e}")
                     remove_autodec_files(base_folder)
                 save_passwords()  # 保存到本地
                 if not manager.files_to_process:
