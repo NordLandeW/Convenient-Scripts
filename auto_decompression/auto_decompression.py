@@ -1173,6 +1173,9 @@ def main(args):
                 current_batch = files_to_process[:]
                 files_to_process = []
                 for file_path in current_batch:
+                    if file_path.lower().endswith(".apk"):
+                        print_info(f"跳过 .apk 文件：{file_path} 喵。")
+                        continue
                     print_info(f"开始解压文件 {file_path} 喵❤")
                     base_folder = os.path.dirname(file_path)
                     if move_temp_folders_to_recycle_bin(base_folder):
