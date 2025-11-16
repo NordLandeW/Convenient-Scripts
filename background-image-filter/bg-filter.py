@@ -186,6 +186,8 @@ class ImageBrowser:
         self.desired_ratio = desired_ratio
         self.placeholder_image = ImageTk.PhotoImage(Image.new("RGB", (10, 10), "gray"))
         self.executor = ThreadPoolExecutor(max_workers=4)
+        # 中间内容区域尺寸变化时，延迟触发布局重绘，避免拖动窗口时频繁重建所有控件
+        self._resize_after_id = None
         self.setup_ui()
         self.master.bind("<Left>", lambda event: self.prev_page())
         self.master.bind("<Right>", lambda event: self.next_page())
@@ -217,7 +219,25 @@ class ImageBrowser:
         
         self.middle_frame = tk.Frame(self.master)
         self.middle_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.middle_frame.bind("<Configure>", lambda event: self.display_page())
+        # 使用防抖处理，避免在拖动窗口大小时连续触发布局重建
+        self.middle_frame.bind("<Configure>", self.on_middle_frame_configure)
+
+    def on_middle_frame_configure(self, event):
+        """
+        middle_frame 大小变化时的回调。
+        使用 after + cancel 做简单防抖，避免在拖动窗口时每一像素变化都完整重建网格布局。
+        """
+        if getattr(self, "_resize_after_id", None) is not None:
+            try:
+                self.master.after_cancel(self._resize_after_id)
+            except Exception:
+                pass
+        # 100ms 内如果没有新的尺寸变化事件，则认为用户暂时停止拖动，执行一次重绘
+        self._resize_after_id = self.master.after(100, self._delayed_display_page)
+
+    def _delayed_display_page(self):
+        self._resize_after_id = None
+        self.display_page()
 
     def browse_folder(self):
         folder = filedialog.askdirectory(title="选择图片文件夹")
@@ -505,14 +525,20 @@ class PreviewWindow:
         self.zoom_level = 1.0
         self.canvas = tk.Canvas(self.top, bg="gray")
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Configure>", lambda event: self.display_image())
+        # 预览窗口中同样对画布尺寸变化做防抖处理，避免在拖动窗口时频繁对大图重采样
+        self._canvas_resize_after_id = None
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
         self.slider = tk.Scale(self.top, from_=0.1, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, label="额外缩放", command=self.update_zoom)
         self.slider.set(1.0)
         self.slider.pack(fill=tk.X)
 
         self.min_zoom = float(self.slider["from"])
         self.max_zoom = float(self.slider["to"])
+        # 当通过代码更新 slider 时，避免再次触发 update_zoom
         self._ignore_zoom_callback = False
+        # slider 连续拖动时的缩放防抖
+        self._zoom_after_id = None
+        self._pending_zoom_value = None
         
         # 添加显示屏幕比例遮挡的勾选框
         self.show_screen_ratio_var = tk.BooleanVar(value=False)
@@ -601,6 +627,22 @@ class PreviewWindow:
         if bbox:
             self.canvas.config(scrollregion=bbox)
 
+    def on_canvas_configure(self, event):
+        """
+        预览窗口中画布尺寸变化时的回调。
+        使用简单防抖，减少拖动窗口大小过程中对大图片的重复缩放与重绘。
+        """
+        if getattr(self, "_canvas_resize_after_id", None) is not None:
+            try:
+                self.top.after_cancel(self._canvas_resize_after_id)
+            except Exception:
+                pass
+        self._canvas_resize_after_id = self.top.after(100, self._delayed_display_image)
+
+    def _delayed_display_image(self):
+        self._canvas_resize_after_id = None
+        self.display_image()
+
     def display_image(self):
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
@@ -669,6 +711,10 @@ class PreviewWindow:
             self.info_label.config(text=info_text)
 
     def update_zoom(self, val):
+        """
+        slider 回调：使用防抖，避免从 1.0 拖到 2.0 的过程中，每一个中间值都触发一次重采样。
+        鼠标停顿一小段时间后再真正应用缩放。
+        """
         if self._ignore_zoom_callback:
             return
         try:
@@ -676,7 +722,26 @@ class PreviewWindow:
         except Exception as e:
             print("更新缩放出错:", e)
             return
-        self.change_zoom(zoom_value)
+
+        # 记录最新缩放值，并取消之前挂起的缩放任务
+        if getattr(self, "_zoom_after_id", None) is not None:
+            try:
+                self.top.after_cancel(self._zoom_after_id)
+            except Exception:
+                pass
+
+        self._pending_zoom_value = zoom_value
+        # 80~100ms 的防抖间隔即可，既不影响交互感受，又能明显减少重采样次数
+        self._zoom_after_id = self.top.after(100, self._apply_debounced_zoom)
+
+    def _apply_debounced_zoom(self):
+        """实际应用 slider 最新值对应的缩放。"""
+        self._zoom_after_id = None
+        zoom_value = self._pending_zoom_value
+        if zoom_value is None:
+            return
+        # slider 本身已经在最新位置，不需要再回写 slider，避免产生多余回调
+        self.change_zoom(zoom_value, update_slider=False)
 
     def change_zoom(self, new_zoom, focal_point=None, update_slider=False, reset_offsets=False):
         new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
