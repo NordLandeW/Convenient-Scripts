@@ -26,6 +26,7 @@ RECOVER_SUFFIX = ".AutoDecRecovered"
 DEFAULT_EMBEDDED_SCAN_MAX_LEVEL = 2  # 小于等于该层级时尝试执行隐藏文件判定与提取
 embedded_scan_depth_setting = DEFAULT_EMBEDDED_SCAN_MAX_LEVEL
 CLI_ARGS = None
+SMALL_NON_ARCHIVE_IGNORE_THRESHOLD = 20 * 1024  # bytes，判断递归时忽略的小体积“非压缩文件”大小阈值喵
 
 GIST_CONFIG_FILE = "gist_config.json"
 _gist_cfg = None  # {token:str, gist_id:str, file:str}
@@ -940,6 +941,31 @@ def try_remove_directory(dir):
         pass
 
 
+def is_likely_archive_filename(name: str) -> bool:
+    """
+    粗略判断一个文件名是否“像压缩包”，用于在递归判断时区分压缩/非压缩文件喵。
+    这里只做基于扩展名/分卷命名规则的启发式判断，真正能否解压仍然交给 7z/Bandizip 处理。
+    """
+    lower = name.lower()
+
+    patterns = [
+        r".+\.part\d+\.rar$",       # xxx.part01.rar 等
+        r".+\.r\d+$",               # xxx.r00 等（配合 .rar）
+        r".+\.(7z|zip)\.\d+$",      # xxx.7z.001 / xxx.zip.001
+        r".+\.z\d+$",               # xxx.z01 / xxx.z02（配合 .zip）
+        r".+\.zip$",                # 单文件 zip
+        r".+\.rar$",                # 单文件 rar
+        r".+\.7z$",                 # 单文件 7z
+        r".+\.tar(\.\w+)?$",        # .tar / .tar.gz / .tar.bz2 / .tar.xz 等
+        r".+\.iso$",                # 常见镜像格式，7z 也可以解
+    ]
+
+    for pat in patterns:
+        if re.match(pat, lower, re.IGNORECASE):
+            return True
+    return False
+
+
 def recursive_extract(
     base_folder,
     file_path,
@@ -1028,10 +1054,32 @@ def recursive_extract(
                 last_compressed_file_name = os.path.basename(temp_folder)
                 grouped_files = group_archive_files(temp_folder)
             else:
-                break # Not a directory, stop digging
+                break  # Not a directory, stop digging
     except FileNotFoundError:
         # This can happen if extraction yields an empty folder that gets deleted.
         grouped_files = []
+
+    # 在判定是否继续递归时，忽略用于混淆的小体积“非压缩文件”喵
+    filtered_grouped_files = []
+    for fname in grouped_files:
+        full_path = os.path.join(temp_folder, fname)
+        if not os.path.isfile(full_path):
+            continue
+
+        # 只对“看起来不像压缩包”的文件做体积阈值过滤
+        if not is_likely_archive_filename(fname):
+            try:
+                size = os.path.getsize(full_path)
+            except OSError:
+                size = SMALL_NON_ARCHIVE_IGNORE_THRESHOLD + 1
+
+            if size <= SMALL_NON_ARCHIVE_IGNORE_THRESHOLD:
+                # 这是一个小体积的非压缩文件，用于混淆时可以直接忽略喵
+                continue
+
+        filtered_grouped_files.append(fname)
+
+    grouped_files = filtered_grouped_files
 
     finished = False
     if len(grouped_files) == 1:
