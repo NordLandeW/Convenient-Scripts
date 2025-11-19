@@ -1,6 +1,8 @@
 # Convenient-Scripts
 
-一个脚本合集，由NekoGPT（一个GPTs）和我共同制作。
+方便的脚本合集。
+
+可能包含各种各样的脚本，例如 Python / Powershell / 批处理 / 油猴脚本。
 
 请直接 Clone 该 Repo 以运行脚本。使用 Raw Download 可能会导致不可预料的编码问题。
 
@@ -23,7 +25,7 @@
 * Image-unfolder-script
   * 批量递归地将文件夹下的所有文件重命名并移动到根目录下。
   * 支持还原。
-* random_unicode_string
+* random-unicode-string
   * 随机生成可被打印的Unicode字符串。
   * 可输入长度。
   * 生成后自动移动到剪贴板中。
@@ -32,3 +34,6 @@
   * 主要针对 CJK 文件/文件夹名。
 * path
   * 将指定的目录添加到 Windows 环境变量中。
+* qr-code-scanner
+  * 油猴脚本。
+  * 帮助识别可见图片元素中包含的二维码。
