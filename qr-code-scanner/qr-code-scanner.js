@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QR Code Scanner
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  智能识别网页图片中的二维码，支持在线API和本地离线识别，带有设置页面。
 // @author       nord
 // @match        *://*/*
@@ -29,7 +29,9 @@
 
     const Settings = {
         get provider() { return GM_getValue('qr_provider', 'caoliao'); },
-        set provider(val) { GM_setValue('qr_provider', val); }
+        set provider(val) { GM_setValue('qr_provider', val); },
+        get activationMode() { return GM_getValue('qr_activation_mode', 'always'); },
+        set activationMode(val) { GM_setValue('qr_activation_mode', val); }
     };
 
     const STYLES = `
@@ -146,6 +148,14 @@
             border-radius: 50%; margin: 0 auto 10px; animation: qr-spin 0.8s linear infinite;
         }
         @keyframes qr-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .qr-toast {
+            position: fixed; bottom: 20px; right: 20px;
+            background: rgba(0,0,0,0.75); color: white; padding: 10px 20px;
+            border-radius: 8px; z-index: ${CONSTANTS.zIndex + 10};
+            font-size: 14px; opacity: 0; transition: opacity 0.3s; pointer-events: none;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15); backdrop-filter: blur(4px);
+        }
+        .qr-toast.show { opacity: 1; }
     `;
 
     GM_addStyle(STYLES);
@@ -244,13 +254,39 @@
         currentImg: null,
         hideTimer: null,
         isHoveringButton: false,
+        isPluginActive: false,
+        lastQPressTime: 0,
+        toast: null,
 
         init() {
             this.createScanButton();
             this.createResultModal();
             this.createSettingsModal();
+            this.createToast();
             this.bindEvents();
             GM_registerMenuCommand("设置 / Settings", () => this.openSettings());
+        },
+
+        createToast() {
+            const div = document.createElement('div');
+            div.className = 'qr-toast';
+            document.body.appendChild(div);
+            this.toast = div;
+        },
+
+        showToast(msg) {
+            this.toast.innerText = msg;
+            this.toast.classList.add('show');
+            setTimeout(() => this.toast.classList.remove('show'), 2000);
+        },
+
+        togglePluginActive() {
+            this.isPluginActive = !this.isPluginActive;
+            this.showToast(this.isPluginActive ? "二维码扫描已激活" : "二维码扫描已关闭");
+            if (!this.isPluginActive) {
+                this.btn.classList.remove('visible');
+                this.currentImg = null;
+            }
         },
 
         createScanButton() {
@@ -289,7 +325,7 @@
             document.body.appendChild(div);
             this.resultModal = div;
             div.querySelector('#qr-cls-btn').onclick = () => this.closeModal(div);
-            div.querySelector('#qr-set-btn').onclick = () => { this.closeModal(div); this.openSettings(); };
+            div.querySelector('#qr-set-btn').onclick = (e) => { e.stopPropagation(); this.closeModal(div); this.openSettings(); };
         },
 
         createSettingsModal() {
@@ -315,6 +351,19 @@
                         </div>
                     </div>
                 </div>
+                <div style="margin-bottom:15px">
+                    <label class="qr-settings-label">激活方式</label>
+                    <div class="qr-radio-group">
+                        <div class="qr-radio-item" data-group="mode" data-val="always">
+                            <div class="qr-radio-circle"></div>
+                            <div class="qr-radio-info"><span class="qr-radio-title">一直启用</span><span class="qr-radio-desc">鼠标悬停在二维码上自动显示按钮</span></div>
+                        </div>
+                        <div class="qr-radio-item" data-group="mode" data-val="shortcut">
+                            <div class="qr-radio-circle"></div>
+                            <div class="qr-radio-info"><span class="qr-radio-title">组合键激活 (Ctrl + QQ)</span><span class="qr-radio-desc">平时隐藏，按两下 Q 键激活/关闭</span></div>
+                        </div>
+                    </div>
+                </div>
                 <div class="qr-modal-actions"><button class="qr-btn qr-btn-primary" id="qr-save-set">保存</button></div>
             `;
             document.body.appendChild(div);
@@ -323,19 +372,53 @@
             div.querySelector('#qr-set-close').onclick = saveAndClose;
             div.querySelector('#qr-save-set').onclick = saveAndClose;
             const items = div.querySelectorAll('.qr-radio-item');
-            items.forEach(item => {
+            const allRadioItems = div.querySelectorAll('.qr-radio-item');
+            allRadioItems.forEach(item => {
                 item.addEventListener('click', () => {
-                    items.forEach(i => i.classList.remove('selected'));
-                    item.classList.add('selected');
-                    Settings.provider = item.dataset.val;
+                    const group = item.dataset.group;
+                    if (group === 'mode') {
+                        div.querySelectorAll('[data-group="mode"]').forEach(i => i.classList.remove('selected'));
+                        item.classList.add('selected');
+                        Settings.activationMode = item.dataset.val;
+                        // Reset active state if switching modes
+                        this.isPluginActive = false;
+                        this.btn.classList.remove('visible');
+                    } else {
+                        div.querySelectorAll(':not([data-group="mode"]).qr-radio-item').forEach(i => i.classList.remove('selected'));
+                        item.classList.add('selected');
+                        Settings.provider = item.dataset.val;
+                    }
                 });
             });
         },
 
         bindEvents() {
+            document.addEventListener('click', (e) => {
+                if (this.resultModal.classList.contains('active') && !this.resultModal.contains(e.target)) {
+                    this.closeModal(this.resultModal);
+                }
+                if (this.settingsModal.classList.contains('active') && !this.settingsModal.contains(e.target)) {
+                    this.closeModal(this.settingsModal);
+                }
+            });
+
+            document.addEventListener('keydown', (e) => {
+                if (Settings.activationMode !== 'shortcut') return;
+                if (e.key === 'q' || e.key === 'Q') {
+                    if (e.ctrlKey) {
+                        const now = Date.now();
+                        if (now - this.lastQPressTime < 500) {
+                            this.togglePluginActive();
+                        }
+                        this.lastQPressTime = now;
+                    }
+                }
+            });
+
             document.addEventListener('mouseover', (e) => {
                 const target = e.target;
                 if (target.tagName === 'IMG') {
+                    if (Settings.activationMode === 'shortcut' && !this.isPluginActive) return;
                     if (this.isLikelyAnimatedByUrl(target)) return;
                     const rect = target.getBoundingClientRect();
                     if (rect.width < CONSTANTS.minImageSize || rect.height < CONSTANTS.minImageSize) return;
@@ -422,9 +505,16 @@
         },
 
         openSettings() {
-            const mode = Settings.provider;
+            const provider = Settings.provider;
+            const actMode = Settings.activationMode;
             const items = this.settingsModal.querySelectorAll('.qr-radio-item');
-            items.forEach(i => i.classList.toggle('selected', i.dataset.val === mode));
+            items.forEach(i => {
+                if (i.dataset.group === 'mode') {
+                    i.classList.toggle('selected', i.dataset.val === actMode);
+                } else {
+                    i.classList.toggle('selected', i.dataset.val === provider);
+                }
+            });
             this.openModal(this.settingsModal);
         },
 
