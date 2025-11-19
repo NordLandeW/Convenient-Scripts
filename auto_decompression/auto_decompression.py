@@ -17,6 +17,7 @@ import time
 
 __version__ = "1.2.1"
 console = Console()
+CONFIG_DIR = sys.path[0]
 extract_to_base_folder = False
 auto_flatten_single_file = True
 pwdOldFilename = "dict.txt"
@@ -34,7 +35,7 @@ _gist_remote_ts = None  # 上一次拉取时远程文件 updated_at（datetime�
 
 
 def _cfg_path(fname):
-    return os.path.join(sys.path[0], fname)
+    return os.path.join(CONFIG_DIR, fname)
 
 def _load_gist_config():
     cfg_path = _cfg_path(GIST_CONFIG_FILE)
@@ -118,7 +119,7 @@ def _setup_gist_interactive():
     # 检查是否提供了已有的 Gist ID
     if gist_id != "":
         # 检查本地是否有密码本
-        local_pwd_path = os.path.join(sys.path[0], pwdFilename)
+        local_pwd_path = os.path.join(CONFIG_DIR, pwdFilename)
         has_local_pwd = os.path.exists(local_pwd_path)
         
         # 尝试获取远程密码本信息
@@ -178,7 +179,7 @@ def _ensure_gist_config():
     return cfg
 
 def append_scr_path(relative_path):
-    return os.path.join(sys.path[0], relative_path)
+    return os.path.join(CONFIG_DIR, relative_path)
 
 
 def str2bool(value):
@@ -219,6 +220,12 @@ def parse_cli_arguments(argv):
         default=True,
         metavar="{true,false}",
         help="当（递归）解压成功时，将被解压的原始压缩文件（含分卷）移动到回收站喵（默认 true）。"
+    )
+    parser.add_argument(
+        "--config-dir",
+        type=str,
+        default=None,
+        help="指定配置文件（字典、Gist配置等）的所在文件夹喵。",
     )
     parser.add_argument(
         "files",
@@ -334,7 +341,7 @@ def detect_single_same_named_file(temp_folder, expected_base_name, entries=None)
 def read_passwords_old():
     """从与脚本同一目录下的dict.txt中读取密码喵，如果文件不存在或为空则返回空列表"""
     passwords = []
-    pwdPath = os.path.join(sys.path[0], pwdOldFilename)
+    pwdPath = os.path.join(CONFIG_DIR, pwdOldFilename)
     try:
         with open(pwdPath, "r", encoding="utf-8") as file:
             passwords = file.read().splitlines()
@@ -354,7 +361,7 @@ def convert_old_pwd_to_new_pwd(passwords):
 
 def read_passwords():
     global pwdDictionary
-    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
     try:
         with open(pwdPath, "r", encoding="utf-8") as file:
             pwdDictionary = json.load(file)
@@ -364,7 +371,7 @@ def read_passwords():
 
 def save_passwords():
     # print(str(pwdDictionary))
-    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
     try:
         with open(pwdPath, "w", encoding="utf-8") as file:
             json.dump(pwdDictionary, file, ensure_ascii=False, indent=4)
@@ -390,8 +397,8 @@ def _pull_from_gist_if_possible():
 
 def check_passwords():
     global pwdDictionary
-    pwdPath = os.path.join(sys.path[0], pwdFilename)
-    pwdOldPath = os.path.join(sys.path[0], pwdOldFilename)
+    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
+    pwdOldPath = os.path.join(CONFIG_DIR, pwdOldFilename)
     if not os.path.exists(pwdPath):
         # 若本地缺失则优先尝试从 Gist 获取
         if _pull_from_gist_if_possible():
@@ -409,7 +416,7 @@ def _sync_to_gist_before_exit():
     global _gist_cfg, _gist_remote_ts
     if _gist_cfg is None:
         return
-    pwdPath = os.path.join(sys.path[0], pwdFilename)
+    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
     if not os.path.exists(pwdPath):
         return
     local_mtime = _dt.datetime.fromtimestamp(os.path.getmtime(pwdPath), tz=_dt.timezone.utc)
@@ -1157,7 +1164,9 @@ def send_file_to_main_instance(file_paths):
 
 
 class FileManager:
-    def __init__(self):
+    def __init__(self, queue_path, lock_path):
+        self.queue_path = queue_path
+        self.lock_path = lock_path
         manager = Manager()
         self.files_to_process = manager.list()
         self.process = Process(target=self.queue_listener)
@@ -1165,13 +1174,13 @@ class FileManager:
 
     def queue_listener(self):
         while True:
-            lock = FileLock(queue_file_lock)
-            if os.path.exists(queue_file_path):
+            lock = FileLock(self.lock_path)
+            if os.path.exists(self.queue_path):
                 with lock.acquire(timeout=0):
-                    with open(queue_file_path, "r", encoding="utf-8") as f:
+                    with open(self.queue_path, "r", encoding="utf-8") as f:
                         lines = f.readlines()
                     if lines:
-                        os.remove(queue_file_path)
+                        os.remove(self.queue_path)
                         for line in lines:
                             self.files_to_process.append(line.strip())
             time.sleep(0.1)
@@ -1189,7 +1198,7 @@ def main(args):
     # ① 确保 Gist 配置可用
     _gist_cfg = _ensure_gist_config()
 
-    manager = FileManager()
+    manager = FileManager(queue_file_path, queue_file_lock)
 
     check_passwords()
 
@@ -1276,6 +1285,21 @@ def error_end(e: Exception = None):
 
 if __name__ == "__main__":
     CLI_ARGS = parse_cli_arguments(sys.argv[1:])
+
+    if CLI_ARGS.config_dir:
+        CONFIG_DIR = os.path.abspath(CLI_ARGS.config_dir)
+        if not os.path.exists(CONFIG_DIR):
+            try:
+                os.makedirs(CONFIG_DIR)
+            except Exception as e:
+                print_error(f"无法创建配置目录 {CONFIG_DIR} 喵：{e}")
+                sys.exit(1)
+
+        # 更新依赖 CONFIG_DIR 的全局路径变量
+        queue_file_path = append_scr_path("queue_file.txt")
+        queue_file_lock = append_scr_path("queue_file.lock")
+        instance_lock = append_scr_path("instance.lock")
+
     try:
         lock = FileLock(instance_lock)
         with lock.acquire(timeout=0):
