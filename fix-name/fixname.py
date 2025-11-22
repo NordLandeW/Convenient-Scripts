@@ -113,17 +113,31 @@ def preview_mode(directory, dict_file):
 
     total_files = 0
     total_dirs = 0
+    all_names = set()
 
-    for root, dirs, files in os.walk(directory):
+    # Score path candidates on names relative to the scan root to avoid bias from absolute prefixes.
+    start_dir = os.path.abspath(directory)
+
+    for root, dirs, files in os.walk(start_dir):
         print(f"\n【路径】：{root}")
-        print_candidates(process_item(root, global_scores, global_examples, global_best, common_chars)[:5])
+
+        rel_root = os.path.relpath(root, start_dir)
+        name_for_scoring = os.path.basename(root) if rel_root == "." else rel_root
+
+        # Use relative segment(s); when '.', fall back to basename for meaningful scoring.
+        target_for_scoring = name_for_scoring if name_for_scoring and name_for_scoring != "." else os.path.basename(root)
+        if target_for_scoring:
+            all_names.add(target_for_scoring)
+            print_candidates(process_item(target_for_scoring, global_scores, global_examples, global_best, common_chars)[:5])
 
         for name in files:
             total_files += 1
+            all_names.add(name)
             print_candidates(process_item(name, global_scores, global_examples, global_best, common_chars)[:3])
 
         for name in dirs:
             total_dirs += 1
+            all_names.add(name)
             print_candidates(process_item(name, global_scores, global_examples, global_best, common_chars)[:3])
 
     print("\n============================")
@@ -150,7 +164,6 @@ def preview_mode(directory, dict_file):
         print(f"示例: {o}  =>  {f}  (分数 {s})")
     print()
 
-
     use_top = input("是否直接使用该方案? (y/N): ").strip().lower() == "y"
     if use_top:
         print(f"开始修复，方案 [{cur_enc}->{act_enc}]")
@@ -169,13 +182,47 @@ def preview_mode(directory, dict_file):
                             key=lambda x: x[0], reverse=True)[:3]:
             print(f"     {o}  =>  {f}  (分数 {s})")
 
-    choice = input("输入要使用的方案编号 (1-10)；其他任意键取消: ").strip()
+    print("\n m. 手动输入编码方案（形如 gbk->utf-8）用于自定义预览/修复")
+
+    choice = input("输入要使用的方案编号 (1-10) 或输入 m 进行手动；其他任意键取消: ").strip()
     if choice.isdigit():
         idx = int(choice)
         if 1 <= idx <= min(10, len(sorted_global)):
             cur_enc, act_enc = sorted_global[idx - 1][0]
             print(f"开始修复，方案 [{cur_enc}->{act_enc}]")
             logger.info(f"Chosen conversion {cur_enc}->{act_enc}")
+            fixed_files, fixed_dirs = fix_mode(directory, cur_enc, act_enc)
+            print(f"修复完成：文件 {fixed_files} 个，目录 {fixed_dirs} 个")
+            logger.info(f"Fix done: files {fixed_files}, dirs {fixed_dirs}")
+        else:
+            print("取消修复")
+    elif choice.lower() == "m":
+        enc_pair = input("请输入编码方案（形如 gbk->utf-8）: ").strip()
+        if "->" not in enc_pair:
+            print("格式无效，已取消")
+            return
+        cur_enc, act_enc = [p.strip() for p in enc_pair.split("->", 1)]
+
+        # Preview manual pair on collected names to validate before applying.
+        manual_candidates = []
+        for name in list(all_names):
+            fixed = get_fixed_name(name, cur_enc, act_enc)
+            if not fixed or fixed == name:
+                continue
+            score = score_conversion(name, fixed, common_chars)
+            manual_candidates.append((score, name, fixed))
+        manual_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        if manual_candidates:
+            print("\n手动方案预览 Top10：")
+            for s, o, f in manual_candidates[:10]:
+                print(f"示例: {o}  =>  {f}  (分数 {s})")
+        else:
+            print("手动方案没有可预览的有效转换。")
+
+        if input("是否使用该方案? (y/N): ").strip().lower() == "y":
+            print(f"开始修复，方案 [{cur_enc}->{act_enc}]")
+            logger.info(f"Chosen manual conversion {cur_enc}->{act_enc}")
             fixed_files, fixed_dirs = fix_mode(directory, cur_enc, act_enc)
             print(f"修复完成：文件 {fixed_files} 个，目录 {fixed_dirs} 个")
             logger.info(f"Fix done: files {fixed_files}, dirs {fixed_dirs}")
