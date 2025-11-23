@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QR Code Scanner
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  智能识别网页图片中的二维码，支持在线API和本地离线识别，带有设置页面。
 // @author       nord
 // @match        *://*/*
@@ -13,6 +13,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @connect      api.2dcode.biz
+// @connect      api.qrserver.com
 // @connect      *
 // @require      https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js
 // @run-at       document-end
@@ -27,11 +28,20 @@
         zIndex: 2147483647
     };
 
+    // Capabilities per online provider; used to decide whether URL/Upload is supported.
+    const PROVIDER_CAPS = {
+        caoliao: { fileurl: true, upload: false },
+        qrserver: { fileurl: true, upload: true }
+    };
+
     const Settings = {
         get provider() { return GM_getValue('qr_provider', 'caoliao'); },
         set provider(val) { GM_setValue('qr_provider', val); },
         get activationMode() { return GM_getValue('qr_activation_mode', 'always'); },
-        set activationMode(val) { GM_setValue('qr_activation_mode', val); }
+        set activationMode(val) { GM_setValue('qr_activation_mode', val); },
+        // apiMethod: auto | fileurl | upload (only for online providers)
+        get apiMethod() { return GM_getValue('qr_api_method', 'auto'); },
+        set apiMethod(val) { GM_setValue('qr_api_method', val); }
     };
 
     const STYLES = `
@@ -133,6 +143,21 @@
         .qr-radio-title { font-size: 13px; font-weight: 600; }
         .qr-radio-desc { font-size: 11px; color: #888; margin-top: 2px; }
         .qr-radio-item.selected .qr-radio-desc { color: rgba(0, 122, 255, 0.7); }
+        .qr-radio-item.disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+            background: rgba(0, 0, 0, 0.02);
+            color: inherit;
+        }
+        .qr-radio-item.disabled .qr-radio-circle {
+            border-color: #d1d1d6;
+            background: rgba(0, 0, 0, 0.05);
+        }
+        .qr-radio-item.disabled:hover {
+            background: rgba(0, 0, 0, 0.02);
+            border-color: transparent;
+            box-shadow: none;
+        }
         .qr-modal-actions { display: flex; gap: 8px; }
         .qr-btn {
             flex: 1; padding: 8px 0; border: none; border-radius: 8px;
@@ -164,14 +189,38 @@
         constructor() {
             this.providers = {
                 'caoliao': this.decodeOnline,
+                'qrserver': this.decodeQrServer,
                 'local': this.decodeLocal
             };
         }
 
+        /**
+         * Select provider/method based on user settings and capability.
+         * Prefer URL method to minimize data transfer, fallback to upload when supported.
+         */
         async decode(imageUrl) {
             const providerKey = Settings.provider;
-            const decoder = this.providers[providerKey] || this.providers['caoliao'];
-            return decoder.call(this, imageUrl);
+            if (providerKey === 'local') {
+                return this.decodeLocal(imageUrl);
+            }
+            const caps = (PROVIDER_CAPS[providerKey] || {});
+            let method = Settings.apiMethod || 'auto';
+            if (method === 'auto') {
+                method = caps.fileurl ? 'fileurl' : (caps.upload ? 'upload' : 'fileurl');
+            }
+            if (method === 'upload' && !caps.upload) method = 'fileurl';
+            if (method === 'fileurl' && !caps.fileurl) method = 'upload';
+
+            if (providerKey === 'caoliao') {
+                // CaoLiao only supports fileurl; upload path is intentionally ignored.
+                return this.decodeOnline(imageUrl);
+            }
+            if (providerKey === 'qrserver') {
+                return method === 'upload'
+                    ? this.decodeQrServerUpload(imageUrl)
+                    : this.decodeQrServer(imageUrl);
+            }
+            return this.decodeOnline(imageUrl);
         }
 
         decodeOnline(imageUrl) {
@@ -190,6 +239,87 @@
                         } catch (e) { reject("API响应异常"); }
                     },
                     onerror: () => reject("网络请求失败")
+                });
+            });
+        }
+
+        /**
+         * QRServer cloud decoding via fileurl.
+         * Chosen to increase availability alongside the existing provider, without uploading local images.
+         * Only supports HTTP(S) URLs; use local mode for data/blob or non-public images.
+         * @param {string} imageUrl - The image URL that likely contains a QR code.
+         * @returns {Promise<string>} Resolved with decoded text or rejected with a human-readable reason.
+         */
+        decodeQrServer(imageUrl) {
+            return new Promise((resolve, reject) => {
+                if (!/^https?:/i.test(imageUrl)) {
+                    return reject("在线API不支持此图片格式，请在设置中切换为【本地离线】模式。");
+                }
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: `https://api.qrserver.com/v1/read-qr-code/?fileurl=${encodeURIComponent(imageUrl)}&outputformat=json`,
+                    onload: (response) => {
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            if (Array.isArray(data) && data.length > 0 && data[0]?.symbol?.length > 0) {
+                                const sym = data[0].symbol[0];
+                                if (sym.error) reject(sym.error);
+                                else if (sym.data) resolve(sym.data);
+                                else reject("未发现二维码");
+                            } else {
+                                reject("未发现二维码");
+                            }
+                        } catch (e) { reject("API响应异常"); }
+                    },
+                    onerror: () => reject("网络请求失败")
+                });
+            });
+        }
+
+        /**
+         * QRServer file upload decoding.
+         * Chosen for cases where public URL scanning is undesirable or impossible.
+         * Enforces 1 MiB limit to respect API constraints.
+         * @param {string} imageUrl
+         * @returns {Promise<string>}
+         */
+        decodeQrServerUpload(imageUrl) {
+            return new Promise((resolve, reject) => {
+                if (!/^https?:/i.test(imageUrl)) {
+                    return reject("仅支持上传来自 HTTP(S) 的图片；非公网图片请使用【本地离线】模式。");
+                }
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: imageUrl,
+                    responseType: "blob",
+                    onload: (res) => {
+                        if (res.status !== 200) return reject("图片下载失败");
+                        const blob = res.response;
+                        if (!blob || !(blob instanceof Blob)) return reject("无法获取图片数据");
+                        if (blob.size > 1048576) return reject("文件超过 1 MiB，无法上传，请改用 URL 方式或本地离线");
+                        const fd = new FormData();
+                        fd.append("file", blob, "qr.jpg");
+                        GM_xmlhttpRequest({
+                            method: "POST",
+                            url: "https://api.qrserver.com/v1/read-qr-code/?outputformat=json",
+                            data: fd,
+                            onload: (resp) => {
+                                try {
+                                    const data = JSON.parse(resp.responseText);
+                                    if (Array.isArray(data) && data.length > 0 && data[0]?.symbol?.length > 0) {
+                                        const sym = data[0].symbol[0];
+                                        if (sym.error) reject(sym.error);
+                                        else if (sym.data) resolve(sym.data);
+                                        else reject("未发现二维码");
+                                    } else {
+                                        reject("未发现二维码");
+                                    }
+                                } catch (e) { reject("API响应异常"); }
+                            },
+                            onerror: () => reject("网络请求失败")
+                        });
+                    },
+                    onerror: () => reject("无法获取图片数据")
                 });
             });
         }
@@ -343,11 +473,32 @@
                     <div class="qr-radio-group">
                         <div class="qr-radio-item" data-val="caoliao">
                             <div class="qr-radio-circle"></div>
-                            <div class="qr-radio-info"><span class="qr-radio-title">在线 API (草料)</span><span class="qr-radio-desc">需公网图片，兼容性高</span></div>
+                            <div class="qr-radio-info"><span class="qr-radio-title">在线 API (草料)</span><span class="qr-radio-desc">仅支持 URL 方式（file_url），公开 HTTP(S) 图片</span></div>
+                        </div>
+                        <div class="qr-radio-item" data-val="qrserver">
+                            <div class="qr-radio-circle"></div>
+                            <div class="qr-radio-info"><span class="qr-radio-title">在线 API (QRServer)</span><span class="qr-radio-desc">支持 URL（fileurl）与 文件上传（≤ 1 MiB），JSON 响应</span></div>
                         </div>
                         <div class="qr-radio-item" data-val="local">
                             <div class="qr-radio-circle"></div>
                             <div class="qr-radio-info"><span class="qr-radio-title">本地离线 (jsQR)</span><span class="qr-radio-desc">隐私安全，支持任何图片格式</span></div>
+                        </div>
+                    </div>
+                </div>
+                <div id="qr-online-options" style="margin-bottom:15px; display:none">
+                    <label class="qr-settings-label">在线 API 方式</label>
+                    <div class="qr-radio-group" id="qr-method-group">
+                        <div class="qr-radio-item" data-group="method" data-val="auto">
+                            <div class="qr-radio-circle"></div>
+                            <div class="qr-radio-info"><span class="qr-radio-title">自动选择</span><span class="qr-radio-desc">优先使用 URL，不可用时切换上传</span></div>
+                        </div>
+                        <div class="qr-radio-item" data-group="method" data-val="fileurl">
+                            <div class="qr-radio-circle"></div>
+                            <div class="qr-radio-info"><span class="qr-radio-title">直接使用图片URL</span><span class="qr-radio-desc">无需上传，要求公开 HTTP(S) 图片</span></div>
+                        </div>
+                        <div class="qr-radio-item" data-group="method" data-val="upload">
+                            <div class="qr-radio-circle"></div>
+                            <div class="qr-radio-info"><span class="qr-radio-title">上传小文件</span><span class="qr-radio-desc">文件 ≤ 1 MiB，受接口支持限制</span></div>
                         </div>
                     </div>
                 </div>
@@ -383,13 +534,66 @@
                         // Reset active state if switching modes
                         this.isPluginActive = false;
                         this.btn.classList.remove('visible');
-                    } else {
-                        div.querySelectorAll(':not([data-group="mode"]).qr-radio-item').forEach(i => i.classList.remove('selected'));
-                        item.classList.add('selected');
-                        Settings.provider = item.dataset.val;
+                        return;
                     }
+                    if (group === 'method') {
+                        if (item.classList.contains('disabled')) return;
+                        div.querySelectorAll('[data-group="method"]').forEach(i => i.classList.remove('selected'));
+                        item.classList.add('selected');
+                        Settings.apiMethod = item.dataset.val;
+                        return;
+                    }
+                    // provider selection
+                    div.querySelectorAll('.qr-radio-item:not([data-group])').forEach(i => i.classList.remove('selected'));
+                    item.classList.add('selected');
+                    Settings.provider = item.dataset.val;
+                    this.updateOnlineOptionsUI();
                 });
             });
+        },
+
+        /**
+         * Toggle online options visibility and enforce capability-based disabling.
+         * Forces a safe method when current selection is unsupported.
+         */
+        updateOnlineOptionsUI() {
+            const provider = Settings.provider;
+            const method = Settings.apiMethod || 'auto';
+            const caps = PROVIDER_CAPS[provider] || {};
+            const section = this.settingsModal.querySelector('#qr-online-options');
+            const methodItems = this.settingsModal.querySelectorAll('#qr-method-group .qr-radio-item');
+
+            // Show only for online providers
+            const online = provider !== 'local';
+            section.style.display = online ? 'block' : 'none';
+            if (!online) return;
+
+            // Update disabled state by capability
+            methodItems.forEach(i => {
+                i.classList.remove('disabled');
+                if (i.dataset.val === 'fileurl' && caps.fileurl === false) i.classList.add('disabled');
+                if (i.dataset.val === 'upload' && caps.upload === false) i.classList.add('disabled');
+            });
+
+            // Determine effective method if current is unsupported
+            let effective = method;
+            if (effective !== 'auto') {
+                if (effective === 'fileurl' && caps.fileurl === false) effective = caps.upload ? 'upload' : 'auto';
+                if (effective === 'upload' && caps.upload === false) effective = caps.fileurl ? 'fileurl' : 'auto';
+            }
+            if (effective !== method) Settings.apiMethod = effective;
+
+            // Sync selected styles
+            methodItems.forEach(i => i.classList.remove('selected'));
+            const toSelect = this.settingsModal.querySelector(`#qr-method-group .qr-radio-item[data-val="${Settings.apiMethod}"]`);
+            if (toSelect && !toSelect.classList.contains('disabled')) {
+                toSelect.classList.add('selected');
+            } else {
+                const fallback = caps.fileurl ? 'fileurl' : (caps.upload ? 'upload' : 'auto');
+                const fbNode = this.settingsModal.querySelector(`#qr-method-group .qr-radio-item[data-val="${fallback}"]`);
+                if (fbNode) fbNode.classList.add('selected');
+                Settings.apiMethod = fallback;
+            }
         },
 
         bindEvents() {
@@ -507,14 +711,18 @@
         openSettings() {
             const provider = Settings.provider;
             const actMode = Settings.activationMode;
+            const method = Settings.apiMethod;
             const items = this.settingsModal.querySelectorAll('.qr-radio-item');
             items.forEach(i => {
                 if (i.dataset.group === 'mode') {
                     i.classList.toggle('selected', i.dataset.val === actMode);
+                } else if (i.dataset.group === 'method') {
+                    i.classList.toggle('selected', i.dataset.val === method);
                 } else {
                     i.classList.toggle('selected', i.dataset.val === provider);
                 }
             });
+            this.updateOnlineOptionsUI();
             this.openModal(this.settingsModal);
         },
 
