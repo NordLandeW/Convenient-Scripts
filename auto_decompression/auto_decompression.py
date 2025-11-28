@@ -996,9 +996,22 @@ def recursive_extract(
     while True:
         tryResult = extract_with_7zip(file_path, temp_folder, password)
         if tryResult == -1:
+            # 先尝试密码本（不含当前已尝试的 password）
             next_password = try_passwords(
                 file_path, temp_folder, passwords, password
-            ) or manual_password_entry(file_path, temp_folder, level)
+            )
+            # 若密码本全部失败，在放弃前额外尝试使用压缩包名称作为密码，以覆盖常见命名习惯
+            if next_password is None:
+                name_pwd = last_compressed_file_name
+                if name_pwd and name_pwd != password:
+                    print_info(
+                        f"尝试使用压缩包名称 '{name_pwd}' 作为密码喵..."
+                    )
+                    if extract_with_7zip(file_path, temp_folder, name_pwd) > 0:
+                        next_password = name_pwd
+            # 若以上都失败，最后再进入人工输入流程
+            if next_password is None:
+                next_password = manual_password_entry(file_path, temp_folder, level)
             if next_password is None:
                 print_warning(f"用户跳过了文件 {file_path} 的密码输入喵，将跳过该文件。")
                 try_remove_directory(orig_temp_folder)
