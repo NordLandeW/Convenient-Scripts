@@ -26,6 +26,7 @@
         defaults: {
             maxCacheSize: 10 * 1024 * 1024, // 10MB
             cacheTTL: 7 * 24 * 60 * 60 * 1000, // 7天
+            urlSimilarityThreshold: 0.95, // 默认 URL 模糊匹配相似度（0-1）
         }
     };
 
@@ -94,6 +95,110 @@
     // ================= 缓存管理 =================
     
     /**
+     * Normalize URLs so the cache ignores query/hash noise and minor variants.
+     */
+    function normalizeUrl(rawUrl) {
+        try {
+            const url = new URL(rawUrl, window.location.origin);
+            let normalized = `${url.protocol}//${url.host}${url.pathname}`;
+            if (normalized.length > 1 && normalized.endsWith('/')) {
+                normalized = normalized.slice(0, -1);
+            }
+            return normalized;
+        } catch {
+            const stripped = rawUrl.split('#')[0].split('?')[0];
+            if (stripped.length > 1 && stripped.endsWith('/')) {
+                return stripped.slice(0, -1);
+            }
+            return stripped;
+        }
+    }
+
+    /**
+     * Read and clamp URL similarity threshold from storage.
+     */
+    function getUrlSimilarityThreshold() {
+        const stored = GM_getValue('gm_url_similarity_threshold', CONFIG.defaults.urlSimilarityThreshold);
+        const value = typeof stored === 'number' ? stored : parseFloat(stored);
+        if (Number.isNaN(value)) return CONFIG.defaults.urlSimilarityThreshold;
+        return Math.min(Math.max(value, 0), 1);
+    }
+
+    /**
+     * Compute Levenshtein distance for short URL strings.
+     */
+    function levenshteinDistance(a, b) {
+        const m = a.length;
+        const n = b.length;
+        if (m === 0) return n;
+        if (n === 0) return m;
+
+        const dp = new Array(n + 1);
+        for (let j = 0; j <= n; j++) dp[j] = j;
+
+        for (let i = 1; i <= m; i++) {
+            let prev = dp[0];
+            dp[0] = i;
+            const ca = a.charCodeAt(i - 1);
+            for (let j = 1; j <= n; j++) {
+                const tmp = dp[j];
+                const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+                dp[j] = Math.min(
+                    dp[j] + 1,
+                    dp[j - 1] + 1,
+                    prev + cost
+                );
+                prev = tmp;
+            }
+        }
+
+        return dp[n];
+    }
+
+    /**
+     * Convert edit distance into [0,1] similarity score.
+     */
+    function stringSimilarity(a, b) {
+        if (a === b) return 1;
+        const maxLen = Math.max(a.length, b.length);
+        if (maxLen === 0) return 1;
+        const dist = levenshteinDistance(a, b);
+        return (maxLen - dist) / maxLen;
+    }
+
+    /**
+     * Find the best cache entry for a URL using exact + fuzzy matching.
+     */
+    function findBestCacheKeyForUrl(rawUrl, meta) {
+        const normalizedUrl = normalizeUrl(rawUrl);
+        const threshold = getUrlSimilarityThreshold();
+        const exactKey = generateCacheKey(normalizedUrl);
+
+        let bestKey = null;
+        let bestEntry = null;
+        let bestScore = 0;
+
+        if (meta[exactKey]) {
+            bestKey = exactKey;
+            bestEntry = meta[exactKey];
+            bestScore = 1;
+        }
+
+        for (const [key, entry] of Object.entries(meta)) {
+            if (key === exactKey) continue;
+            const candidateUrl = entry.normalizedUrl || normalizeUrl(entry.url || '');
+            const score = stringSimilarity(normalizedUrl, candidateUrl);
+            if (score >= threshold && score > bestScore) {
+                bestKey = key;
+                bestEntry = entry;
+                bestScore = score;
+            }
+        }
+
+        return { key: bestKey, entry: bestEntry, normalizedUrl };
+    }
+
+    /**
      * 生成缓存键（使用SHA-256模拟）
      */
     function generateCacheKey(url) {
@@ -129,12 +234,11 @@
     /**
      * 获取缓存（检查TTL）
      */
-    function getCache(url) {
-        const key = generateCacheKey(url);
+    function getCache(rawUrl) {
         const meta = getCacheMeta();
-        const entry = meta[key];
+        const { key, entry } = findBestCacheKeyForUrl(rawUrl, meta);
 
-        if (!entry) return null;
+        if (!key || !entry) return null;
 
         const ttl = GM_getValue('gm_cache_ttl', CONFIG.defaults.cacheTTL);
         const now = Date.now();
@@ -159,8 +263,9 @@
     /**
      * 设置缓存（检查大小限制）
      */
-    function setCache(url, data) {
-        const key = generateCacheKey(url);
+    function setCache(rawUrl, data) {
+        const normalizedUrl = normalizeUrl(rawUrl);
+        const key = generateCacheKey(normalizedUrl);
         const meta = getCacheMeta();
         const dataSize = new Blob([data]).size;
         const maxSize = GM_getValue('gm_max_cache_size', CONFIG.defaults.maxCacheSize);
@@ -187,7 +292,8 @@
         // Save cache and metadata
         GM_setValue(key, data);
         meta[key] = {
-            url: url,
+            url: rawUrl,
+            normalizedUrl,
             timestamp: Date.now(),
             size: dataSize
         };
@@ -208,7 +314,9 @@
      * 删除当前页面缓存
      */
     function clearCurrentPageCache() {
-        const key = generateCacheKey(window.location.href);
+        const meta = getCacheMeta();
+        const { key } = findBestCacheKeyForUrl(window.location.href, meta);
+        if (!key) return;
         deleteCache(key);
     }
     
@@ -519,6 +627,16 @@
                         </label>
                     </div>
 
+                    <label style="color:#aaa; font-size:12px">URL 匹配相似度 (%)</label>
+                    <input
+                        type="number"
+                        id="gm-url-similarity"
+                        class="gm-input"
+                        min="50"
+                        max="100"
+                        step="1"
+                        placeholder="95">
+
                     <label style="color:#aaa; font-size:12px">缓存大小限制</label>
                     <select id="gm-max-cache-size" class="gm-select">
                         <option value="5242880">5 MB</option>
@@ -557,6 +675,13 @@
             GM_setValue('gm_model', document.getElementById('gm-model').value);
             GM_setValue('gm_cache_enable', document.getElementById('gm-cache').checked);
             GM_setValue('gm_debug', document.getElementById('gm-debug').checked);
+
+            const similarityInput = parseFloat(document.getElementById('gm-url-similarity').value);
+            const similarity = Number.isNaN(similarityInput)
+                ? CONFIG.defaults.urlSimilarityThreshold
+                : Math.min(Math.max(similarityInput / 100, 0), 1);
+            GM_setValue('gm_url_similarity_threshold', similarity);
+
             GM_setValue('gm_max_cache_size', parseInt(document.getElementById('gm-max-cache-size').value));
             GM_setValue('gm_cache_ttl', parseInt(document.getElementById('gm-cache-ttl').value));
             closeSettings();
@@ -597,6 +722,8 @@
         document.getElementById('gm-model').value = GM_getValue('gm_model', CONFIG.defaultModel);
         document.getElementById('gm-cache').checked = GM_getValue('gm_cache_enable', true);
         document.getElementById('gm-debug').checked = GM_getValue('gm_debug', false);
+        const similarity = getUrlSimilarityThreshold();
+        document.getElementById('gm-url-similarity').value = Math.round(similarity * 100);
         document.getElementById('gm-max-cache-size').value = GM_getValue('gm_max_cache_size', CONFIG.defaults.maxCacheSize);
         document.getElementById('gm-cache-ttl').value = GM_getValue('gm_cache_ttl', CONFIG.defaults.cacheTTL);
         
