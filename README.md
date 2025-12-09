@@ -37,3 +37,6 @@
 * qr-code-scanner
   * 油猴脚本。
   * 帮助识别可见图片元素中包含的二维码。
+* gemini-web-translator
+  * 油猴脚本。
+  * 将网页的文本元素传输给 Gemini 进行翻译并替换。
