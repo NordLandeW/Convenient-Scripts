@@ -80,6 +80,11 @@
             color: #fff; padding: 8px 12px; border-radius: 4px; font-size: 13px;
             margin-bottom: 15px; box-sizing: border-box; outline: none;
         }
+        /* Mask API key visually while avoiding password manager heuristics */
+        .gm-input-secret {
+            -webkit-text-security: disc;
+            text-security: disc;
+        }
         .gm-input:focus { border-color: var(--gm-primary); }
         .gm-btn { padding: 8px 16px; border-radius: 4px; font-size: 13px; cursor: pointer; border: none; margin-left: 8px; }
         .gm-btn-primary { background: var(--gm-primary); color: #202124; font-weight: 600; }
@@ -487,7 +492,17 @@
                     <h3 style="color:#fff; margin-top:0">Gemini Translator V7</h3>
                     
                     <label style="color:#aaa; font-size:12px">API Key</label>
-                    <input type="password" id="gm-key" class="gm-input" placeholder="Paste Google AI Studio Key">
+                    <input
+                        type="text"
+                        id="gm-key"
+                        class="gm-input gm-input-secret"
+                        placeholder="Paste Google AI Studio Key"
+                        autocomplete="off"
+                        autocorrect="off"
+                        autocapitalize="off"
+                        spellcheck="false"
+                        data-lpignore="true"
+                        data-1p-ignore="true">
                     
                     <label style="color:#aaa; font-size:12px">Model</label>
                     <select id="gm-model" class="gm-select">
