@@ -26,7 +26,9 @@
                 endpoint: 'https://generativelanguage.googleapis.com/v1beta/models',
                 models: [
                     'gemini-2.5-pro',
-                    'gemini-3.0-pro-preview',
+                    'gemini-2.5-flash',
+                    'gemini-2.5-flash-lite',
+                    'gemini-3-pro-preview',
                     'gemini-2.0-flash-exp',
                     'gemini-1.5-pro',
                     'gemini-1.5-flash'
@@ -524,12 +526,18 @@
             const prompt = `You are a CSV translator.
 Input format: id,"text content"
 Task: Translate "text content" to Simplified Chinese.
+
 Rules:
-1. Keep "id" exactly the same.
-2. Do NOT translate content inside HTML-like tags if any exist, but translate the text around them.
-3. Output valid CSV: id,"translated_text".
-4. If text is already Chinese, keep it as is.
-5. Escape double quotes with "".`;
+1. Keep the "id" exactly as is.
+2. Output a valid CSV line: id,"translated_text". Escape any double quotes in the translated text by doubling them (e.g., " becomes "").
+3. If the text is already Chinese (i.e., contains predominantly Chinese characters), keep it unchanged; do not translate.
+4. Do not translate proper nouns (names, brands, places, organizations, etc.). Keep them in their original language.
+5. For specialist/technical terms that lack a widely accepted Chinese translation, keep them in English. Only translate if a common Chinese equivalent exists.
+6. The IDs are derived from HTML tags; the text may contain HTML markup or format placeholders (e.g., {0}, %s, %1$s, etc.). Preserve all such markup and placeholders exactly as they appear. Only translate the natural language text that surrounds them.
+7. Maintain consistency in layout and word order: keep the translation as structurally close to the original as possible, without unnecessary reordering.
+
+Provide only the translated CSV line, with no additional commentary.
+`;
 
             if (platform === 'gemini') {
                 callGeminiAPI(apiKey, model, prompt, csvInput, currentUrl, cacheEnabled, isDebug);
