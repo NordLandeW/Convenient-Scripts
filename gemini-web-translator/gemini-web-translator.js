@@ -57,6 +57,8 @@
 
     const state = {
         isTranslating: false,
+        isTranslated: false,
+        originalTexts: new Map(),
         textNodeMap: new Map(),
         currentToastId: null
     };
@@ -472,11 +474,27 @@
                 
                 const node = state.textNodeMap.get(id);
                 if (node) {
+                    // Save original text if not already saved
+                    if (!state.originalTexts.has(node)) {
+                        state.originalTexts.set(node, node.nodeValue);
+                    }
                     node.nodeValue = text;
                     count++;
                 }
             }
         });
+        state.isTranslated = true;
+        return count;
+    }
+
+    // Restore original text to DOM
+    function restoreOriginalText() {
+        let count = 0;
+        state.originalTexts.forEach((originalText, node) => {
+            node.nodeValue = originalText;
+            count++;
+        });
+        state.isTranslated = false;
         return count;
     }
 
@@ -484,6 +502,12 @@
 
     async function startTranslationProcess() {
         if (state.isTranslating) return;
+
+        if (state.isTranslated) {
+            const count = restoreOriginalText();
+            showToast(`已还原原始状态 (${count} 个节点)`, 'success');
+            return;
+        }
         
         const platform = GM_getValue('gm_platform', CONFIG.defaults.platform);
         const apiKey = GM_getValue(`gm_api_key_${platform}`, '');
