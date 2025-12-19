@@ -494,13 +494,20 @@ def get_total_split_size(file_path: str) -> int:
 
 def extract_with_7zip(file_path, extract_to, password: str = None):
     """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
-    command = ["7z", "x", file_path, f"-o{extract_to}", "-y", "-bsp1", "-bb3"]
+    command = ["7z", "x", file_path, f"-o{extract_to}", "-y", "-bsp1", "-bb3", "-sccUTF-8"]
     if password:
         command.extend(["-p" + password])
 
     # 启动7z进程
+    # Use explicit UTF-8 encoding for stdout/stderr to avoid crashes on Windows (defaulting to GBK)
     process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
     )
 
     task = -1
