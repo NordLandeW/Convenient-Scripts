@@ -117,7 +117,7 @@ def copy_file_to_clipboard(filepath):
         import win32clipboard
         import win32con
     except ImportError:
-        print("Need pywin32 for clipboard functionality.")
+        print("需要安装 pywin32 以使用剪贴板功能。")
         return
     try:
         win32clipboard.OpenClipboard()
@@ -142,9 +142,9 @@ def copy_file_to_clipboard(filepath):
         windll.kernel32.GlobalUnlock(ctypes.c_void_p(hGlobalMem))
         win32clipboard.SetClipboardData(win32con.CF_HDROP, hGlobalMem)
         win32clipboard.CloseClipboard()
-        print("Copied to clipboard:", filepath)
+        print("已复制到剪贴板:", filepath)
     except Exception:
-        logger.exception("Failed to copy file to clipboard")
+        logger.exception("复制文件到剪贴板失败")
         try:
             win32clipboard.CloseClipboard()
         except Exception:
@@ -158,18 +158,18 @@ def open_external_and_copy(img_path):
             copy_file_to_clipboard(img_path)
         elif sys.platform.startswith("darwin"):
             subprocess.call(["open", img_path])
-            print("Copy functionality is only supported on Windows.")
+            print("复制功能仅在 Windows 上受支持。")
         else:
             subprocess.call(["xdg-open", img_path])
-            print("Copy functionality is only supported on Windows.")
+            print("复制功能仅在 Windows 上受支持。")
     except Exception as e:
-        print("Failed to open external program:", e)
+        print("无法打开外部程序:", e)
 
 
 class ImageBrowser:
     def __init__(self, master, folder=None, page_size=12, desired_ratio=None):
         self.master = master
-        self.master.title("Image Browser")
+        self.master.title("图片浏览器")
         self.page_size = page_size
         self.folder = folder
         self.images = []
@@ -219,7 +219,7 @@ class ImageBrowser:
 
         prev_button = tk.Button(top_frame, text="上一页", command=self.prev_page)
         prev_button.pack(side=tk.LEFT, padx=5)
-        self.page_label = tk.Label(top_frame, text="Page 0/0")
+        self.page_label = tk.Label(top_frame, text="第 0/0 页")
         self.page_label.pack(side=tk.LEFT, padx=5)
         next_button = tk.Button(top_frame, text="下一页", command=self.next_page)
         next_button.pack(side=tk.LEFT, padx=5)
@@ -251,7 +251,7 @@ class ImageBrowser:
                 self.load_folder(self.folder)
                 self.display_page()
         except Exception:
-            messagebox.showerror("Error", f"Invalid ratio format: {ratio_str}")
+            messagebox.showerror("错误", f"无效的比例格式: {ratio_str}")
 
     def on_middle_frame_configure(self, event):
         if getattr(self, "_resize_after_id", None) is not None:
@@ -266,7 +266,7 @@ class ImageBrowser:
         self.display_page()
 
     def browse_folder(self):
-        folder = filedialog.askdirectory(title="Choose image folder")
+        folder = filedialog.askdirectory(title="选择图片文件夹")
         if folder:
             self.folder_entry.delete(0, tk.END)
             self.folder_entry.insert(0, folder)
@@ -275,7 +275,7 @@ class ImageBrowser:
     def load_folder(self, folder):
         self.images = collect_images(folder)
         if not self.images:
-            messagebox.showinfo("Tip", "No images found in this folder!")
+            messagebox.showinfo("提示", "该文件夹中未找到图片！")
             self.sorted_images = []
             self.current_page = 0
             self.display_page()
@@ -294,7 +294,7 @@ class ImageBrowser:
                 try:
                     info = fut.result()
                 except Exception:
-                    logger.exception("Failed to read image info: {}", path)
+                    logger.exception("读取图片信息失败: {}", path)
                     info = None
                 if info is not None:
                     self.image_info_cache[path] = info
@@ -304,7 +304,7 @@ class ImageBrowser:
                         self.max_area = area
                     if sz > self.max_size:
                         self.max_size = sz
-                _print_progress(idx, total, "Reading ")
+                _print_progress(idx, total, "正在读取 ")
 
         print()
 
@@ -318,9 +318,9 @@ class ImageBrowser:
                 try:
                     score_dict[p] = fut.result()
                 except Exception:
-                    logger.exception("Failed to compute score: {}", p)
+                    logger.exception("计算得分失败: {}", p)
                     score_dict[p] = -10000
-                _print_progress(idx, total, "Scoring ")
+                _print_progress(idx, total, "正在评分 ")
         print()
 
         self.score_cache = score_dict
@@ -342,7 +342,7 @@ class ImageBrowser:
         total_pages = (total_images + self.page_size - 1) // self.page_size if total_images else 0
 
         if total_pages == 0:
-            self.page_label.config(text="Page 0/0")
+            self.page_label.config(text="第 0/0 页")
             return
 
         if self.current_page >= total_pages:
@@ -353,7 +353,7 @@ class ImageBrowser:
         page_images = self.sorted_images[start_index:end_index]
 
         if not page_images:
-            self.page_label.config(text=f"Page {self.current_page + 1}/{total_pages}")
+            self.page_label.config(text=f"第 {self.current_page + 1}/{total_pages} 页")
             return
 
         columns = self.current_columns
@@ -404,7 +404,7 @@ class ImageBrowser:
                 cell_canvas = self.middle_frame.grid_slaves(row=row, column=col)[0]
                 self.draw_thumbnail_overlay(cell_canvas, img_path, target_size)
         
-        self.page_label.config(text=f"Page {self.current_page + 1}/{total_pages}")
+        self.page_label.config(text=f"第 {self.current_page + 1}/{total_pages} 页")
 
     def draw_thumbnail_overlay(self, canvas, img_path, target_size):
         try:
@@ -458,7 +458,7 @@ class ImageBrowser:
                                           tags="thumbnail_overlay")
                                           
         except Exception as e:
-            logger.error(f"Failed to draw thumbnail overlay: {e}")
+            logger.error(f"绘制缩略图遮罩失败: {e}")
 
     def get_thumbnail(self, img_path, target_size):
         key = (img_path, target_size)
@@ -477,7 +477,7 @@ class ImageBrowser:
             img_copy.thumbnail(target_size, Image.Resampling.HAMMING)
             return img_copy
         except Exception as e:
-            logger.error(f"Failed to generate thumbnail for {img_path}: {e}")
+            logger.error(f"生成缩略图失败 {img_path}: {e}")
             return None
 
     def thumbnail_done_callback(self, key, fut):
@@ -487,7 +487,7 @@ class ImageBrowser:
                 photo = ImageTk.PhotoImage(pil_image)
                 self.thumbnails[key] = photo
             except Exception as e:
-                logger.error(f"Failed to convert PhotoImage: {e}")
+                logger.error(f"转换 PhotoImage 失败: {e}")
         self.display_page()
 
     def prev_page(self):
@@ -530,7 +530,7 @@ class PreviewWindow:
         try:
             self.original_image = Image.open(self.img_path)
         except Exception as e:
-            logger.error(f"Cannot open image: {self.img_path}\n{e}")
+            logger.error(f"无法打开图片: {self.img_path}\n{e}")
             self.top.destroy()
             return
         self.zoom_level = 1.0
@@ -652,7 +652,7 @@ class PreviewWindow:
         try:
             orig_width, orig_height = self.original_image.size
         except Exception as e:
-            logger.error(f"Failed to get image size: {e}")
+            logger.error(f"获取图片尺寸失败: {e}")
             return
 
         base_zoom = min(canvas_width / orig_width, canvas_height / orig_height)
@@ -667,7 +667,7 @@ class PreviewWindow:
                 resized = self.original_image.resize(new_size, Image.Resampling.HAMMING)
                 self.photo = ImageTk.PhotoImage(resized)
             except Exception as e:
-                logger.error(f"Image resize failed: {e}")
+                logger.error(f"图片调整大小失败: {e}")
                 return
             if self.image_item is None:
                 self.image_item = self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
@@ -702,13 +702,13 @@ class PreviewWindow:
         self._clamp_offsets()
         self._update_canvas_position(redraw_overlay=True)
 
-        self.top.title(f"Preview: {os.path.basename(self.img_path)}")
+        self.top.title(f"预览: {os.path.basename(self.img_path)}")
         info = self.get_cached_image_info(self.img_path)
         if info is not None:
             width, height, ratio, file_size = info
             total_score = self.get_cached_score(self.img_path, info)
             aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
-            info_text = f"Res: {width}x{height}, Size: {file_size} bytes, Score: {total_score:.1f}, Aspect Score: {aspect_score:.1f}"
+            info_text = f"分辨率: {width}x{height}, 大小: {file_size} 字节, 总分: {total_score:.1f}, 比例分: {aspect_score:.1f}"
             self.info_label.config(text=info_text)
 
     def update_zoom(self, val):
@@ -717,7 +717,7 @@ class PreviewWindow:
         try:
             zoom_value = float(val)
         except Exception as e:
-            logger.error(f"Zoom update error: {e}")
+            logger.error(f"缩放更新错误: {e}")
             return
 
         if getattr(self, "_zoom_after_id", None) is not None:
@@ -741,7 +741,7 @@ class PreviewWindow:
         try:
             orig_width, orig_height = self.original_image.size
         except Exception as e:
-            logger.error(f"Failed to get image size: {e}")
+            logger.error(f"获取图片尺寸失败: {e}")
             return
 
         if reset_offsets:
@@ -810,7 +810,7 @@ class PreviewWindow:
         try:
             self.original_image = Image.open(self.img_path)
         except Exception as e:
-            logger.error(f"Cannot open image: {self.img_path}\n{e}")
+            logger.error(f"无法打开图片: {self.img_path}\n{e}")
             return
         self.photo = None
         self.cached_image_size = None
@@ -886,14 +886,14 @@ class PreviewWindow:
                                          tags=overlay_tag)
 
         except Exception as e:
-            logger.error(f"Failed to draw overlay: {e}")
+            logger.error(f"绘制遮罩失败: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Image Browser GUI")
-    parser.add_argument("--folder", help="Folder path to scan")
-    parser.add_argument("--page-size", type=int, default=12, help="Images per page, default 12")
-    parser.add_argument("--ratio", help="Target aspect ratio, e.g., 16:9")
+    parser = argparse.ArgumentParser(description="图片浏览器 GUI")
+    parser.add_argument("--folder", help="要扫描的文件夹路径")
+    parser.add_argument("--page-size", type=int, default=12, help="每页显示的图片数量，默认为 12")
+    parser.add_argument("--ratio", help="目标纵横比，例如 16:9")
     args = parser.parse_args()
     desired_ratio = None
     if args.ratio:
@@ -901,7 +901,7 @@ def main():
             a, b = args.ratio.split(":")
             desired_ratio = float(a) / float(b)
         except Exception:
-            print("Ratio format should be a:b")
+            print("比例格式应为 a:b")
             sys.exit(1)
     root = tk.Tk()
     sw = root.winfo_screenwidth()
