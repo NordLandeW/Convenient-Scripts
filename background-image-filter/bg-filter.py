@@ -18,16 +18,23 @@ def _print_progress(cur, total, prefix=""):
     sys.stdout.write(f"\r{prefix}{cur}/{total}  {pct}%")
     sys.stdout.flush()
 
-def compute_score(img_path, screen_ratio, max_area, max_size, preloaded_info=None):
+def get_simplest_ratio(ratio_float):
+    if ratio_float is None or ratio_float <= 0:
+        return ""
+    # Try to find a simple integer ratio
+    from fractions import Fraction
+    f = Fraction(ratio_float).limit_denominator(100)
+    return f"{f.numerator}:{f.denominator}"
+
+
+def compute_score(img_path, target_ratio, max_area, max_size, preloaded_info=None):
     info = preloaded_info if preloaded_info is not None else get_image_info(img_path)
     if info is None:
         return -10000
     width, height, ratio, file_size = info
 
-    # 1. 比例评分
-    score_aspect = aspect_ratio_score(ratio, screen_ratio)
+    score_aspect = aspect_ratio_score(ratio, target_ratio)
 
-    # 2. 格式评分（保持原有逻辑）
     ext = os.path.splitext(img_path)[1].lower()
     if ext == '.png':
         score_format = 20
@@ -38,33 +45,25 @@ def compute_score(img_path, screen_ratio, max_area, max_size, preloaded_info=Non
     else:
         score_format = 0
 
-    # 3. 分辨率评分（最高45分）
-    if width * height >= 3840 * 2160:  # 4K
+    if width * height >= 3840 * 2160:
         score_resolution = 45
-    elif width * height >= 2560 * 1440:  # 2K
+    elif width * height >= 2560 * 1440:
         score_resolution = 40
-    elif width * height >= 1920 * 1080:  # 1K
+    elif width * height >= 1920 * 1080:
         score_resolution = 20
     elif width * height >= 1280 * 720:
         score_resolution = 10
     else:
         score_resolution = -40
 
-    # 4. 文件大小评分（最高20分）
     score_filesize = 20 * (file_size / max_size) if max_size > 0 else 0
 
     return score_aspect + score_format + score_resolution + score_filesize
 
 
 def aspect_ratio_score(image_ratio, desired_ratio):
-    """
-    计算比例评分：以覆盖方式放置壁纸时，计算无法显示的部分占比
-    X% 的部分无法显示，X越大扣分越多
-    """
     if desired_ratio <= 0 or image_ratio <= 0:
         return 0
-    
-    scale_factor = max(1.0 / image_ratio, desired_ratio)
     
     if image_ratio > desired_ratio:
         visible_ratio = desired_ratio / image_ratio
@@ -113,14 +112,12 @@ def collect_images(folder):
     return image_files
 
 
-# 将文件作为单个文件复制到剪贴板（仅在 Windows 上支持）
-
 def copy_file_to_clipboard(filepath):
     try:
         import win32clipboard
         import win32con
     except ImportError:
-        print("复制文件到剪贴板需要 pywin32 模块。")
+        print("Need pywin32 for clipboard functionality.")
         return
     try:
         win32clipboard.OpenClipboard()
@@ -145,9 +142,9 @@ def copy_file_to_clipboard(filepath):
         windll.kernel32.GlobalUnlock(ctypes.c_void_p(hGlobalMem))
         win32clipboard.SetClipboardData(win32con.CF_HDROP, hGlobalMem)
         win32clipboard.CloseClipboard()
-        print("文件已复制到剪贴板:", filepath)
+        print("Copied to clipboard:", filepath)
     except Exception:
-        logger.exception("复制文件到剪贴板失败")
+        logger.exception("Failed to copy file to clipboard")
         try:
             win32clipboard.CloseClipboard()
         except Exception:
@@ -161,18 +158,18 @@ def open_external_and_copy(img_path):
             copy_file_to_clipboard(img_path)
         elif sys.platform.startswith("darwin"):
             subprocess.call(["open", img_path])
-            print("复制功能仅在 Windows 上支持。")
+            print("Copy functionality is only supported on Windows.")
         else:
             subprocess.call(["xdg-open", img_path])
-            print("复制功能仅在 Windows 上支持。")
+            print("Copy functionality is only supported on Windows.")
     except Exception as e:
-        print("打开外部程序失败:", e)
+        print("Failed to open external program:", e)
 
 
 class ImageBrowser:
     def __init__(self, master, folder=None, page_size=12, desired_ratio=None):
         self.master = master
-        self.master.title("图片浏览器")
+        self.master.title("Image Browser")
         self.page_size = page_size
         self.folder = folder
         self.images = []
@@ -183,10 +180,16 @@ class ImageBrowser:
         self.score_cache = {}
         self.current_page = 0
         self.current_columns = 3
-        self.desired_ratio = desired_ratio
+        
+        if desired_ratio is not None:
+            self.screen_ratio = desired_ratio
+        else:
+            screen_width = self.master.winfo_screenwidth()
+            screen_height = self.master.winfo_screenheight()
+            self.screen_ratio = screen_width / screen_height
+            
         self.placeholder_image = ImageTk.PhotoImage(Image.new("RGB", (10, 10), "gray"))
         self.executor = ThreadPoolExecutor(max_workers=4)
-        # 中间内容区域尺寸变化时，延迟触发布局重绘，避免拖动窗口时频繁重建所有控件
         self._resize_after_id = None
         self.setup_ui()
         self.master.bind("<Left>", lambda event: self.prev_page())
@@ -197,12 +200,23 @@ class ImageBrowser:
     def setup_ui(self):
         top_frame = tk.Frame(self.master)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-        self.folder_entry = tk.Entry(top_frame, width=50)
+        
+        self.folder_entry = tk.Entry(top_frame, width=40)
         self.folder_entry.pack(side=tk.LEFT, padx=5)
         browse_button = tk.Button(top_frame, text="选择文件夹", command=self.browse_folder)
         browse_button.pack(side=tk.LEFT, padx=5)
-        load_button = tk.Button(top_frame, text="加载图片", command=lambda: self.load_folder(self.folder_entry.get()))
+        load_button = tk.Button(top_frame, text="加载", command=lambda: self.load_folder(self.folder_entry.get()))
         load_button.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(top_frame, text="比例:").pack(side=tk.LEFT, padx=(10, 2))
+        self.ratio_entry = tk.Entry(top_frame, width=10)
+        self.ratio_entry.insert(0, get_simplest_ratio(self.screen_ratio))
+        self.ratio_entry.pack(side=tk.LEFT, padx=5)
+        self.ratio_entry.bind("<Return>", lambda e: self.apply_ratio())
+        
+        recalc_button = tk.Button(top_frame, text="重新计算", command=self.apply_ratio)
+        recalc_button.pack(side=tk.LEFT, padx=5)
+
         prev_button = tk.Button(top_frame, text="上一页", command=self.prev_page)
         prev_button.pack(side=tk.LEFT, padx=5)
         self.page_label = tk.Label(top_frame, text="Page 0/0")
@@ -210,29 +224,41 @@ class ImageBrowser:
         next_button = tk.Button(top_frame, text="下一页", command=self.next_page)
         next_button.pack(side=tk.LEFT, padx=5)
         
-        # 添加屏幕比例预览勾选框
         self.show_overlay_var = tk.BooleanVar(value=False)
-        overlay_checkbox = tk.Checkbutton(top_frame, text="显示屏幕比例遮挡", 
+        overlay_checkbox = tk.Checkbutton(top_frame, text="比例遮挡", 
                                          variable=self.show_overlay_var, 
                                          command=self.display_page)
         overlay_checkbox.pack(side=tk.LEFT, padx=10)
         
         self.middle_frame = tk.Frame(self.master)
         self.middle_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        # 使用防抖处理，避免在拖动窗口大小时连续触发布局重建
         self.middle_frame.bind("<Configure>", self.on_middle_frame_configure)
 
+    def apply_ratio(self):
+        ratio_str = self.ratio_entry.get().strip()
+        try:
+            if ":" in ratio_str:
+                a, b = ratio_str.split(":")
+                new_ratio = float(a) / float(b)
+            else:
+                new_ratio = float(ratio_str)
+            
+            self.screen_ratio = new_ratio
+            self.ratio_entry.delete(0, tk.END)
+            self.ratio_entry.insert(0, get_simplest_ratio(self.screen_ratio))
+            
+            if self.folder:
+                self.load_folder(self.folder)
+                self.display_page()
+        except Exception:
+            messagebox.showerror("Error", f"Invalid ratio format: {ratio_str}")
+
     def on_middle_frame_configure(self, event):
-        """
-        middle_frame 大小变化时的回调。
-        使用 after + cancel 做简单防抖，避免在拖动窗口时每一像素变化都完整重建网格布局。
-        """
         if getattr(self, "_resize_after_id", None) is not None:
             try:
                 self.master.after_cancel(self._resize_after_id)
             except Exception:
                 pass
-        # 100ms 内如果没有新的尺寸变化事件，则认为用户暂时停止拖动，执行一次重绘
         self._resize_after_id = self.master.after(100, self._delayed_display_page)
 
     def _delayed_display_page(self):
@@ -240,7 +266,7 @@ class ImageBrowser:
         self.display_page()
 
     def browse_folder(self):
-        folder = filedialog.askdirectory(title="选择图片文件夹")
+        folder = filedialog.askdirectory(title="Choose image folder")
         if folder:
             self.folder_entry.delete(0, tk.END)
             self.folder_entry.insert(0, folder)
@@ -249,18 +275,13 @@ class ImageBrowser:
     def load_folder(self, folder):
         self.images = collect_images(folder)
         if not self.images:
-            messagebox.showinfo("提示", "该文件夹下没有找到图片！")
+            messagebox.showinfo("Tip", "No images found in this folder!")
             self.sorted_images = []
             self.current_page = 0
             self.display_page()
             return
 
         total = len(self.images)
-        screen_width = self.master.winfo_screenwidth()
-        screen_height = self.master.winfo_screenheight()
-        self.screen_ratio = screen_width / screen_height
-
-        # 阶段一：并行读取图片信息并统计 max_area / max_size
         self.image_info_cache.clear()
         self.score_cache.clear()
         self.max_area = 0
@@ -273,7 +294,7 @@ class ImageBrowser:
                 try:
                     info = fut.result()
                 except Exception:
-                    logger.exception("读取图片信息失败: {}", path)
+                    logger.exception("Failed to read image info: {}", path)
                     info = None
                 if info is not None:
                     self.image_info_cache[path] = info
@@ -283,11 +304,10 @@ class ImageBrowser:
                         self.max_area = area
                     if sz > self.max_size:
                         self.max_size = sz
-                _print_progress(idx, total, "读取信息 ")
+                _print_progress(idx, total, "Reading ")
 
-        print()  # 换行
+        print()
 
-        # 阶段二：多线程计算评分
         score_dict = {}
         score_workers = min(32, max(4, (os.cpu_count() or 1) * 2))
         with ThreadPoolExecutor(max_workers=score_workers) as pool:
@@ -298,12 +318,11 @@ class ImageBrowser:
                 try:
                     score_dict[p] = fut.result()
                 except Exception:
-                    logger.exception("计算评分失败: {}", p)
+                    logger.exception("Failed to compute score: {}", p)
                     score_dict[p] = -10000
-                _print_progress(idx, total, "计算评分 ")
-        print()  # 换行
+                _print_progress(idx, total, "Scoring ")
+        print()
 
-        # 根据评分排序
         self.score_cache = score_dict
         self.sorted_images = sorted(self.images, key=lambda x: score_dict[x], reverse=True)
 
@@ -388,7 +407,6 @@ class ImageBrowser:
         self.page_label.config(text=f"Page {self.current_page + 1}/{total_pages}")
 
     def draw_thumbnail_overlay(self, canvas, img_path, target_size):
-        """在缩略图上绘制屏幕比例遮挡效果"""
         try:
             info = self.get_cached_image_info(img_path)
             if info is None:
@@ -397,28 +415,23 @@ class ImageBrowser:
             orig_width, orig_height, image_ratio, _ = info
             canvas_width, canvas_height = target_size
             
-            # 计算缩略图的实际显示区域（因为 thumbnail 会保持比例）
             scale = min(canvas_width / orig_width, canvas_height / orig_height)
             thumb_width = orig_width * scale
             thumb_height = orig_height * scale
             
-            # 缩略图在 canvas 中的位置（居中）
             thumb_x1 = (canvas_width - thumb_width) / 2
             thumb_y1 = (canvas_height - thumb_height) / 2
             thumb_x2 = thumb_x1 + thumb_width
             thumb_y2 = thumb_y1 + thumb_height
             
-            # 计算可见区域
             if image_ratio > self.screen_ratio:
-                # 图片比屏幕更宽，会裁剪左右部分
+                # Crop horizontally
                 visible_width_ratio = self.screen_ratio / image_ratio
                 visible_width = thumb_width * visible_width_ratio
                 
-                # 可见区域居中
                 visible_x1 = thumb_x1 + (thumb_width - visible_width) / 2
                 visible_x2 = visible_x1 + visible_width
                 
-                # 绘制左右遮挡区域
                 if visible_x1 > thumb_x1:
                     canvas.create_rectangle(thumb_x1, thumb_y1, visible_x1, thumb_y2,
                                           fill="black", stipple="gray25", outline="",
@@ -428,15 +441,13 @@ class ImageBrowser:
                                           fill="black", stipple="gray25", outline="",
                                           tags="thumbnail_overlay")
             else:
-                # 图片比屏幕更高，会裁剪上下部分
+                # Crop vertically
                 visible_height_ratio = image_ratio / self.screen_ratio
                 visible_height = thumb_height * visible_height_ratio
                 
-                # 可见区域居中
                 visible_y1 = thumb_y1 + (thumb_height - visible_height) / 2
                 visible_y2 = visible_y1 + visible_height
                 
-                # 绘制上下遮挡区域
                 if visible_y1 > thumb_y1:
                     canvas.create_rectangle(thumb_x1, thumb_y1, thumb_x2, visible_y1,
                                           fill="black", stipple="gray25", outline="",
@@ -447,7 +458,7 @@ class ImageBrowser:
                                           tags="thumbnail_overlay")
                                           
         except Exception as e:
-            print(f"绘制缩略图遮挡失败: {e}")
+            logger.error(f"Failed to draw thumbnail overlay: {e}")
 
     def get_thumbnail(self, img_path, target_size):
         key = (img_path, target_size)
@@ -466,7 +477,7 @@ class ImageBrowser:
             img_copy.thumbnail(target_size, Image.Resampling.HAMMING)
             return img_copy
         except Exception as e:
-            print(f"生成缩略图 {img_path} 失败: {e}")
+            logger.error(f"Failed to generate thumbnail for {img_path}: {e}")
             return None
 
     def thumbnail_done_callback(self, key, fut):
@@ -476,7 +487,7 @@ class ImageBrowser:
                 photo = ImageTk.PhotoImage(pil_image)
                 self.thumbnails[key] = photo
             except Exception as e:
-                print("转换 PhotoImage 失败:", e)
+                logger.error(f"Failed to convert PhotoImage: {e}")
         self.display_page()
 
     def prev_page(self):
@@ -519,13 +530,12 @@ class PreviewWindow:
         try:
             self.original_image = Image.open(self.img_path)
         except Exception as e:
-            print(f"无法打开图片: {self.img_path}\n{e}")
+            logger.error(f"Cannot open image: {self.img_path}\n{e}")
             self.top.destroy()
             return
         self.zoom_level = 1.0
         self.canvas = tk.Canvas(self.top, bg="gray")
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        # 预览窗口中同样对画布尺寸变化做防抖处理，避免在拖动窗口时频繁对大图重采样
         self._canvas_resize_after_id = None
         self.canvas.bind("<Configure>", self.on_canvas_configure)
         self.slider = tk.Scale(self.top, from_=0.1, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, label="额外缩放", command=self.update_zoom)
@@ -534,13 +544,10 @@ class PreviewWindow:
 
         self.min_zoom = float(self.slider["from"])
         self.max_zoom = float(self.slider["to"])
-        # 当通过代码更新 slider 时，避免再次触发 update_zoom
         self._ignore_zoom_callback = False
-        # slider 连续拖动时的缩放防抖
         self._zoom_after_id = None
         self._pending_zoom_value = None
         
-        # 添加显示屏幕比例遮挡的勾选框
         self.show_screen_ratio_var = tk.BooleanVar(value=False)
         self.screen_ratio_checkbox = tk.Checkbutton(self.top, text="显示屏幕比例遮挡",
                                                    variable=self.show_screen_ratio_var,
@@ -561,7 +568,6 @@ class PreviewWindow:
         self.top.bind("<Right>", lambda event: self.next_image())
         self.top.bind("<Control-c>", lambda event: self.copy_current_file())
 
-        # 拖动状态
         self.drag_start_x = 0
         self.drag_start_y = 0
         self.view_offset_x = 0
@@ -577,7 +583,6 @@ class PreviewWindow:
 
         self.canvas.configure(cursor="fleur")
 
-        # 绑定拖动与缩放事件
         self.canvas.bind("<ButtonPress-1>", self.start_drag)
         self.canvas.bind("<B1-Motion>", self.do_drag)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
@@ -628,10 +633,6 @@ class PreviewWindow:
             self.canvas.config(scrollregion=bbox)
 
     def on_canvas_configure(self, event):
-        """
-        预览窗口中画布尺寸变化时的回调。
-        使用简单防抖，减少拖动窗口大小过程中对大图片的重复缩放与重绘。
-        """
         if getattr(self, "_canvas_resize_after_id", None) is not None:
             try:
                 self.top.after_cancel(self._canvas_resize_after_id)
@@ -651,7 +652,7 @@ class PreviewWindow:
         try:
             orig_width, orig_height = self.original_image.size
         except Exception as e:
-            print("获取图片尺寸失败:", e)
+            logger.error(f"Failed to get image size: {e}")
             return
 
         base_zoom = min(canvas_width / orig_width, canvas_height / orig_height)
@@ -666,7 +667,7 @@ class PreviewWindow:
                 resized = self.original_image.resize(new_size, Image.Resampling.HAMMING)
                 self.photo = ImageTk.PhotoImage(resized)
             except Exception as e:
-                print("图片缩放失败:", e)
+                logger.error(f"Image resize failed: {e}")
                 return
             if self.image_item is None:
                 self.image_item = self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
@@ -701,29 +702,24 @@ class PreviewWindow:
         self._clamp_offsets()
         self._update_canvas_position(redraw_overlay=True)
 
-        self.top.title(f"预览: {os.path.basename(self.img_path)}")
+        self.top.title(f"Preview: {os.path.basename(self.img_path)}")
         info = self.get_cached_image_info(self.img_path)
         if info is not None:
             width, height, ratio, file_size = info
             total_score = self.get_cached_score(self.img_path, info)
             aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
-            info_text = f"尺寸: {width}x{height}, 大小: {file_size} bytes, 总分: {total_score:.1f}, 比例分: {aspect_score:.1f}"
+            info_text = f"Res: {width}x{height}, Size: {file_size} bytes, Score: {total_score:.1f}, Aspect Score: {aspect_score:.1f}"
             self.info_label.config(text=info_text)
 
     def update_zoom(self, val):
-        """
-        slider 回调：使用防抖，避免从 1.0 拖到 2.0 的过程中，每一个中间值都触发一次重采样。
-        鼠标停顿一小段时间后再真正应用缩放。
-        """
         if self._ignore_zoom_callback:
             return
         try:
             zoom_value = float(val)
         except Exception as e:
-            print("更新缩放出错:", e)
+            logger.error(f"Zoom update error: {e}")
             return
 
-        # 记录最新缩放值，并取消之前挂起的缩放任务
         if getattr(self, "_zoom_after_id", None) is not None:
             try:
                 self.top.after_cancel(self._zoom_after_id)
@@ -731,16 +727,13 @@ class PreviewWindow:
                 pass
 
         self._pending_zoom_value = zoom_value
-        # 80~100ms 的防抖间隔即可，既不影响交互感受，又能明显减少重采样次数
         self._zoom_after_id = self.top.after(100, self._apply_debounced_zoom)
 
     def _apply_debounced_zoom(self):
-        """实际应用 slider 最新值对应的缩放。"""
         self._zoom_after_id = None
         zoom_value = self._pending_zoom_value
         if zoom_value is None:
             return
-        # slider 本身已经在最新位置，不需要再回写 slider，避免产生多余回调
         self.change_zoom(zoom_value, update_slider=False)
 
     def change_zoom(self, new_zoom, focal_point=None, update_slider=False, reset_offsets=False):
@@ -748,7 +741,7 @@ class PreviewWindow:
         try:
             orig_width, orig_height = self.original_image.size
         except Exception as e:
-            print("获取图片尺寸失败:", e)
+            logger.error(f"Failed to get image size: {e}")
             return
 
         if reset_offsets:
@@ -817,7 +810,7 @@ class PreviewWindow:
         try:
             self.original_image = Image.open(self.img_path)
         except Exception as e:
-            print(f"无法打开图片: {self.img_path}\n{e}")
+            logger.error(f"Cannot open image: {self.img_path}\n{e}")
             return
         self.photo = None
         self.cached_image_size = None
@@ -855,9 +848,6 @@ class PreviewWindow:
         return score
 
     def draw_screen_ratio_overlay(self, canvas_width, canvas_height, image_size, image_center, visible_size):
-        """
-        绘制屏幕比例的半透明遮挡，显示以覆盖模式显示时能够看到的部分
-        """
         try:
             img_display_width, img_display_height = image_size
             visible_width, visible_height = visible_size
@@ -896,14 +886,14 @@ class PreviewWindow:
                                          tags=overlay_tag)
 
         except Exception as e:
-            print(f"绘制屏幕比例遮挡失败: {e}")
+            logger.error(f"Failed to draw overlay: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="图片浏览器 GUI")
-    parser.add_argument("--folder", help="要扫描的文件夹路径")
-    parser.add_argument("--page-size", type=int, default=12, help="每页显示图片数量，默认12个")
-    parser.add_argument("--ratio", help="指定目标宽高比，格式 a:b")
+    parser = argparse.ArgumentParser(description="Image Browser GUI")
+    parser.add_argument("--folder", help="Folder path to scan")
+    parser.add_argument("--page-size", type=int, default=12, help="Images per page, default 12")
+    parser.add_argument("--ratio", help="Target aspect ratio, e.g., 16:9")
     args = parser.parse_args()
     desired_ratio = None
     if args.ratio:
@@ -911,7 +901,7 @@ def main():
             a, b = args.ratio.split(":")
             desired_ratio = float(a) / float(b)
         except Exception:
-            print("比例格式应为 a:b，其中 a、b 为数字")
+            print("Ratio format should be a:b")
             sys.exit(1)
     root = tk.Tk()
     sw = root.winfo_screenwidth()
