@@ -195,6 +195,142 @@
         }
 
         /**
+         * Loads image bytes for decoding.
+         *
+         * Why: modern sites frequently use `blob:`/`data:` URLs, `<picture>/<source>` (WebP), or lazy-load placeholders.
+         * A plain network GET can fail even though the image is visible in the page.
+         * @param {string} imageUrl
+         * @returns {Promise<Blob>}
+         */
+        async fetchImageBlob(imageUrl) {
+            if (!imageUrl) throw "无法获取图片地址";
+
+            // `fetch()` can read `blob:`/`data:` URLs that GM_xmlhttpRequest can't.
+            if (/^(blob:|data:)/i.test(imageUrl)) {
+                const r = await fetch(imageUrl);
+                const b = await r.blob();
+                if (!b || b.size === 0) throw "无法获取图片数据";
+                return b;
+            }
+
+            return await this.fetchImageBlobByGmRequest(imageUrl);
+        }
+
+        /**
+         * Uses Tampermonkey network stack to bypass CORS for cross-origin images.
+         * Keeps redirects enabled and accepts non-200 success variants like 206.
+         * @param {string} imageUrl
+         * @returns {Promise<Blob>}
+         */
+        fetchImageBlobByGmRequest(imageUrl) {
+            const doRequest = (referrer, allowRetry) => new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: imageUrl,
+                    responseType: "blob",
+                    redirect: "follow",
+                    nocache: true,
+                    revalidate: true,
+                    // Make intent explicit; some environments behave differently for third-party resources.
+                    anonymous: false,
+                    headers: {
+                        // Some CDNs vary formats by Accept; hint that WebP is fine.
+                        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+                        // Hotlink protection is commonly implemented via referer checks.
+                        // Tampermonkey treats some headers specially; `referer` tends to be more reliably applied than `Referer`.
+                        "referer": referrer,
+                        // Optional hints; unsupported headers will be ignored.
+                        "origin": location.origin,
+                        "user-agent": navigator.userAgent
+                    },
+                    onload: (res) => {
+                        const blob = res.response;
+                        const ok = (res.status >= 200 && res.status < 300) || res.status === 304;
+                        const okOpaque = (res.status === 0 && blob && blob.size > 0);
+
+                        if (!ok && !okOpaque) {
+                            // Some CDNs only accept origin-level referrers (or normalize referrers internally).
+                            if (allowRetry && res.status === 403) {
+                                return doRequest(location.origin + '/', false).then(resolve, reject);
+                            }
+                            return reject(`图片下载失败 (${res.status || 'unknown'})`);
+                        }
+
+                        if (!blob || !(blob instanceof Blob) || blob.size === 0) return reject("无法获取图片数据");
+                        resolve(blob);
+                    },
+                    onerror: () => reject("无法获取图片数据")
+                });
+            });
+
+            return doRequest(location.href, true);
+        }
+
+        /**
+         * Converts WebP to PNG for providers that may not accept WebP uploads.
+         * Keeps original blob if conversion fails to avoid blocking the flow.
+         * @param {Blob} blob
+         * @param {string} sourceUrl
+         * @returns {Promise<Blob>}
+         */
+        async maybeConvertWebpToPng(blob, sourceUrl) {
+            const urlLooksWebp = /\.webp(?:[?#].*)?$/i.test(sourceUrl || '');
+            const typeLooksWebp = (blob.type || '').toLowerCase().includes('image/webp');
+            if (!urlLooksWebp && !typeLooksWebp) return blob;
+
+            try {
+                return await this.convertBlobToPng(blob);
+            } catch (_) {
+                return blob;
+            }
+        }
+
+        /**
+         * Converts an image blob into PNG using canvas.
+         * Why: QRServer and similar endpoints are more likely to support PNG/JPEG than WebP.
+         * @param {Blob} blob
+         * @returns {Promise<Blob>}
+         */
+        async convertBlobToPng(blob) {
+            const toPngFromCanvas = (canvas) => new Promise((resolve, reject) => {
+                canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+            });
+
+            if (typeof createImageBitmap === 'function') {
+                const bmp = await createImageBitmap(blob);
+                try {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = bmp.width;
+                    canvas.height = bmp.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(bmp, 0, 0);
+                    return await toPngFromCanvas(canvas);
+                } finally {
+                    if (typeof bmp.close === 'function') bmp.close();
+                }
+            }
+
+            // Fallback for environments without createImageBitmap.
+            const blobUrl = URL.createObjectURL(blob);
+            try {
+                const img = await new Promise((resolve, reject) => {
+                    const i = new Image();
+                    i.onload = () => resolve(i);
+                    i.onerror = () => reject(new Error('image load failed'));
+                    i.src = blobUrl;
+                });
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                return await toPngFromCanvas(canvas);
+            } finally {
+                URL.revokeObjectURL(blobUrl);
+            }
+        }
+
+        /**
          * Select provider/method based on user settings and capability.
          * Prefer URL method to minimize data transfer, fallback to upload when supported.
          */
@@ -283,80 +419,85 @@
          * @param {string} imageUrl
          * @returns {Promise<string>}
          */
-        decodeQrServerUpload(imageUrl) {
-            return new Promise((resolve, reject) => {
-                if (!/^https?:/i.test(imageUrl)) {
-                    return reject("仅支持上传来自 HTTP(S) 的图片；非公网图片请使用【本地离线】模式。");
-                }
+        async decodeQrServerUpload(imageUrl) {
+            if (!/^https?:/i.test(imageUrl)) {
+                throw "仅支持上传来自 HTTP(S) 的图片；非公网图片请使用【本地离线】模式。";
+            }
+
+            let blob = await this.fetchImageBlob(imageUrl);
+            blob = await this.maybeConvertWebpToPng(blob, imageUrl);
+
+            if (blob.size > 1048576) {
+                throw "文件超过 1 MiB，无法上传，请改用 URL 方式或本地离线";
+            }
+
+            const fd = new FormData();
+            const ext = (blob.type || '').toLowerCase().includes('png') ? 'png' : 'jpg';
+            fd.append("file", blob, `qr.${ext}`);
+
+            const respText = await new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
-                    method: "GET",
-                    url: imageUrl,
-                    responseType: "blob",
-                    onload: (res) => {
-                        if (res.status !== 200) return reject("图片下载失败");
-                        const blob = res.response;
-                        if (!blob || !(blob instanceof Blob)) return reject("无法获取图片数据");
-                        if (blob.size > 1048576) return reject("文件超过 1 MiB，无法上传，请改用 URL 方式或本地离线");
-                        const fd = new FormData();
-                        fd.append("file", blob, "qr.jpg");
-                        GM_xmlhttpRequest({
-                            method: "POST",
-                            url: "https://api.qrserver.com/v1/read-qr-code/?outputformat=json",
-                            data: fd,
-                            onload: (resp) => {
-                                try {
-                                    const data = JSON.parse(resp.responseText);
-                                    if (Array.isArray(data) && data.length > 0 && data[0]?.symbol?.length > 0) {
-                                        const sym = data[0].symbol[0];
-                                        if (sym.error) reject(sym.error);
-                                        else if (sym.data) resolve(sym.data);
-                                        else reject("未发现二维码");
-                                    } else {
-                                        reject("未发现二维码");
-                                    }
-                                } catch (e) { reject("API响应异常"); }
-                            },
-                            onerror: () => reject("网络请求失败")
-                        });
+                    method: "POST",
+                    url: "https://api.qrserver.com/v1/read-qr-code/?outputformat=json",
+                    data: fd,
+                    onload: (resp) => {
+                        if (resp.status && (resp.status < 200 || resp.status >= 300)) {
+                            return reject(`网络请求失败 (${resp.status})`);
+                        }
+                        resolve(resp.responseText);
                     },
-                    onerror: () => reject("无法获取图片数据")
+                    onerror: () => reject("网络请求失败")
                 });
             });
+
+            try {
+                const data = JSON.parse(respText);
+                if (Array.isArray(data) && data.length > 0 && data[0]?.symbol?.length > 0) {
+                    const sym = data[0].symbol[0];
+                    if (sym.error) throw sym.error;
+                    if (sym.data) return sym.data;
+                }
+                throw "未发现二维码";
+            } catch (e) {
+                if (typeof e === 'string') throw e;
+                throw "API响应异常";
+            }
         }
 
-        decodeLocal(imageUrl) {
-            return new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "GET",
-                    url: imageUrl,
-                    responseType: 'blob',
-                    onload: async (res) => {
-                        if (res.status !== 200) return reject("图片下载失败");
-                        const blob = res.response;
-                        try {
-                            if (await this.isAnimatedBlob(blob)) return reject("不支持动图图片格式");
-                        } catch(e) {}
-                        const blobUrl = URL.createObjectURL(blob);
-                        const img = new Image();
-                        img.onload = () => {
-                            const canvas = document.createElement('canvas');
-                            const ctx = canvas.getContext('2d');
-                            canvas.width = img.width;
-                            canvas.height = img.height;
-                            ctx.drawImage(img, 0, 0);
-                            try {
-                                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                                const code = jsQR(imageData.data, imageData.width, imageData.height);
-                                URL.revokeObjectURL(blobUrl);
-                                code ? resolve(code.data) : reject("未发现二维码");
-                            } catch (e) { URL.revokeObjectURL(blobUrl); reject("解析错误"); }
-                        };
-                        img.onerror = () => { URL.revokeObjectURL(blobUrl); reject("图片加载失败"); };
-                        img.src = blobUrl;
-                    },
-                    onerror: () => reject("无法获取图片数据")
+        async decodeLocal(imageUrl) {
+            const blob = await this.fetchImageBlob(imageUrl);
+
+            try {
+                if (await this.isAnimatedBlob(blob)) throw "不支持动图图片格式";
+            } catch (e) {
+                if (typeof e === 'string') throw e;
+            }
+
+            const blobUrl = URL.createObjectURL(blob);
+            try {
+                const img = await new Promise((resolve, reject) => {
+                    const i = new Image();
+                    i.onload = () => resolve(i);
+                    i.onerror = () => reject("图片加载失败");
+                    i.src = blobUrl;
                 });
-            });
+
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                ctx.drawImage(img, 0, 0);
+
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const code = jsQR(imageData.data, imageData.width, imageData.height);
+                if (!code) throw "未发现二维码";
+                return code.data;
+            } catch (e) {
+                if (typeof e === 'string') throw e;
+                throw "解析错误";
+            } finally {
+                URL.revokeObjectURL(blobUrl);
+            }
         }
 
         async isAnimatedBlob(blob) {
@@ -435,7 +576,7 @@
             });
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                if (this.currentImg) this.processImage(this.currentImg.src);
+                if (this.currentImg) this.processImage(this.getImageUrl(this.currentImg));
             });
         },
 
@@ -646,6 +787,62 @@
             if (/^data:image\/gif/.test(src)) return true;
             if (/\.(gif)(?:[?#].*)?$/.test(src)) return true;
             return false;
+        },
+
+        isPlaceholderDataUrl(url) {
+            const s = (url || '').toLowerCase();
+            return /^data:image\/gif/.test(s);
+        },
+
+        pickFromSrcset(srcset) {
+            if (!srcset) return '';
+            const parts = String(srcset)
+                .split(',')
+                .map(s => s.trim())
+                .filter(Boolean);
+            if (!parts.length) return '';
+            const last = parts[parts.length - 1];
+            return last.split(/\s+/)[0] || '';
+        },
+
+        /**
+         * Finds the most usable URL for the actually-rendered image.
+         * Why: `.src` may be a lazy-load placeholder while `.currentSrc` points to the real (often WebP) resource.
+         */
+        getImageUrl(img) {
+            const candidates = [];
+            const push = (v) => {
+                if (typeof v !== 'string') return;
+                const s = v.trim();
+                if (s) candidates.push(s);
+            };
+
+            push(img?.currentSrc);
+            push(img?.src);
+
+            const attrs = [
+                'data-src',
+                'data-original',
+                'data-url',
+                'data-lazy-src',
+                'data-actualsrc',
+                'data-source',
+                'data-img',
+                'data-image',
+                'data-large-image',
+                'data-zoom-image'
+            ];
+            for (const a of attrs) push(img?.getAttribute?.(a));
+
+            push(this.pickFromSrcset(img?.getAttribute?.('srcset')));
+            push(this.pickFromSrcset(img?.getAttribute?.('data-srcset')));
+
+            const normalized = candidates.map((u) => {
+                if (/^(https?:|blob:|data:)/i.test(u)) return u;
+                try { return new URL(u, location.href).toString(); } catch (_) { return u; }
+            });
+
+            return normalized.find(u => u && !this.isPlaceholderDataUrl(u)) || normalized[0] || '';
         },
 
         showButtonOn(img) {
