@@ -24,10 +24,10 @@ pwdOldFilename = "dict.txt"
 pwdFilename = "dict.json"
 pwdDictionary = {}
 RECOVER_SUFFIX = ".AutoDecRecovered"
-DEFAULT_EMBEDDED_SCAN_MAX_LEVEL = 2  # 小于等于该层级时尝试执行隐藏文件判定与提取
+DEFAULT_EMBEDDED_SCAN_MAX_LEVEL = 2  # Max recursion depth to check for hidden embedded files
 embedded_scan_depth_setting = DEFAULT_EMBEDDED_SCAN_MAX_LEVEL
 CLI_ARGS = None
-SMALL_NON_ARCHIVE_IGNORE_THRESHOLD = 20 * 1024  # bytes，判断递归时忽略的小体积“非压缩文件”大小阈值喵
+SMALL_NON_ARCHIVE_IGNORE_THRESHOLD = 20 * 1024  # Threshold in bytes to ignore small non-archive files during recursion
 
 GIST_CONFIG_FILE = "gist_config.json"
 _gist_cfg = None  # {token:str, gist_id:str, file:str}
@@ -62,7 +62,12 @@ def _gist_headers(token):
     }
 
 def _fetch_from_gist(cfg):
-    """返回 (dict, gist_updated_at str) 或 (None, None)"""
+    """
+    Fetches password dictionary from GitHub Gist.
+    
+    Returns:
+        tuple: (content_dict, updated_at_str) or (None, None) on failure.
+    """
     try:
         r = requests.get(
             f"https://api.github.com/gists/{cfg['gist_id']}",
@@ -72,7 +77,7 @@ def _fetch_from_gist(cfg):
             gist = r.json()
             file_info = gist["files"].get(cfg["file"])
             if file_info and file_info.get("content") is not None:
-                # ↳ 文件对象本身没有 updated_at，使用 gist 的 updated_at 字段
+                # Use gist-level updated_at as individual files don't have it
                 return json.loads(file_info["content"] or "{}"), gist["updated_at"]
     except Exception as e:
         print_warning(f"拉取 Gist 时出错喵：{e}")
@@ -236,30 +241,25 @@ def parse_cli_arguments(argv):
 
 
 def print_info(message):
-    """用蓝色打印普通信息喵"""
     console.out(message, style="blue")
 
 
 def print_error(message):
-    """用红色加粗打印错误信息喵"""
     console.out(message, style="bold red")
 
 
 def print_success(message):
-    """用绿色打印成功信息喵"""
     console.out(message, style="green")
 
 
 def print_warning(message):
-    """用黄色打印警告信息喵"""
     console.out(message, style="bold yellow underline")
 
 
 def move_temp_folders_to_recycle_bin(current_directory):
-    # 获取当前目录下的所有文件和文件夹
+    """Cleans up leftover temporary extraction folders."""
     items = os.listdir(current_directory)
 
-    # 过滤出以 'temp_extract' 为前缀的子文件夹
     temp_folders = [
         item
         for item in items
@@ -295,7 +295,7 @@ def remove_autodec_files(directory):
 
 
 def create_unique_directory(base_path, dir_name):
-    """创建一个唯一的目录，如果目录存在，则添加波浪号来避免重复喵"""
+    """Creates a directory with a unique name to avoid collisions."""
     counter = 1
     original_dir_name = dir_name
     while os.path.exists(os.path.join(base_path, dir_name)):
@@ -307,7 +307,7 @@ def create_unique_directory(base_path, dir_name):
 
 
 def move_file_with_unique_suffix(src_path, dest_dir):
-    """移动文件到目标目录，如果重名则追加波浪号计数喵"""
+    """Moves a file to destination, appending a suffix if a name collision occurs."""
     file_name = os.path.basename(src_path)
     name, ext = os.path.splitext(file_name)
     candidate = file_name
@@ -321,7 +321,7 @@ def move_file_with_unique_suffix(src_path, dest_dir):
 
 
 def detect_single_same_named_file(temp_folder, expected_base_name, entries=None):
-    """检测是否只有一个与压缩包同名的文件，若有则返回其路径喵"""
+    """Checks if the folder contains exactly one file matching the archive's base name."""
     try:
         items = entries if entries is not None else os.listdir(temp_folder)
     except FileNotFoundError:
@@ -339,7 +339,7 @@ def detect_single_same_named_file(temp_folder, expected_base_name, entries=None)
 
 
 def read_passwords_old():
-    """从与脚本同一目录下的dict.txt中读取密码喵，如果文件不存在或为空则返回空列表"""
+    """Legacy loader for plaintext password dictionary."""
     passwords = []
     pwdPath = os.path.join(CONFIG_DIR, pwdOldFilename)
     try:
@@ -454,9 +454,7 @@ import threading
 
 
 def get_total_split_size(file_path: str) -> int:
-    """
-    取倒数第二个（如果只有一个'.'就取一个）'.'之前相同的部分，计算所有同样前缀文件的总大小。
-    """
+    """Calculates combined size of all parts in a multi-volume archive."""
     dir_name = os.path.dirname(file_path)
     base_name = os.path.basename(file_path)
 
@@ -493,7 +491,7 @@ def get_total_split_size(file_path: str) -> int:
 
 
 def extract_with_7zip(file_path, extract_to, password: str = None):
-    """使用7zip尝试解压文件到指定目录，可能需要密码，并实时显示美观的进度条喵"""
+    """Extracts archive using 7-Zip with real-time progress reporting."""
     command = ["7z", "x", file_path, f"-o{extract_to}", "-y", "-bsp1", "-bb3", "-sccUTF-8"]
     if password:
         command.extend(["-p" + password])
@@ -608,13 +606,11 @@ def extract_with_7zip(file_path, extract_to, password: str = None):
 
 
 def extract_with_bandizip(file_path, extract_to, password=None):
-    """使用 Bandizip 命令行版本 (bz.exe) 尝试解压文件喵
+    """
+    Fallback extraction using Bandizip CLI (bz.exe).
     
-    返回值：
-    1: 成功解压
-    -1: 密码错误
-    -2: 无法打开文件（不是压缩文件或文件损坏）
-    -3: 其他错误
+    Returns:
+        int: 1 for success, -1 for wrong password, -2 for invalid file, -3 for other errors.
     """
     # 构建命令，避免在参数内使用引号，让subprocess处理路径
     command = ["bz", "x", f"-o:{extract_to}", "-aoa", "-y"]
@@ -737,7 +733,7 @@ def handle_bandizip_extraction(file_path, temp_folder, passwords, level):
 
 
 def try_passwords(file_path, extract_to, passwords, last_tried_password):
-    """尝试一系列密码解压文件喵，如果没有有效密码则返回None"""
+    """Iterates through dictionary passwords to find a match."""
     for password in passwords:
         password = password[0]
         if last_tried_password == password:
@@ -748,7 +744,7 @@ def try_passwords(file_path, extract_to, passwords, last_tried_password):
 
 
 def manual_password_entry(file_path, extract_to, level):
-    """当字典中的密码都无效时，手动请求用户输入密码喵"""
+    """Prompts user for password entry when dictionary lookup fails."""
     while True:
         console.print(f"[cyan][b]请输入第{level}层文件的解压密码喵：", end="")
         password = input()
@@ -956,10 +952,7 @@ def try_remove_directory(dir):
 
 
 def is_likely_archive_filename(name: str) -> bool:
-    """
-    粗略判断一个文件名是否“像压缩包”，用于在递归判断时区分压缩/非压缩文件喵。
-    这里只做基于扩展名/分卷命名规则的启发式判断，真正能否解压仍然交给 7z/Bandizip 处理。
-    """
+    """Heuristic check to determine if a file is likely an archive based on its extension."""
     lower = name.lower()
 
     patterns = [
@@ -987,10 +980,10 @@ def recursive_extract(
     level=1,
     embedded_scan_depth=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL,
 ):
+    """Recursively extracts archives, handling nested compressed files and passwords."""
     global global_last_success_password
     global extract_to_base_folder
     global auto_flatten_single_file
-    """递归解压文件，处理密码保护的压缩文件喵"""
     temp_folder = create_unique_directory(base_folder, "temp_extract")
     orig_temp_folder = temp_folder  # 保存最初创建的临时目录路径
     last_compressed_file_name = get_archive_base_name(file_path)
@@ -1003,20 +996,20 @@ def recursive_extract(
     while True:
         tryResult = extract_with_7zip(file_path, temp_folder, password)
         if tryResult == -1:
-            # 先尝试密码本（不含当前已尝试的 password）
+            # Try dictionary passwords first (excluding current)
             next_password = try_passwords(
                 file_path, temp_folder, passwords, password
             )
-            # 若密码本全部失败，在放弃前额外尝试使用压缩包名称作为密码，以覆盖常见命名习惯
+            # Try archive name as a password fallback
             if next_password is None:
                 name_pwd = last_compressed_file_name
                 if name_pwd and name_pwd != password:
                     print_info(
-                        f"尝试使用压缩包名称 '{name_pwd}' 作为密码喵..."
+                        f"Trying archive name '{name_pwd}' as password..."
                     )
                     if extract_with_7zip(file_path, temp_folder, name_pwd) > 0:
                         next_password = name_pwd
-            # 若以上都失败，最后再进入人工输入流程
+            # Request manual entry if all automated attempts fail
             if next_password is None:
                 next_password = manual_password_entry(file_path, temp_folder, level)
             if next_password is None:
@@ -1026,9 +1019,9 @@ def recursive_extract(
             password = next_password
             break
         elif tryResult == -2:
-            # 7zip 无法打开文件，尝试其他方法
+            # 7-Zip cannot open file; attempt alternative methods
             if file_path.endswith(RECOVER_SUFFIX):
-                # 这是一个从隐藏zip中提取的文件，7zip打不开，需要用Bandizip处理
+                # Files extracted from hidden segments might require Bandizip
                 new_password = handle_bandizip_extraction(file_path, temp_folder, passwords, level)
                 if new_password:
                     password = new_password # 更新当前密码
@@ -1039,7 +1032,7 @@ def recursive_extract(
                     try_remove_directory(orig_temp_folder)
                     return True # 结束当前分支的解压
 
-            # 如果不是RECOVER_SUFFIX文件，或者Bandizip失败了，走原来的隐藏文件检测逻辑
+            # Search for embedded hidden archives if standard opening fails
             found_embedded = False
             for fmt in ["zip", "rar", "7z", "*"]:
                 if (
@@ -1048,17 +1041,17 @@ def recursive_extract(
                     and hiddenZip.has_embedded_signature(file_path, fmt)
                 ):
                     print_info(
-                        f"发现文件嵌入了隐藏{"的某个文件" if fmt == "*" else fmt.upper()}喵，准备处理喵！"
+                        f"Found embedded {fmt.upper() if fmt != '*' else 'file'}, extracting..."
                     )
                     hiddenZip.extract_embedded_file(
                         file_path, file_path + RECOVER_SUFFIX, fmt
                     )
                     file_path = file_path + RECOVER_SUFFIX
                     found_embedded = True
-                    break # 跳出 for 循环，进入下一个 while 循环再次尝试解压
+                    break
             
             if found_embedded:
-                continue # 重新开始 while 循环，用 7zip 尝试解压新提取的文件
+                continue
 
             # 如果以上所有尝试都失败了
             try_remove_directory(orig_temp_folder)
@@ -1215,7 +1208,6 @@ class FileManager:
 def main(args):
     global extract_to_base_folder, _gist_cfg, _gist_remote_ts, embedded_scan_depth_setting, auto_flatten_single_file
 
-    # ① 确保 Gist 配置可用
     _gist_cfg = _ensure_gist_config()
 
     manager = FileManager(queue_file_path, queue_file_lock)

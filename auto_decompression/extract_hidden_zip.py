@@ -16,43 +16,36 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-# 可调整参数
 CHUNK_SIZE = 256 * 1024 * 1024  # 256 MB
-COPY_BUFFER_SIZE = 8 * 1024 * 1024  # 8 MB，优化嵌入文件提取性能
+COPY_BUFFER_SIZE = 8 * 1024 * 1024  # 8 MB
 
 console = Console()
 
-# 搜索方式控制变量
-USE_BINWALK = False  # True: 使用 binwalk 搜索, False: 使用手写搜索
+# Search mode: True for binwalk, False for manual signature scanning
+USE_BINWALK = False
 
-# 文件魔法头定义
 MAGIC_SIGNATURES = {
-    "zip": b"PK\x03\x04",      # ZIP文件的魔法头
-    "rar": b"Rar!\x1a\x07",   # RAR文件的魔法头 (RAR v4)
-    "rar5": b"Rar!\x1a\x07\x01\x00",  # RAR5文件的魔法头
-    "7z": b"7z\xbc\xaf\x27\x1c",      # 7Z文件的魔法头
-    "tar": b"ustar\x00",       # TAR文件的魔法头 (位置在257字节处)
-    "gz": b"\x1f\x8b",         # GZIP文件的魔法头
-    "bz2": b"BZ",              # BZIP2文件的魔法头
-    "xz": b"\xfd7zXZ\x00",     # XZ文件的魔法头
-    "pdf": b"%PDF-",           # PDF文件的魔法头
-    "png": b"\x89PNG\r\n\x1a\n",  # PNG文件的魔法头
-    "jpg": b"\xff\xd8\xff",    # JPEG文件的魔法头
-    "gif": b"GIF8",            # GIF文件的魔法头
-    "exe": b"MZ",              # Windows PE可执行文件的魔法头
-    "elf": b"\x7fELF",         # Linux ELF可执行文件的魔法头
+    "zip": b"PK\x03\x04",
+    "rar": b"Rar!\x1a\x07",
+    "rar5": b"Rar!\x1a\x07\x01\x00",
+    "7z": b"7z\xbc\xaf\x27\x1c",
+    "tar": b"ustar\x00",  # TAR signature is at offset 257
+    "gz": b"\x1f\x8b",
+    "bz2": b"BZ",
+    "xz": b"\xfd7zXZ\x00",
+    "pdf": b"%PDF-",
+    "png": b"\x89PNG\r\n\x1a\n",
+    "jpg": b"\xff\xd8\xff",
+    "gif": b"GIF8",
+    "exe": b"MZ",
+    "elf": b"\x7fELF",
 }
 
-# 用于缓存 binwalk 安装检测结果，避免重复检测
 _BINWALK_INSTALLED = None
-
-# 用于缓存针对每个文件的 binwalk 检测结果，避免重复检测
 _BINWALK_RESULTS_CACHE = {}
 
 def _copy_range_with_progress(input_file, output_file, offset, size, signature):
-    """
-    从输入文件指定偏移复制 size 字节到输出文件，并显示进度与速度。
-    """
+    """Extracts a range from input to output file with a progress bar."""
     if size <= 0:
         raise ValueError(f"提取范围大小必须为正数喵：size={size}")
     total = size
@@ -93,12 +86,7 @@ def _copy_range_with_progress(input_file, output_file, offset, size, signature):
     console.print(f"[green][b]嵌入文件提取完成：{output_file}[/b][/green]")
 
 def _check_binwalk_installed():
-    """
-    检查系统中是否安装了 binwalk，可根据需要修改检查方式:
-    - 使用 shutil.which("binwalk")
-    - 或者通过 subprocess.run(["binwalk", "--help"])
-    返回 True/False，并在未安装时输出提示。
-    """
+    """Checks if binwalk is available in the system PATH."""
     global _BINWALK_INSTALLED
     if _BINWALK_INSTALLED is not None:
         return _BINWALK_INSTALLED
@@ -115,10 +103,7 @@ def _check_binwalk_installed():
 
 
 def _get_binwalk_analysis(filename):
-    """
-    调用 binwalk 并返回解析后的 JSON 结果。
-    如果 binwalk 不可用，则直接返回空列表。
-    """
+    """Executes binwalk on the file and returns parsed JSON results."""
     if not _check_binwalk_installed():
         return []  # 无法执行 binwalk，则返回空
 
@@ -146,12 +131,7 @@ def _get_binwalk_analysis(filename):
 
 
 def _pick_highest_confidence(filename, signature):
-    """
-    从 binwalk 的 JSON 输出中选出与 signature 匹配的最高置信度结果。
-    - signature 为 "*" 时，表示可接受任何格式（name）。
-    - 否则按照忽略大小写匹配格式名称。
-    返回值示例: (offset, size, name, confidence)，若没找到则返回 None。
-    """
+    """Selects the match with the highest confidence from binwalk output."""
     data = _get_binwalk_analysis(filename)
     if not data:
         return None
@@ -179,14 +159,7 @@ def _pick_highest_confidence(filename, signature):
 
 
 def has_embedded_signature(filename, signature):
-    """
-    检查 filename 文件内是否包含指定(或指定列表) signature，并进行初步有效性验证，
-    若有效，则返回 True，否则返回 False。
-
-    根据 USE_BINWALK 变量决定使用哪种搜索方式：
-    - True: 使用 binwalk 搜索（若 binwalk 未安装，提示用户后返回 False；若最高置信度 <= 200，则也返回 False）
-    - False: 使用手写搜索（直接查找魔法头）
-    """
+    """Determines if a file contains an embedded archive based on the current search mode."""
     if USE_BINWALK:
         # 使用 binwalk 搜索
         if not _check_binwalk_installed():
@@ -212,17 +185,7 @@ def has_embedded_signature(filename, signature):
 
 
 def _find_first_magic_signature(input_file, signature_type):
-    """
-    在文件中查找指定类型的第一个魔法头，并返回其偏移量。
-    如果找不到，则返回 None。
-    
-    Args:
-        input_file: 输入文件路径
-        signature_type: 签名类型，如 "zip", "rar", "7z" 等
-    
-    Returns:
-        int: 魔法头的偏移量，如果找不到则返回 None
-    """
+    """Locates the first occurrence of a magic signature in a file."""
     if signature_type not in MAGIC_SIGNATURES:
         return None
     
@@ -262,9 +225,7 @@ def _find_first_magic_signature(input_file, signature_type):
         return None
 
 def extract_embedded_file(input_file, output_file, signature):
-    """
-    根据 USE_BINWALK 变量决定使用哪种提取方式，并在提取过程中展示实时进度和速度。
-    """
+    """Extracts embedded data starting from a detected signature."""
     signature_lower = signature.lower()
     display_signature = signature_lower if signature_lower != "*" else "embedded"
     offset = None
