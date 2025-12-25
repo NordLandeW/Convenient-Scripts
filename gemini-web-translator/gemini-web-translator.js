@@ -58,6 +58,7 @@
     const state = {
         isTranslating: false,
         isTranslated: false,
+        isUIInitialized: false,
         originalTexts: new Map(),
         textNodeMap: new Map(),
         currentToastId: null
@@ -66,7 +67,7 @@
     // ================= 样式表 =================
     const STYLES = `
         :root { --gm-primary: #8ab4f8; --gm-bg: #202124; --gm-surface: #303134; --gm-text: #e8eaed; --gm-border: #5f6368; }
-        #gm-translator-container { font-family: 'Segoe UI', system-ui, sans-serif; z-index: 2147483647; position: fixed; top: 0; left: 0; color-scheme: dark; }
+        #gm-translator-container { display: block; font-family: 'Segoe UI', system-ui, sans-serif; z-index: 2147483647; position: fixed; top: 0; left: 0; color-scheme: dark; }
         
         /* Modern Toast */
         .gm-toast {
@@ -371,13 +372,18 @@
 
     // ================= Initialization =================
 
-    function init() {
+    function ensureUI() {
+        if (state.isUIInitialized) return;
+
         const style = document.createElement('style');
         style.textContent = STYLES;
         document.head.appendChild(style);
-        
+
         createUI();
-        
+        state.isUIInitialized = true;
+    }
+
+    function init() {
         GM_registerMenuCommand("🚀 翻译网页 (Alt+T)", startTranslationProcess);
         GM_registerMenuCommand("⚙️ 设置", openSettings);
 
@@ -502,6 +508,7 @@
 
     async function startTranslationProcess() {
         if (state.isTranslating) return;
+        ensureUI();
 
         if (state.isTranslated) {
             const count = restoreOriginalText();
@@ -677,7 +684,8 @@ Provide only the translated CSV line, with no additional commentary.
     // ================= UI Components =================
 
     function createUI() {
-        const div = document.createElement('div');
+        // Use a custom tag name to avoid interfering with CSS selectors like :last-of-type on common tags
+        const div = document.createElement('gm-translator');
         div.id = 'gm-translator-container';
         div.innerHTML = `
             <div id="gm-settings-overlay">
@@ -859,6 +867,7 @@ Provide only the translated CSV line, with no additional commentary.
     }
 
     function openSettings() {
+        ensureUI();
         const platform = GM_getValue('gm_platform', CONFIG.defaults.platform);
         document.getElementById('gm-platform').value = platform;
         
@@ -886,6 +895,7 @@ Provide only the translated CSV line, with no additional commentary.
     const activeToasts = new Map();
 
     function showToast(text, type = 'info', duration = 3000) {
+        ensureUI();
         const container = document.getElementById('gm-translator-container');
         const toast = document.createElement('div');
         toast.className = 'gm-toast';

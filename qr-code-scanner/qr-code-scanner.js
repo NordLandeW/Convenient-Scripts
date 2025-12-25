@@ -183,7 +183,6 @@
         .qr-toast.show { opacity: 1; }
     `;
 
-    GM_addStyle(STYLES);
 
     class QrDecoderService {
         constructor() {
@@ -526,26 +525,34 @@
         hideTimer: null,
         isHoveringButton: false,
         isPluginActive: false,
+        isUIInitialized: false,
         lastQPressTime: 0,
         toast: null,
 
-        init() {
+        ensureUI() {
+            if (this.isUIInitialized) return;
+            GM_addStyle(STYLES);
             this.createScanButton();
             this.createResultModal();
             this.createSettingsModal();
             this.createToast();
+            this.isUIInitialized = true;
+        },
+
+        init() {
             this.bindEvents();
             GM_registerMenuCommand("设置 / Settings", () => this.openSettings());
         },
 
         createToast() {
-            const div = document.createElement('div');
+            const div = document.createElement('qr-scanner-ui');
             div.className = 'qr-toast';
             document.body.appendChild(div);
             this.toast = div;
         },
 
         showToast(msg) {
+            this.ensureUI();
             this.toast.innerText = msg;
             this.toast.classList.add('show');
             setTimeout(() => this.toast.classList.remove('show'), 2000);
@@ -561,7 +568,7 @@
         },
 
         createScanButton() {
-            const btn = document.createElement('div');
+            const btn = document.createElement('qr-scanner-ui');
             btn.className = 'qr-scan-btn';
             btn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M3 3h6v6H3V3zm2 2v2h2V5H5zm8-2h6v6h-6V3zm2 2v2h2V5h-2zM3 15h6v6H3v-6zm2 2v2h2v-2H5zm8 4h2v2h-2v-2zm2-2h2v2h-2v-2zm2 2h2v2h-2v-2zm-2-2h-2v-2h2v2zm4 0h2v2h-2v-2zm-2-4h-2v2h2v-2zm2 0h2v2h-2v-2z"/></svg>`;
             document.body.appendChild(btn);
@@ -581,7 +588,7 @@
         },
 
         createResultModal() {
-            const div = document.createElement('div');
+            const div = document.createElement('qr-scanner-ui');
             div.className = 'qr-modal-window';
             div.innerHTML = `
                 <div class="qr-modal-header">
@@ -600,7 +607,7 @@
         },
 
         createSettingsModal() {
-            const div = document.createElement('div');
+            const div = document.createElement('qr-scanner-ui');
             div.className = 'qr-modal-window';
             div.innerHTML = `
                 <div class="qr-modal-header">
@@ -767,6 +774,7 @@
                     if (this.isLikelyAnimatedByUrl(target)) return;
                     const rect = target.getBoundingClientRect();
                     if (rect.width < CONSTANTS.minImageSize || rect.height < CONSTANTS.minImageSize) return;
+                    this.ensureUI();
                     clearTimeout(this.hideTimer);
                     if (this.currentImg !== target) {
                         this.currentImg = target;
@@ -774,7 +782,7 @@
                     } else {
                         this.btn.classList.add('visible');
                     }
-                } else if (this.btn.contains(target)) {
+                } else if (this.isUIInitialized && this.btn.contains(target)) {
                     clearTimeout(this.hideTimer);
                 } else {
                     this.startHideTimer();
@@ -906,6 +914,7 @@
         },
 
         openSettings() {
+            this.ensureUI();
             const provider = Settings.provider;
             const actMode = Settings.activationMode;
             const method = Settings.apiMethod;
