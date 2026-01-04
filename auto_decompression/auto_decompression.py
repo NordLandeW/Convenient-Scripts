@@ -29,6 +29,10 @@ embedded_scan_depth_setting = DEFAULT_EMBEDDED_SCAN_MAX_LEVEL
 CLI_ARGS = None
 SMALL_NON_ARCHIVE_IGNORE_THRESHOLD = 20 * 1024  # Threshold in bytes to ignore small non-archive files during recursion
 
+# When extracted output reuses the source archive filename, we must avoid trashing the output
+# later in the global "trash-on-success" step.
+_RECYCLED_RESERVED_PATHS = set()
+
 GIST_CONFIG_FILE = "gist_config.json"
 _gist_cfg = None  # {token:str, gist_id:str, file:str}
 _gist_remote_ts = None  # 上一次拉取时远程文件 updated_at（datetime）
@@ -381,6 +385,7 @@ def move_path_with_collision_handling(
 
         try:
             os.rename(temp_path, desired_path)
+            _RECYCLED_RESERVED_PATHS.add(_normalize_path_for_compare(desired_path))
             return desired_path
         except Exception:
             fallback_name = _pick_unique_name(dest_dir, desired_name, is_dir=is_dir)
@@ -1430,6 +1435,7 @@ def main(args):
                         print_info(f"跳过 .apk 文件：{file_path} 喵。")
                         continue
                     print_info(f"开始解压文件 {file_path} 喵❤")
+                    _RECYCLED_RESERVED_PATHS.clear()
                     base_folder = os.path.dirname(file_path)
                     if move_temp_folders_to_recycle_bin(base_folder):
                         print_info(
@@ -1455,6 +1461,9 @@ def main(args):
                     if _ret is False and hasattr(CLI_ARGS, "trash_on_success") and CLI_ARGS.trash_on_success:
                         try:
                             for p in list_related_archive_parts(file_path):
+                                if _normalize_path_for_compare(p) in _RECYCLED_RESERVED_PATHS:
+                                    # This path now points to extracted output after a reserved-name replacement.
+                                    continue
                                 if os.path.exists(p):
                                     send2trash.send2trash(p)
                                     print_info(f"已将被解压的原始压缩文件移动到回收站：{p}")
