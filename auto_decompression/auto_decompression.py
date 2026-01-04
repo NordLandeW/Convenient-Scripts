@@ -306,18 +306,129 @@ def create_unique_directory(base_path, dir_name):
     return os.path.join(base_path, dir_name)
 
 
-def move_file_with_unique_suffix(src_path, dest_dir):
-    """Moves a file to destination, appending a suffix if a name collision occurs."""
-    file_name = os.path.basename(src_path)
-    name, ext = os.path.splitext(file_name)
-    candidate = file_name
+def _normalize_path_for_compare(path: str) -> str:
+    """Normalizes paths for reliable comparisons across platforms/case rules."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _is_reserved_path(path: str, reserved_paths: set) -> bool:
+    if not reserved_paths:
+        return False
+    return _normalize_path_for_compare(path) in reserved_paths
+
+
+def _pick_unique_name(dest_dir: str, desired_name: str, is_dir: bool) -> str:
+    """Generates a non-colliding name by appending '~N' while preserving file extensions."""
+    candidate = desired_name
+    stem, ext = os.path.splitext(desired_name)
     counter = 1
     while os.path.exists(os.path.join(dest_dir, candidate)):
-        candidate = f"{name}~{counter}{ext}"
+        candidate = f"{desired_name}~{counter}" if is_dir else f"{stem}~{counter}{ext}"
         counter += 1
-    destination = os.path.join(dest_dir, candidate)
-    shutil.move(src_path, destination)
-    return destination
+    return candidate
+
+
+def _pick_temp_name(dest_dir: str, desired_name: str, is_dir: bool) -> str:
+    """Produces a transient name used to stage moves before replacing a reserved destination."""
+    if is_dir:
+        base = f"{desired_name}.AutoDecTmp"
+        return _pick_unique_name(dest_dir, base, is_dir=True)
+
+    stem, ext = os.path.splitext(desired_name)
+    base = f"{stem}.AutoDecTmp{ext}"
+    return _pick_unique_name(dest_dir, base, is_dir=False)
+
+
+def move_path_with_collision_handling(
+    src_path: str,
+    dest_dir: str,
+    reserved_paths: set = None,
+    allow_replace_reserved: bool = False,
+) -> str:
+    """
+    Moves a file or directory into dest_dir while keeping names stable when possible.
+
+    When a collision is caused only by a 'reserved' path (typically the source archive
+    that will be moved to recycle bin on success), the function stages the move under a
+    temporary name first, then replaces the reserved path and renames into place. This
+    avoids producing unnecessary '~1' suffixes.
+    """
+    desired_name = os.path.basename(src_path)
+    is_dir = os.path.isdir(src_path)
+    desired_path = os.path.join(dest_dir, desired_name)
+
+    if not os.path.exists(desired_path):
+        shutil.move(src_path, desired_path)
+        return desired_path
+
+    if allow_replace_reserved and _is_reserved_path(desired_path, reserved_paths):
+        temp_name = _pick_temp_name(dest_dir, desired_name, is_dir=is_dir)
+        temp_path = os.path.join(dest_dir, temp_name)
+
+        # Stage first so we don't lose output if recycling the source archive fails.
+        shutil.move(src_path, temp_path)
+
+        try:
+            send2trash.send2trash(desired_path)
+        except Exception:
+            fallback_name = _pick_unique_name(dest_dir, desired_name, is_dir=is_dir)
+            fallback_path = os.path.join(dest_dir, fallback_name)
+            try:
+                os.rename(temp_path, fallback_path)
+            except Exception:
+                shutil.move(temp_path, fallback_path)
+            return fallback_path
+
+        try:
+            os.rename(temp_path, desired_path)
+            return desired_path
+        except Exception:
+            fallback_name = _pick_unique_name(dest_dir, desired_name, is_dir=is_dir)
+            fallback_path = os.path.join(dest_dir, fallback_name)
+            shutil.move(temp_path, fallback_path)
+            return fallback_path
+
+    fallback_name = _pick_unique_name(dest_dir, desired_name, is_dir=is_dir)
+    fallback_path = os.path.join(dest_dir, fallback_name)
+    shutil.move(src_path, fallback_path)
+    return fallback_path
+
+
+def move_file_with_unique_suffix(
+    src_path: str,
+    dest_dir: str,
+    reserved_paths: set = None,
+    allow_replace_reserved: bool = False,
+) -> str:
+    """Backward-compatible wrapper around `move_path_with_collision_handling()` for files."""
+    return move_path_with_collision_handling(
+        src_path,
+        dest_dir,
+        reserved_paths=reserved_paths,
+        allow_replace_reserved=allow_replace_reserved,
+    )
+
+
+def should_flatten_prefixed_files(temp_folder: str, entries: list, folder_name: str) -> bool:
+    """
+    Detects 'X/XY' layouts where the extra 'X' directory provides no value.
+
+    If every extracted entry is a file whose name starts with the would-be output folder
+    name, flattening avoids an extra nesting level without losing disambiguation.
+    """
+    if not entries:
+        return False
+    if not folder_name:
+        return False
+
+    prefix = folder_name.casefold()
+    for entry in entries:
+        entry_path = os.path.join(temp_folder, entry)
+        if not os.path.isfile(entry_path):
+            return False
+        if not entry.casefold().startswith(prefix):
+            return False
+    return True
 
 
 def detect_single_same_named_file(temp_folder, expected_base_name, entries=None):
@@ -979,11 +1090,15 @@ def recursive_extract(
     last_success_password=None,
     level=1,
     embedded_scan_depth=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL,
+    source_archive_paths: set = None,
 ):
     """Recursively extracts archives, handling nested compressed files and passwords."""
     global global_last_success_password
     global extract_to_base_folder
     global auto_flatten_single_file
+
+    source_archive_paths = set(source_archive_paths or [])
+
     temp_folder = create_unique_directory(base_folder, "temp_extract")
     orig_temp_folder = temp_folder  # 保存最初创建的临时目录路径
     last_compressed_file_name = get_archive_base_name(file_path)
@@ -1110,6 +1225,7 @@ def recursive_extract(
             password,
             level + 1,
             embedded_scan_depth=embedded_scan_depth,
+            source_archive_paths=source_archive_paths,
         )
         if not finished:
             try:
@@ -1120,11 +1236,18 @@ def recursive_extract(
         finished = True
 
     if finished:
+        allow_replace_reserved = bool(
+            source_archive_paths
+            and CLI_ARGS is not None
+            and getattr(CLI_ARGS, "trash_on_success", False)
+        )
+
         flattened_output_path = None
         try:
             temp_entries = os.listdir(temp_folder)
         except FileNotFoundError:
             temp_entries = []
+
         if auto_flatten_single_file and not extract_to_base_folder and temp_entries:
             single_file_path = detect_single_same_named_file(
                 temp_folder,
@@ -1133,23 +1256,84 @@ def recursive_extract(
             )
             if single_file_path:
                 flattened_output_path = move_file_with_unique_suffix(
-                    single_file_path, base_folder
+                    single_file_path,
+                    base_folder,
+                    reserved_paths=source_archive_paths,
+                    allow_replace_reserved=allow_replace_reserved,
                 )
                 print_success(
                     f"检测到 {last_compressed_file_name}/"
                     f"{os.path.basename(flattened_output_path)} 结构喵，"
                     f"已直接将文件放置到目标目录：{flattened_output_path}"
                 )
+
         if not flattened_output_path:
-            if extract_to_base_folder:
+            flatten_due_to_prefix = (
+                (not extract_to_base_folder)
+                and should_flatten_prefixed_files(
+                    temp_folder, temp_entries, last_compressed_file_name
+                )
+            )
+
+            if extract_to_base_folder or flatten_due_to_prefix:
                 target_folder = base_folder
+                for entry in temp_entries:
+                    move_path_with_collision_handling(
+                        os.path.join(temp_folder, entry),
+                        target_folder,
+                        reserved_paths=source_archive_paths,
+                        allow_replace_reserved=allow_replace_reserved,
+                    )
+
+                if flatten_due_to_prefix and not extract_to_base_folder:
+                    print_success(
+                        f"检测到 {last_compressed_file_name}/XY 前缀结构喵，"
+                        f"已移除 {last_compressed_file_name}/ 层级，"
+                        f"最终文件被移动到：{target_folder}"
+                    )
+                else:
+                    print_success(f"最终文件被移动到：{target_folder}")
             else:
-                target_folder = create_unique_directory(
+                desired_target_folder = os.path.join(
                     base_folder, last_compressed_file_name
                 )
-            for entry in temp_entries:
-                shutil.move(os.path.join(temp_folder, entry), target_folder)
-            print_success(f"最终文件被移动到：{target_folder}")
+                needs_reserved_replacement = (
+                    allow_replace_reserved
+                    and os.path.exists(desired_target_folder)
+                    and _is_reserved_path(desired_target_folder, source_archive_paths)
+                )
+
+                if needs_reserved_replacement:
+                    target_folder = create_unique_directory(
+                        base_folder, f"{last_compressed_file_name}.AutoDecTmp"
+                    )
+                else:
+                    target_folder = create_unique_directory(
+                        base_folder, last_compressed_file_name
+                    )
+
+                for entry in temp_entries:
+                    shutil.move(os.path.join(temp_folder, entry), target_folder)
+
+                if needs_reserved_replacement:
+                    final_target_folder = target_folder
+                    try:
+                        send2trash.send2trash(desired_target_folder)
+                        os.rename(target_folder, desired_target_folder)
+                        final_target_folder = desired_target_folder
+                    except Exception:
+                        fallback_name = _pick_unique_name(
+                            base_folder, last_compressed_file_name, is_dir=True
+                        )
+                        fallback_path = os.path.join(base_folder, fallback_name)
+                        try:
+                            os.rename(target_folder, fallback_path)
+                            final_target_folder = fallback_path
+                        except Exception:
+                            final_target_folder = target_folder
+                    target_folder = final_target_folder
+
+                print_success(f"最终文件被移动到：{target_folder}")
 
     try_remove_directory(orig_temp_folder)
     return False
@@ -1251,11 +1435,21 @@ def main(args):
                         print_info(
                             "检测到上一次非正常退出留下的临时文件夹喵！已经把它们全部移动到回收站了喵☆"
                         )
+
+                    try:
+                        source_archive_paths = {
+                            _normalize_path_for_compare(p)
+                            for p in list_related_archive_parts(file_path)
+                        }
+                    except Exception:
+                        source_archive_paths = {_normalize_path_for_compare(file_path)}
+
                     _ret = recursive_extract(
                         base_folder,
                         file_path,
                         global_last_success_password,
                         embedded_scan_depth=embedded_scan_depth_setting,
+                        source_archive_paths=source_archive_paths,
                     )
                     # 解压成功才执行回收站移动；失败（非密码错误导致）则不移动
                     if _ret is False and hasattr(CLI_ARGS, "trash_on_success") and CLI_ARGS.trash_on_success:
