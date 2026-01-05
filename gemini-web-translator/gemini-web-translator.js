@@ -1,10 +1,14 @@
 // ==UserScript==
 // @name         Gemini Webpage Translator
 // @namespace    http://tampermonkey.net/
-// @version      7.0
+// @version      7.0.1
 // @description  Translate webpages using Gemini or OpenRouter API.
 // @author       NordLandeW
 // @match        *://*/*
+// @exclude      *://challenges.cloudflare.com/*
+// @exclude      *://*/cdn-cgi/challenge-platform/*
+// @exclude      *://*/cdn-cgi/l/chk_*
+// @exclude      *://*/cdn-cgi/access/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -372,6 +376,34 @@
 
     // ================= Initialization =================
 
+    /**
+     * Cloudflare verification pages are sensitive to third-party DOM changes and event listeners.
+     * Disabling the script on those pages avoids breaking the challenge flow.
+     */
+    function isCloudflareVerificationContext() {
+        try {
+            const host = window.location.hostname;
+            if (host === 'challenges.cloudflare.com') return true;
+
+            const path = window.location.pathname || '';
+            if (path.startsWith('/cdn-cgi/challenge-platform/')) return true;
+            if (path.startsWith('/cdn-cgi/l/chk_')) return true;
+            if (path.startsWith('/cdn-cgi/access/')) return true;
+
+            // Cloudflare interstitial pages usually expose this config globally.
+            if (typeof window._cf_chl_opt !== 'undefined') return true;
+
+            // Fallback DOM markers.
+            if (document.querySelector('form#challenge-form')) return true;
+            if (document.getElementById('cf-wrapper')) return true;
+            if (document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]')) return true;
+
+            return false;
+        } catch {
+            return false;
+        }
+    }
+
     function ensureUI() {
         if (state.isUIInitialized) return;
 
@@ -691,7 +723,7 @@ Provide only the translated CSV line, with no additional commentary.
             <div id="gm-settings-overlay">
                 <div id="gm-settings-panel">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.0</h3>
+                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.0.1</h3>
                     </div>
                     
                     <div>
@@ -940,6 +972,11 @@ Provide only the translated CSV line, with no additional commentary.
                 activeToasts.delete(id);
             }, 300);
         }
+    }
+
+    if (isCloudflareVerificationContext()) {
+        console.log('[Gemini Translator] Disabled on Cloudflare verification page to avoid interference.');
+        return;
     }
 
     init();

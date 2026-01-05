@@ -1,10 +1,14 @@
 // ==UserScript==
 // @name         QR Code Scanner
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.3.1
 // @description  智能识别网页图片中的二维码，支持在线API和本地离线识别，带有设置页面。
 // @author       nord
 // @match        *://*/*
+// @exclude      *://challenges.cloudflare.com/*
+// @exclude      *://*/cdn-cgi/challenge-platform/*
+// @exclude      *://*/cdn-cgi/l/chk_*
+// @exclude      *://*/cdn-cgi/access/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_addStyle
@@ -21,6 +25,34 @@
 
 (function() {
     'use strict';
+
+    /**
+     * Cloudflare challenge/Turnstile pages are sensitive to DOM mutations and aggressive event hooks.
+     * Skipping execution there avoids breaking the verification flow.
+     */
+    function isCloudflareVerificationContext() {
+        try {
+            const host = window.location.hostname;
+            if (host === 'challenges.cloudflare.com') return true;
+
+            const path = window.location.pathname || '';
+            if (path.startsWith('/cdn-cgi/challenge-platform/')) return true;
+            if (path.startsWith('/cdn-cgi/l/chk_')) return true;
+            if (path.startsWith('/cdn-cgi/access/')) return true;
+
+            // Cloudflare interstitial pages usually expose this config globally.
+            if (typeof window._cf_chl_opt !== 'undefined') return true;
+
+            // Fallback DOM markers.
+            if (document.querySelector('form#challenge-form')) return true;
+            if (document.getElementById('cf-wrapper')) return true;
+            if (document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]')) return true;
+
+            return false;
+        } catch {
+            return false;
+        }
+    }
 
     const CONSTANTS = {
         minImageSize: 50,
@@ -941,6 +973,11 @@
         isValidUrl(s) { try { return /^https?:/.test(new URL(s).protocol); } catch{ return false; } },
         escape(s) { return s.replace(/[&<>"']/g, m=>({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[m])); }
     };
+
+    if (isCloudflareVerificationContext()) {
+        console.log('[QR Scanner] Disabled on Cloudflare verification page to avoid interference.');
+        return;
+    }
 
     UI.init();
 
