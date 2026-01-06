@@ -9,6 +9,15 @@
 // @exclude      *://*/cdn-cgi/challenge-platform/*
 // @exclude      *://*/cdn-cgi/l/chk_*
 // @exclude      *://*/cdn-cgi/access/*
+// @exclude      *://*.alipay.com/*
+// @exclude      *://*.taobao.com/*
+// @exclude      *://*.tmall.com/*
+// @exclude      *://*.jd.com/*
+// @exclude      *://*.pinduoduo.com/*
+// @exclude      *://*.suning.com/*
+// @exclude      *://*.meituan.com/*
+// @exclude      *://pay.weixin.qq.com/*
+// @exclude      *://*.95516.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_addStyle
@@ -30,9 +39,15 @@
      * Cloudflare challenge/Turnstile pages are sensitive to DOM mutations and aggressive event hooks.
      * Skipping execution there avoids breaking the verification flow.
      */
-    function isCloudflareVerificationContext() {
+    /**
+     * Checks if the current page is a sensitive context where the script should be disabled.
+     * This includes Cloudflare verification pages and major Chinese shopping/payment sites.
+     */
+    function isExcludedContext() {
         try {
             const host = window.location.hostname;
+
+            // Cloudflare protection
             if (host === 'challenges.cloudflare.com') return true;
 
             const path = window.location.pathname || '';
@@ -47,6 +62,20 @@
             if (document.querySelector('form#challenge-form')) return true;
             if (document.getElementById('cf-wrapper')) return true;
             if (document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]')) return true;
+
+            // Domestic shopping and payment sites
+            const sensitiveDomains = [
+                'alipay.com',
+                'taobao.com',
+                'tmall.com',
+                'jd.com',
+                'pinduoduo.com',
+                'suning.com',
+                'meituan.com',
+                'pay.weixin.qq.com',
+                '95516.com'
+            ];
+            if (sensitiveDomains.some(domain => host === domain || host.endsWith('.' + domain))) return true;
 
             return false;
         } catch {
@@ -974,8 +1003,8 @@
         escape(s) { return s.replace(/[&<>"']/g, m=>({'&':'&','<':'<','>':'>','"':'"',"'":'&#039;'}[m])); }
     };
 
-    if (isCloudflareVerificationContext()) {
-        console.log('[QR Scanner] Disabled on Cloudflare verification page to avoid interference.');
+    if (isExcludedContext()) {
+        console.log('[QR Scanner] Disabled on this page to avoid interference or protect sensitive data.');
         return;
     }
 
