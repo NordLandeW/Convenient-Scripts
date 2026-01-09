@@ -40,3 +40,5 @@
 * gemini-web-translator
   * 油猴脚本。
   * 将网页的文本元素传输给 Gemini 进行翻译并替换。
+* nautilus
+  * 有关 nautilus 的各类脚本。
