@@ -23,6 +23,9 @@ from typing import Dict, Optional
 
 from loguru import logger
 
+# Folders containing any of these keywords (case-insensitive) will be skipped during 'rename'.
+EXCLUDE_KEYWORDS = ["old"]
+
 
 def setup_logging():
     logger.remove()
@@ -59,6 +62,12 @@ def _rename_walk(
                 else:
                     logger.info("File %s has existed. Skipped." % new_name)
         else:
+            # Skip folders containing any of the excluded keywords (case-insensitive)
+            name_lower = entry.name.lower()
+            if any(kw.lower() in name_lower for kw in EXCLUDE_KEYWORDS):
+                logger.info("Skip excluded folder: %s" % entry.path)
+                continue
+
             # Preserve original recursion and path concatenation with backslash
             subdir = dir_path + "\\" + entry.name
             _rename_walk(
