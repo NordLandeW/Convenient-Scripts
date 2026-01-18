@@ -1529,8 +1529,8 @@ if __name__ == "__main__":
     _ensure_directory(DATA_DIR, "数据")
 
     if CLI_ARGS.show_paths:
-        print_info(f"Config dir: {os.path.abspath(CONFIG_DIR)}")
-        print_info(f"Data dir: {os.path.abspath(DATA_DIR)}")
+        print_info(f"Config dir: {CONFIG_DIR}")
+        print_info(f"Data dir: {DATA_DIR}")
         sys.exit(0)
 
     try:
