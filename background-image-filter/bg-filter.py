@@ -126,6 +126,9 @@ def copy_file_to_clipboard(filepath):
         except ImportError:
             print("需要安装 pywin32 以使用剪贴板功能。")
             return
+        if windll is None:
+            print("windll 不可用，剪贴板功能无法使用。")
+            return
         try:
             win32clipboard.OpenClipboard()
             win32clipboard.EmptyClipboard()
@@ -171,15 +174,21 @@ def _copy_file_to_clipboard_linux(filepath):
         ["xclip", "-selection", "clipboard", "-t", "text/uri-list"],
         ["xsel", "--clipboard", "--input", "--mime-type", "text/uri-list"],
     ]
+    attempted = False
     for cmd in clipboard_commands:
         if shutil.which(cmd[0]):
             try:
                 subprocess.run(cmd, input=data.encode("utf-8"), check=True)
                 print("已复制到剪贴板:", filepath)
+                return
             except Exception:
                 logger.exception("复制文件到剪贴板失败")
-            return
-    print("未检测到 wl-copy/xclip/xsel，无法复制文件到剪贴板。")
+                attempted = True
+                continue
+    if attempted:
+        print("复制文件到剪贴板失败。")
+    else:
+        print("未检测到 wl-copy/xclip/xsel，无法复制文件到剪贴板。")
 
 
 def open_external_and_copy(img_path):
