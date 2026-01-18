@@ -507,21 +507,27 @@ def check_passwords():
     pwdPath = os.path.join(DATA_DIR, pwdFilename)
     if not os.path.exists(pwdPath):
         _ensure_directory(DATA_DIR, "数据")
-        pwdPath_real = os.path.realpath(pwdPath)
         legacy_paths = (
             os.path.join(CONFIG_DIR, pwdFilename),
             os.path.join(sys.path[0], pwdFilename),
         )
         for legacy_path in legacy_paths:
-            if os.path.realpath(legacy_path) == pwdPath_real:
+            if not os.path.exists(legacy_path):
                 continue
-            if os.path.exists(legacy_path):
-                try:
-                    shutil.copy2(legacy_path, pwdPath)
-                    print_info("已将旧密码本迁移到新的数据目录喵！")
-                except Exception as e:
-                    print_warning(f"迁移旧密码本失败喵：{e}")
-                break
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as file:
+                    legacy_data = json.load(file)
+                if not isinstance(legacy_data, dict):
+                    raise ValueError("密码本格式无效")
+            except Exception as e:
+                print_warning(f"旧密码本格式异常，跳过迁移喵：{e}")
+                continue
+            try:
+                shutil.copy2(legacy_path, pwdPath)
+                print_info(f"已将旧密码本迁移到新的数据目录喵：{legacy_path}")
+            except Exception as e:
+                print_warning(f"迁移旧密码本失败喵：{e}")
+            break
     if not os.path.exists(pwdPath):
         # 若本地缺失则优先尝试从 Gist 获取
         if _pull_from_gist_if_possible():
