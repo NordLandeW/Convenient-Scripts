@@ -524,7 +524,6 @@ def check_passwords():
                 print_warning(f"旧密码本格式异常，跳过迁移喵：{e}")
                 continue
             try:
-                _ensure_directory(DATA_DIR, "数据")
                 shutil.copy2(legacy_path, pwdPath)
                 print_info(f"已将旧密码本迁移到新的数据目录喵：{legacy_path}")
             except Exception as e:
