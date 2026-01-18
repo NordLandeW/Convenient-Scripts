@@ -520,6 +520,8 @@ def check_passwords():
                     legacy_data = json.load(file)
                 if not isinstance(legacy_data, dict):
                     raise ValueError("密码本格式无效：期望 JSON 字典格式")
+                if not all(isinstance(value, int) for value in legacy_data.values()):
+                    raise ValueError("密码本格式无效：计数应为整数")
             except Exception as e:
                 print_warning(f"旧密码本格式异常，跳过迁移喵：{e}")
                 continue
