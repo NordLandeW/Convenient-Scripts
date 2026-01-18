@@ -240,6 +240,11 @@ def parse_cli_arguments(argv):
         help="指定配置文件（不含密码字典）的所在文件夹喵，密码字典将存放在数据目录中。",
     )
     parser.add_argument(
+        "--show-paths",
+        action="store_true",
+        help="输出当前配置与数据目录的绝对路径并退出。",
+    )
+    parser.add_argument(
         "files",
         nargs="*",
         help="需解压的压缩文件路径，可直接拖拽物件到脚本上喵",
@@ -1522,6 +1527,11 @@ if __name__ == "__main__":
 
     _ensure_directory(CONFIG_DIR, "配置")
     _ensure_directory(DATA_DIR, "数据")
+
+    if CLI_ARGS.show_paths:
+        print_info(f"Config dir: {os.path.abspath(CONFIG_DIR)}")
+        print_info(f"Data dir: {os.path.abspath(DATA_DIR)}")
+        sys.exit(0)
 
     try:
         lock = FileLock(instance_lock)
