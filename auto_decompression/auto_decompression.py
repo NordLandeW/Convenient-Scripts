@@ -21,6 +21,7 @@ console = Console()
 _dirs = PlatformDirs(appname="auto_decompression", appauthor="NordLandeW")
 CONFIG_DIR = _dirs.user_config_dir
 DATA_DIR = _dirs.user_data_dir
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 extract_to_base_folder = False
 auto_flatten_single_file = True
 pwdFilename = "dict.json"
@@ -509,7 +510,7 @@ def check_passwords():
         _ensure_directory(DATA_DIR, "数据")
         legacy_paths = (
             os.path.join(CONFIG_DIR, pwdFilename),
-            os.path.join(sys.path[0], pwdFilename),
+            os.path.join(SCRIPT_DIR, pwdFilename),
         )
         for legacy_path in legacy_paths:
             if not os.path.exists(legacy_path):
@@ -518,11 +519,12 @@ def check_passwords():
                 with open(legacy_path, "r", encoding="utf-8") as file:
                     legacy_data = json.load(file)
                 if not isinstance(legacy_data, dict):
-                    raise ValueError("密码本格式无效")
+                    raise ValueError("密码本格式无效：期望 JSON 字典格式")
             except Exception as e:
                 print_warning(f"旧密码本格式异常，跳过迁移喵：{e}")
                 continue
             try:
+                _ensure_directory(DATA_DIR, "数据")
                 shutil.copy2(legacy_path, pwdPath)
                 print_info(f"已将旧密码本迁移到新的数据目录喵：{legacy_path}")
             except Exception as e:
