@@ -43,9 +43,13 @@ def _rename_walk(
     for entry in entries:
         if entry.is_file():
             relative_path = entry.path[head:]
-            new_name = entry.path[:head] + relative_path.replace("\\", "_").replace("/", "_")
+            new_name = entry.path[:head] + relative_path.replace(os.sep, "_")
+            if os.altsep:
+                new_name = new_name.replace(os.altsep, "_")
             if collapse_self_dir:
-                normalized_rel = relative_path.replace("\\", "/")
+                normalized_rel = relative_path.replace(os.sep, "/")
+                if os.altsep:
+                    normalized_rel = normalized_rel.replace(os.altsep, "/")
                 if normalized_rel.count("/") == 1:
                     parent_candidate, file_part = normalized_rel.split("/", 1)
                     file_stem, file_ext = os.path.splitext(file_part)
@@ -68,8 +72,8 @@ def _rename_walk(
                 logger.info("Skip excluded folder: %s" % entry.path)
                 continue
 
-            # Preserve original recursion and path concatenation with backslash
-            subdir = dir_path + "\\" + entry.name
+            # Preserve original recursion and path concatenation
+            subdir = os.path.join(dir_path, entry.name)
             _rename_walk(
                 subdir,
                 head + (len(entry.name) + 1 if floor > 0 else 0),
@@ -183,7 +187,7 @@ def cmd_repack(root: str, lib_path: str, keep_lib: bool) -> None:
                 if underscore_idx != -1:
                     name_chars[underscore_idx] = os.sep
                 candidate = "".join(name_chars)
-                candidate = candidate.replace("_", "/").replace("-U", "_")
+                candidate = candidate.replace("_", os.sep).replace("-U", "_")
                 target_rel = _normalize_relative(candidate)
             else:
                 target_rel = library.get(entry_rel)
