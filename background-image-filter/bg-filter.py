@@ -7,8 +7,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import subprocess
-import shutil
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import struct
 import ctypes
@@ -167,6 +165,9 @@ def copy_file_to_clipboard(filepath):
 
 
 def _copy_file_to_clipboard_linux(filepath):
+    import shutil
+    from pathlib import Path
+
     uri = Path(filepath).resolve().as_uri()
     data = f"{uri}\n"
     clipboard_commands = [
@@ -174,21 +175,19 @@ def _copy_file_to_clipboard_linux(filepath):
         ["xclip", "-selection", "clipboard", "-t", "text/uri-list"],
         ["xsel", "--clipboard", "--input", "--mime-type", "text/uri-list"],
     ]
-    attempted = False
-    for cmd in clipboard_commands:
-        if shutil.which(cmd[0]):
-            attempted = True
-            try:
-                subprocess.run(cmd, input=data.encode("utf-8"), check=True)
-                print("已复制到剪贴板:", filepath)
-                return
-            except Exception:
-                logger.exception("复制文件到剪贴板失败")
-                continue
-    if attempted:
-        print("复制文件到剪贴板失败。")
-    else:
+    available_commands = [cmd for cmd in clipboard_commands if shutil.which(cmd[0])]
+    if not available_commands:
         print("未检测到 wl-copy/xclip/xsel，无法复制文件到剪贴板。")
+        return
+    for cmd in available_commands:
+        try:
+            subprocess.run(cmd, input=data.encode("utf-8"), check=True)
+            print("已复制到剪贴板:", filepath)
+            return
+        except (subprocess.CalledProcessError, OSError):
+            logger.exception("复制文件到剪贴板失败")
+            continue
+    print("复制文件到剪贴板失败。")
 
 
 def open_external_and_copy(img_path):
