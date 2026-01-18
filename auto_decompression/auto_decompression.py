@@ -11,16 +11,19 @@ from rich.console import Console
 from rich.progress import Progress
 import rich.progress
 import requests
+from platformdirs import PlatformDirs
 import datetime as _dt
 import atexit
 import time
 
 __version__ = "1.2.1"
 console = Console()
-CONFIG_DIR = sys.path[0]
+_dirs = PlatformDirs(appname="auto_decompression", appauthor="NordLandeW")
+CONFIG_DIR = _dirs.user_config_dir
+DATA_DIR = _dirs.user_data_dir
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 extract_to_base_folder = False
 auto_flatten_single_file = True
-pwdOldFilename = "dict.txt"
 pwdFilename = "dict.json"
 pwdDictionary = {}
 RECOVER_SUFFIX = ".AutoDecRecovered"
@@ -128,7 +131,7 @@ def _setup_gist_interactive():
     # 检查是否提供了已有的 Gist ID
     if gist_id != "":
         # 检查本地是否有密码本
-        local_pwd_path = os.path.join(CONFIG_DIR, pwdFilename)
+        local_pwd_path = os.path.join(DATA_DIR, pwdFilename)
         has_local_pwd = os.path.exists(local_pwd_path)
         
         # 尝试获取远程密码本信息
@@ -234,7 +237,12 @@ def parse_cli_arguments(argv):
         "--config-dir",
         type=str,
         default=None,
-        help="指定配置文件（字典、Gist配置等）的所在文件夹喵。",
+        help="指定配置文件（不含密码字典）的所在文件夹喵，密码字典将存放在数据目录中。",
+    )
+    parser.add_argument(
+        "--show-paths",
+        action="store_true",
+        help="输出当前配置与数据目录的绝对路径并退出。",
     )
     parser.add_argument(
         "files",
@@ -258,6 +266,16 @@ def print_success(message):
 
 def print_warning(message):
     console.out(message, style="bold yellow underline")
+
+
+def _ensure_directory(path, label):
+    if os.path.exists(path):
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        print_error(f"无法创建{label}目录 {path} 喵：{e}")
+        sys.exit(1)
 
 
 def move_temp_folders_to_recycle_bin(current_directory):
@@ -454,30 +472,9 @@ def detect_single_same_named_file(temp_folder, expected_base_name, entries=None)
     return entry_path
 
 
-def read_passwords_old():
-    """Legacy loader for plaintext password dictionary."""
-    passwords = []
-    pwdPath = os.path.join(CONFIG_DIR, pwdOldFilename)
-    try:
-        with open(pwdPath, "r", encoding="utf-8") as file:
-            passwords = file.read().splitlines()
-    except Exception as e:
-        print_warning(f"读取旧密码文件错误喵！错误信息：{e}")
-
-    return passwords if len(passwords) > 0 else ["???"]
-
-
-# Old version workaround.
-def convert_old_pwd_to_new_pwd(passwords):
-    for pwd in passwords:
-        pwdDictionary[pwd] = 0
-    save_passwords()
-    print_info("密码本格式更新完毕喵！")
-
-
 def read_passwords():
     global pwdDictionary
-    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
+    pwdPath = os.path.join(DATA_DIR, pwdFilename)
     try:
         with open(pwdPath, "r", encoding="utf-8") as file:
             pwdDictionary = json.load(file)
@@ -487,7 +484,7 @@ def read_passwords():
 
 def save_passwords():
     # print(str(pwdDictionary))
-    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
+    pwdPath = os.path.join(DATA_DIR, pwdFilename)
     try:
         with open(pwdPath, "w", encoding="utf-8") as file:
             json.dump(pwdDictionary, file, ensure_ascii=False, indent=4)
@@ -513,17 +510,37 @@ def _pull_from_gist_if_possible():
 
 def check_passwords():
     global pwdDictionary
-    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
-    pwdOldPath = os.path.join(CONFIG_DIR, pwdOldFilename)
+    pwdPath = os.path.join(DATA_DIR, pwdFilename)
+    if not os.path.exists(pwdPath):
+        _ensure_directory(DATA_DIR, "数据")
+        legacy_paths = (
+            os.path.join(CONFIG_DIR, pwdFilename),
+            os.path.join(SCRIPT_DIR, pwdFilename),
+        )
+        for legacy_path in legacy_paths:
+            if not os.path.exists(legacy_path):
+                continue
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as file:
+                    legacy_data = json.load(file)
+                if not isinstance(legacy_data, dict):
+                    raise ValueError("密码本格式无效：期望 JSON 字典格式")
+                if not all(isinstance(value, int) for value in legacy_data.values()):
+                    raise ValueError("密码本格式无效：计数应为整数")
+            except Exception as e:
+                print_warning(f"旧密码本格式异常，跳过迁移喵：{e}")
+                continue
+            try:
+                shutil.copy2(legacy_path, pwdPath)
+                print_info(f"已将旧密码本迁移到新的数据目录喵：{legacy_path}")
+            except Exception as e:
+                print_warning(f"迁移旧密码本失败喵：{e}")
+            break
     if not os.path.exists(pwdPath):
         # 若本地缺失则优先尝试从 Gist 获取
         if _pull_from_gist_if_possible():
             return
-        # Check if a old version file exists.
-        if os.path.exists(pwdOldPath):
-            convert_old_pwd_to_new_pwd(read_passwords_old())
-        else:
-            pwdDictionary = {}
+        pwdDictionary = {}
     else:
         read_passwords()
 
@@ -532,7 +549,7 @@ def _sync_to_gist_before_exit():
     global _gist_cfg, _gist_remote_ts
     if _gist_cfg is None:
         return
-    pwdPath = os.path.join(CONFIG_DIR, pwdFilename)
+    pwdPath = os.path.join(DATA_DIR, pwdFilename)
     if not os.path.exists(pwdPath):
         return
     local_mtime = _dt.datetime.fromtimestamp(os.path.getmtime(pwdPath), tz=_dt.timezone.utc)
@@ -1503,17 +1520,18 @@ if __name__ == "__main__":
 
     if CLI_ARGS.config_dir:
         CONFIG_DIR = os.path.abspath(CLI_ARGS.config_dir)
-        if not os.path.exists(CONFIG_DIR):
-            try:
-                os.makedirs(CONFIG_DIR)
-            except Exception as e:
-                print_error(f"无法创建配置目录 {CONFIG_DIR} 喵：{e}")
-                sys.exit(1)
-
         # 更新依赖 CONFIG_DIR 的全局路径变量
         queue_file_path = append_scr_path("queue_file.txt")
         queue_file_lock = append_scr_path("queue_file.lock")
         instance_lock = append_scr_path("instance.lock")
+
+    _ensure_directory(CONFIG_DIR, "配置")
+    _ensure_directory(DATA_DIR, "数据")
+
+    if CLI_ARGS.show_paths:
+        print_info(f"配置目录: {CONFIG_DIR}")
+        print_info(f"数据目录: {DATA_DIR}")
+        sys.exit(0)
 
     try:
         lock = FileLock(instance_lock)
