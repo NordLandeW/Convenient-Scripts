@@ -177,13 +177,13 @@ def _copy_file_to_clipboard_linux(filepath):
     attempted = False
     for cmd in clipboard_commands:
         if shutil.which(cmd[0]):
+            attempted = True
             try:
                 subprocess.run(cmd, input=data.encode("utf-8"), check=True)
                 print("已复制到剪贴板:", filepath)
                 return
             except Exception:
                 logger.exception("复制文件到剪贴板失败")
-                attempted = True
                 continue
     if attempted:
         print("复制文件到剪贴板失败。")
