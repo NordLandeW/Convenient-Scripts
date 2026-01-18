@@ -236,7 +236,7 @@ def parse_cli_arguments(argv):
         "--config-dir",
         type=str,
         default=None,
-        help="指定配置文件（不含密码字典）的所在文件夹喵。",
+        help="指定配置文件（不含密码字典）的所在文件夹喵，密码字典将存放在数据目录中。",
     )
     parser.add_argument(
         "files",
@@ -506,12 +506,14 @@ def check_passwords():
     global pwdDictionary
     pwdPath = os.path.join(DATA_DIR, pwdFilename)
     if not os.path.exists(pwdPath):
+        _ensure_directory(DATA_DIR, "数据")
+        pwdPath_real = os.path.realpath(pwdPath)
         legacy_paths = (
             os.path.join(CONFIG_DIR, pwdFilename),
             os.path.join(sys.path[0], pwdFilename),
         )
         for legacy_path in legacy_paths:
-            if os.path.abspath(legacy_path) == os.path.abspath(pwdPath):
+            if os.path.realpath(legacy_path) == pwdPath_real:
                 continue
             if os.path.exists(legacy_path):
                 try:
