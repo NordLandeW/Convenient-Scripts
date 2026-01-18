@@ -7,10 +7,16 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import subprocess
+import shutil
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import struct
 import ctypes
-from ctypes import c_void_p, c_size_t, memmove, windll
+from ctypes import c_void_p, c_size_t, memmove
+try:
+    from ctypes import windll
+except ImportError:
+    windll = None
 from loguru import logger
 
 def _print_progress(cur, total, prefix=""):
@@ -113,42 +119,67 @@ def collect_images(folder):
 
 
 def copy_file_to_clipboard(filepath):
-    try:
-        import win32clipboard
-        import win32con
-    except ImportError:
-        print("需要安装 pywin32 以使用剪贴板功能。")
-        return
-    try:
-        win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        dropfiles_header = struct.pack("IiiII", 20, 0, 0, 0, 1)
-        file_list = (filepath + "\0").encode("utf-16le") + b"\0\0"
-        data = dropfiles_header + file_list
-        GHND = 0x0042
-        windll.kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_ulong]
-        windll.kernel32.GlobalAlloc.restype = c_void_p
-        windll.kernel32.GlobalLock.argtypes = [c_void_p]
-        windll.kernel32.GlobalLock.restype = c_void_p
-        hGlobalMem = windll.kernel32.GlobalAlloc(GHND, len(data))
-        if not hGlobalMem:
-            win32clipboard.CloseClipboard()
-            return
-        pGlobalMem = windll.kernel32.GlobalLock(hGlobalMem)
-        if not pGlobalMem:
-            win32clipboard.CloseClipboard()
-            return
-        memmove(pGlobalMem, data, len(data))
-        windll.kernel32.GlobalUnlock(ctypes.c_void_p(hGlobalMem))
-        win32clipboard.SetClipboardData(win32con.CF_HDROP, hGlobalMem)
-        win32clipboard.CloseClipboard()
-        print("已复制到剪贴板:", filepath)
-    except Exception:
-        logger.exception("复制文件到剪贴板失败")
+    if sys.platform.startswith("win"):
         try:
+            import win32clipboard
+            import win32con
+        except ImportError:
+            print("需要安装 pywin32 以使用剪贴板功能。")
+            return
+        try:
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            dropfiles_header = struct.pack("IiiII", 20, 0, 0, 0, 1)
+            file_list = (filepath + "\0").encode("utf-16le") + b"\0\0"
+            data = dropfiles_header + file_list
+            GHND = 0x0042
+            windll.kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_ulong]
+            windll.kernel32.GlobalAlloc.restype = c_void_p
+            windll.kernel32.GlobalLock.argtypes = [c_void_p]
+            windll.kernel32.GlobalLock.restype = c_void_p
+            hGlobalMem = windll.kernel32.GlobalAlloc(GHND, len(data))
+            if not hGlobalMem:
+                win32clipboard.CloseClipboard()
+                return
+            pGlobalMem = windll.kernel32.GlobalLock(hGlobalMem)
+            if not pGlobalMem:
+                win32clipboard.CloseClipboard()
+                return
+            memmove(pGlobalMem, data, len(data))
+            windll.kernel32.GlobalUnlock(ctypes.c_void_p(hGlobalMem))
+            win32clipboard.SetClipboardData(win32con.CF_HDROP, hGlobalMem)
             win32clipboard.CloseClipboard()
+            print("已复制到剪贴板:", filepath)
         except Exception:
-            pass
+            logger.exception("复制文件到剪贴板失败")
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+        return
+    if sys.platform.startswith("linux"):
+        _copy_file_to_clipboard_linux(filepath)
+        return
+    print("复制功能仅在 Windows / Linux 上受支持。")
+
+
+def _copy_file_to_clipboard_linux(filepath):
+    uri = Path(filepath).resolve().as_uri()
+    data = f"{uri}\n"
+    clipboard_commands = [
+        ["wl-copy", "--type", "text/uri-list"],
+        ["xclip", "-selection", "clipboard", "-t", "text/uri-list"],
+        ["xsel", "--clipboard", "--input", "--mime-type", "text/uri-list"],
+    ]
+    for cmd in clipboard_commands:
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=data.encode("utf-8"), check=True)
+                print("已复制到剪贴板:", filepath)
+            except Exception:
+                logger.exception("复制文件到剪贴板失败")
+            return
+    print("未检测到 wl-copy/xclip/xsel，无法复制文件到剪贴板。")
 
 
 def open_external_and_copy(img_path):
@@ -158,10 +189,10 @@ def open_external_and_copy(img_path):
             copy_file_to_clipboard(img_path)
         elif sys.platform.startswith("darwin"):
             subprocess.call(["open", img_path])
-            print("复制功能仅在 Windows 上受支持。")
+            print("复制功能仅在 Windows / Linux 上受支持。")
         else:
             subprocess.call(["xdg-open", img_path])
-            print("复制功能仅在 Windows 上受支持。")
+            copy_file_to_clipboard(img_path)
     except Exception as e:
         print("无法打开外部程序:", e)
 
