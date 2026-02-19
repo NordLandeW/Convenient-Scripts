@@ -245,6 +245,11 @@ def parse_cli_arguments(argv):
         help="输出当前配置与数据目录的绝对路径并退出。",
     )
     parser.add_argument(
+        "--update-dict",
+        action="store_true",
+        help="强制从 Gist 拉取最新的密码本并退出程序。",
+    )
+    parser.add_argument(
         "files",
         nargs="*",
         help="需解压的压缩文件路径，可直接拖拽物件到脚本上喵",
@@ -546,8 +551,8 @@ def check_passwords():
 
 
 def _sync_to_gist_before_exit():
-    global _gist_cfg, _gist_remote_ts
-    if _gist_cfg is None:
+    global _gist_cfg, _gist_remote_ts, _skip_gist_sync
+    if _gist_cfg is None or getattr(sys.modules['__main__'], '_skip_gist_sync', False) or globals().get('_skip_gist_sync'):
         return
     pwdPath = os.path.join(DATA_DIR, pwdFilename)
     if not os.path.exists(pwdPath):
@@ -1412,9 +1417,19 @@ class FileManager:
 
 
 def main(args):
-    global extract_to_base_folder, _gist_cfg, _gist_remote_ts, embedded_scan_depth_setting, auto_flatten_single_file
+    global extract_to_base_folder, _gist_cfg, _gist_remote_ts, embedded_scan_depth_setting, auto_flatten_single_file, _skip_gist_sync
 
     _gist_cfg = _ensure_gist_config()
+
+    if getattr(args, "update_dict", False):
+        if _pull_from_gist_if_possible():
+            _skip_gist_sync = True
+            import sys
+            sys.exit(0)
+        else:
+            print_error("强制拉取密码本失败喵。")
+            import sys
+            sys.exit(1)
 
     manager = FileManager(queue_file_path, queue_file_lock)
 
