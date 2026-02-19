@@ -39,6 +39,7 @@ _RECYCLED_RESERVED_PATHS = set()
 GIST_CONFIG_FILE = "gist_config.json"
 _gist_cfg = None  # {token:str, gist_id:str, file:str}
 _gist_remote_ts = None  # 上一次拉取时远程文件 updated_at（datetime）
+_skip_gist_sync = False
 
 
 def _cfg_path(fname):
@@ -248,6 +249,11 @@ def parse_cli_arguments(argv):
         "--update-dict",
         action="store_true",
         help="强制从 Gist 拉取最新的密码本并退出程序。",
+    )
+    parser.add_argument(
+        "--check-dict-conflict-on-startup",
+        action="store_true",
+        help="程序启动后立即检查本地密码本与 Gist 是否一致；若冲突则交互询问处理方式。",
     )
     parser.add_argument(
         "files",
@@ -574,6 +580,79 @@ def _sync_to_gist_before_exit():
     else:
         print_warning("同步到 Gist 失败喵，请稍后重试！")
     time.sleep(1)
+
+
+def _check_dict_conflict_on_startup():
+    """启动时检查本地密码本与 Gist 是否一致，冲突时让用户选择处理方式。"""
+    global _gist_cfg, _gist_remote_ts, pwdDictionary, _skip_gist_sync
+
+    if _gist_cfg is None:
+        return
+
+    remote_dict, remote_ts_str = _fetch_from_gist(_gist_cfg)
+    if remote_dict is None:
+        print_warning("启动检查时无法拉取 Gist 密码本，已跳过冲突检查喵。")
+        return
+
+    remote_ts = (
+        _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00"))
+        if remote_ts_str
+        else None
+    )
+    _gist_remote_ts = remote_ts
+
+    if remote_dict == pwdDictionary:
+        print_info("启动检查完成：本地密码本与 Gist 一致喵。")
+        return
+
+    pwd_path = os.path.join(DATA_DIR, pwdFilename)
+    local_mtime = (
+        _dt.datetime.fromtimestamp(os.path.getmtime(pwd_path), tz=_dt.timezone.utc)
+        if os.path.exists(pwd_path)
+        else None
+    )
+
+    print_warning("启动检查发现本地密码本与 Gist 不一致喵！")
+    print_info(
+        f"本地最后修改时间：{local_mtime.astimezone().strftime('%Y-%m-%d %H:%M:%S') if local_mtime else '未知'}"
+    )
+    print_info(
+        f"远程最后修改时间：{remote_ts.astimezone().strftime('%Y-%m-%d %H:%M:%S') if remote_ts else '未知'}"
+    )
+
+    while True:
+        console.print(
+            "[cyan][b]请选择冲突处理方式：[1] 拉取远程覆盖本地 [2] 上传本地覆盖远程 [3] 暂不处理且本次退出前不自动同步 [默认:1]：",
+            end="",
+        )
+        choice = input().strip()
+
+        if choice in ("", "1"):
+            pwdDictionary = remote_dict
+            save_passwords()
+            print_success("已拉取远程密码本并覆盖本地喵！")
+            return
+
+        if choice == "2":
+            if _update_gist(_gist_cfg, json.dumps(pwdDictionary, ensure_ascii=False, indent=4)):
+                refreshed_dict, refreshed_ts_str = _fetch_from_gist(_gist_cfg)
+                if refreshed_dict is not None:
+                    _gist_remote_ts = (
+                        _dt.datetime.fromisoformat(refreshed_ts_str.replace("Z", "+00:00"))
+                        if refreshed_ts_str
+                        else _gist_remote_ts
+                    )
+                print_success("已上传本地密码本到 Gist 喵！")
+            else:
+                print_warning("上传本地密码本到 Gist 失败喵，将保留本地内容继续运行。")
+            return
+
+        if choice == "3":
+            _skip_gist_sync = True
+            print_info("本次会话将跳过退出时自动同步到 Gist。")
+            return
+
+        print_warning("输入无效喵，请输入 1、2 或 3。")
 
 # 注册到 atexit，以便任何正常退出路径都会尝试同步
 atexit.register(_sync_to_gist_before_exit)
@@ -1431,9 +1510,12 @@ def main(args):
             import sys
             sys.exit(1)
 
-    manager = FileManager(queue_file_path, queue_file_lock)
-
     check_passwords()
+
+    if getattr(args, "check_dict_conflict_on_startup", False):
+        _check_dict_conflict_on_startup()
+
+    manager = FileManager(queue_file_path, queue_file_lock)
 
     embedded_scan_depth_setting = max(0, args.embedded_scan_depth)
     auto_flatten_single_file = args.flatten_single_file
