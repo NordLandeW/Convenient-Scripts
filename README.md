@@ -40,5 +40,8 @@
 * gemini-web-translator
   * 油猴脚本。
   * 将网页的文本元素传输给 Gemini 进行翻译并替换。
+* gemini-model-resumer
+  * 在 Gemini 网页端点击开始新对话时，自动恢复模型到上一次你选中的模型。
+  * 即修复 Gemini 网页端引入的一个“bug”。
 * nautilus
   * 有关 nautilus 的各类脚本。
