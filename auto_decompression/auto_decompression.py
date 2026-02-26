@@ -1103,52 +1103,86 @@ def list_related_archive_parts(file_path):
 def group_archive_files(directory):
     """
     Groups files in a directory into logical archives, handling multi-volume archives.
-    Returns a list of primary files (first volume of a set or regular files).
+    Returns a list where each split archive contributes only its primary part.
     """
     files = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
-    
-    # Regex for different archive parts
-    # 1. .part1.rar, .part01.rar, .part001.rar etc.
-    # 2. .r00, .r01, ...
-    # 3. .7z.001, .zip.001, ...
-    # 4. .z01, .z02, ... (first file is .zip)
-    part_regex = re.compile(r'(.+)\.part\d+\.rar$', re.IGNORECASE)
-    r_regex = re.compile(r'(.+)\.r\d+$', re.IGNORECASE)
-    num_regex = re.compile(r'(.+)\.(7z|zip)\.\d+$', re.IGNORECASE)
-    z_regex = re.compile(r'(.+)\.z\d+$', re.IGNORECASE)
 
-    archives = {} # key: base_name, value: list of parts
-    
-    # First pass: group all volume parts
+    part_regex = re.compile(r'(.+)\.part(\d+)\.rar$', re.IGNORECASE)
+    r_regex = re.compile(r'(.+)\.r(\d+)$', re.IGNORECASE)
+    num_regex = re.compile(r'(.+)\.(7z|zip)\.(\d+)$', re.IGNORECASE)
+    z_regex = re.compile(r'(.+)\.z(\d+)$', re.IGNORECASE)
+
+    # Preserve on-disk naming while allowing case-insensitive lookup of companion files.
+    lower_name_map = {}
     for f in files:
-        match = part_regex.match(f) or r_regex.match(f) or num_regex.match(f) or z_regex.match(f)
-        if match:
-            base_name = match.group(1)
-            if base_name not in archives:
-                archives[base_name] = []
-            archives[base_name].append(f)
+        lower_name_map.setdefault(f.casefold(), f)
 
-    # Identify primary files
+    part_groups = {}
+    r_groups = {}
+    num_groups = {}
+    z_groups = {}
+
+    for f in files:
+        m = part_regex.match(f)
+        if m:
+            base_name = m.group(1)
+            index = int(m.group(2))
+            part_groups.setdefault(base_name, []).append((index, f))
+            continue
+
+        m = r_regex.match(f)
+        if m:
+            base_name = m.group(1)
+            index = int(m.group(2))
+            r_groups.setdefault(base_name, []).append((index, f))
+            continue
+
+        m = num_regex.match(f)
+        if m:
+            base_name = m.group(1)
+            ext = m.group(2).casefold()
+            index = int(m.group(3))
+            num_groups.setdefault((base_name, ext), []).append((index, f))
+            continue
+
+        m = z_regex.match(f)
+        if m:
+            base_name = m.group(1)
+            index = int(m.group(2))
+            z_groups.setdefault(base_name, []).append((index, f))
+
     primary_files = []
     processed_files = set()
 
-    # Add the first part of each archive group
-    for base_name, parts in archives.items():
-        parts.sort() # Sort to find the first part reliably
-        first_part = parts[0]
-        
-        # For .z01 style, the .zip file is the primary
-        if z_regex.match(first_part):
-            zip_file = f"{base_name}.zip"
-            if zip_file in files:
-                primary_files.append(zip_file)
-                processed_files.add(zip_file)
-            else: # If .zip is missing, use the first part
-                primary_files.append(first_part)
+    for _, parts in part_groups.items():
+        first_part = min(parts, key=lambda item: (item[0], item[1].casefold()))[1]
+        primary_files.append(first_part)
+        processed_files.update(name for _, name in parts)
+
+    for base_name, parts in r_groups.items():
+        rar_file = lower_name_map.get(f"{base_name}.rar".casefold())
+        if rar_file is not None:
+            primary_files.append(rar_file)
+            processed_files.add(rar_file)
         else:
+            first_part = min(parts, key=lambda item: (item[0], item[1].casefold()))[1]
             primary_files.append(first_part)
-        
-        processed_files.update(parts)
+        processed_files.update(name for _, name in parts)
+
+    for _, parts in num_groups.items():
+        first_part = min(parts, key=lambda item: (item[0], item[1].casefold()))[1]
+        primary_files.append(first_part)
+        processed_files.update(name for _, name in parts)
+
+    for base_name, parts in z_groups.items():
+        zip_file = lower_name_map.get(f"{base_name}.zip".casefold())
+        if zip_file is not None:
+            primary_files.append(zip_file)
+            processed_files.add(zip_file)
+        else:
+            first_part = min(parts, key=lambda item: (item[0], item[1].casefold()))[1]
+            primary_files.append(first_part)
+        processed_files.update(name for _, name in parts)
 
     # Add all other non-volume files
     for f in files:
@@ -1156,6 +1190,84 @@ def group_archive_files(directory):
             primary_files.append(f)
             
     return primary_files
+
+
+def is_split_volume_member(filename: str) -> bool:
+    """Returns True when the filename is one member of a split archive set."""
+    return bool(
+        re.match(r'.+\.part\d+\.rar$', filename, re.IGNORECASE)
+        or re.match(r'.+\.r\d+$', filename, re.IGNORECASE)
+        or re.match(r'.+\.(7z|zip)\.\d+$', filename, re.IGNORECASE)
+        or re.match(r'.+\.z\d+$', filename, re.IGNORECASE)
+    )
+
+
+def filter_non_primary_split_inputs(file_paths):
+    """Keeps input order and redirects non-primary split members to their primary part."""
+    if not file_paths:
+        return []
+
+    primary_names_by_dir = {}
+    for path in file_paths:
+        dir_name = os.path.dirname(path) or "."
+        if dir_name in primary_names_by_dir:
+            continue
+        try:
+            primary_names_by_dir[dir_name] = {
+                name.casefold() for name in group_archive_files(dir_name)
+            }
+        except Exception:
+            primary_names_by_dir[dir_name] = set()
+
+    filtered_paths = []
+    seen_input_paths = set()
+    seen_output_paths = set()
+
+    for path in file_paths:
+        normalized_input_path = _normalize_path_for_compare(path)
+        if normalized_input_path in seen_input_paths:
+            continue
+        seen_input_paths.add(normalized_input_path)
+
+        candidate_path = path
+        redirect_message = None
+        file_name = os.path.basename(path)
+
+        if is_split_volume_member(file_name):
+            dir_name = os.path.dirname(path) or "."
+            primary_names = primary_names_by_dir.get(dir_name, set())
+
+            if file_name.casefold() not in primary_names:
+                redirected_path = None
+                try:
+                    related_paths = list_related_archive_parts(path)
+                except Exception:
+                    related_paths = []
+
+                for related_path in related_paths:
+                    related_name = os.path.basename(related_path)
+                    if related_name.casefold() in primary_names:
+                        redirected_path = related_path
+                        break
+
+                if redirected_path is None:
+                    print_info(f"跳过非首卷分卷文件：{path}")
+                    continue
+
+                candidate_path = redirected_path
+                redirect_message = f"将非首卷分卷文件重定向到首卷：{path} -> {candidate_path}"
+
+        normalized_output_path = _normalize_path_for_compare(candidate_path)
+        if normalized_output_path in seen_output_paths:
+            continue
+        seen_output_paths.add(normalized_output_path)
+
+        if redirect_message:
+            print_info(redirect_message)
+
+        filtered_paths.append(candidate_path)
+
+    return filtered_paths
 
 
 global_last_success_password = None
@@ -1544,6 +1656,7 @@ def main(args):
             while True:
                 current_batch = files_to_process[:]
                 files_to_process = []
+                current_batch = filter_non_primary_split_inputs(current_batch)
                 for file_path in current_batch:
                     if file_path.lower().endswith(".apk"):
                         print_info(f"跳过 .apk 文件：{file_path} 喵。")
