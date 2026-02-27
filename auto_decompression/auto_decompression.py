@@ -256,6 +256,11 @@ def parse_cli_arguments(argv):
         help="程序启动后立即检查本地密码本与 Gist 是否一致；若冲突则交互询问处理方式。",
     )
     parser.add_argument(
+        "--use-binwalk",
+        action="store_true",
+        help="启用 binwalk 进行隐藏嵌入文件判定喵（默认关闭，使用手写签名搜索）。",
+    )
+    parser.add_argument(
         "files",
         nargs="*",
         help="需解压的压缩文件路径，可直接拖拽物件到脚本上喵",
@@ -1631,8 +1636,11 @@ def main(args):
 
     embedded_scan_depth_setting = max(0, args.embedded_scan_depth)
     auto_flatten_single_file = args.flatten_single_file
+    hiddenZip.USE_BINWALK = bool(args.use_binwalk)
     if not auto_flatten_single_file:
         print_info("已禁用同名单文件自动扁平化喵。")
+    if hiddenZip.USE_BINWALK:
+        print_info("已启用 binwalk 进行隐藏嵌入文件判定喵。")
     if args.embedded_scan_depth < 0:
         print_warning("嵌入检测层级小于 0 喵，已自动调整为 0（禁用嵌入扫描）。")
     if embedded_scan_depth_setting == 0:
@@ -1758,6 +1766,10 @@ if __name__ == "__main__":
         if CLI_ARGS.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
             print_warning(
                 "已有实例正在运行，新的嵌入扫描层级参数未被应用喵。请先关闭原实例再重新运行。"
+            )
+        if CLI_ARGS.use_binwalk:
+            print_warning(
+                "已有实例正在运行，新的 --use-binwalk 参数未被应用喵。请先关闭原实例再重新运行。"
             )
         print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
         pass
