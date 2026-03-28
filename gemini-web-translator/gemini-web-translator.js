@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Webpage Translator
 // @namespace    http://tampermonkey.net/
-// @version      7.0.1
+// @version      7.1.0
 // @description  Translate webpages using Gemini or OpenRouter API.
 // @author       NordLandeW
 // @match        *://*/*
@@ -39,13 +39,9 @@
                 endpoint: 'https://generativelanguage.googleapis.com/v1beta/models',
                 models: [
                     'gemini-2.5-pro',
-                    'gemini-2.5-flash',
-                    'gemini-2.5-flash-lite',
-                    'gemini-3-pro-preview',
+                    'gemini-3.1-pro-preview',
                     'gemini-3-flash-preview',
-                    'gemini-2.0-flash-exp',
-                    'gemini-1.5-pro',
-                    'gemini-1.5-flash'
+                    'gemini-3.1-flash-lite-preview',
                 ]
             },
             openrouter: {
@@ -54,7 +50,7 @@
                 models: [
                     'google/gemini-2.5-pro',
                     'google/gemini-3-flash-preview',
-                    'deepseek/deepseek-v3.2'
+                    'google/gemini-3.1-flash-lite-preview',
                 ]
             }
         },
@@ -64,7 +60,10 @@
             platform: 'gemini',
             maxCacheSize: 10 * 1024 * 1024, // 10MB
             cacheTTL: 7 * 24 * 60 * 60 * 1000, // 7 days
-            urlSimilarityThreshold: 0.95
+            urlSimilarityThreshold: 0.95,
+            batchNodeCount: 500,
+            concurrency: 8,
+            maxBatchRetries: 2
         }
     };
 
@@ -74,7 +73,9 @@
         isUIInitialized: false,
         originalTexts: new Map(),
         textNodeMap: new Map(),
-        currentToastId: null
+        currentToastId: null,
+        translationProgress: null,
+        lastProgressUpdateAt: 0
     };
 
     // ================= 样式表 =================
@@ -93,7 +94,7 @@
             transform: translateY(-20px) scale(0.95); opacity: 0;
             transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
             backdrop-filter: blur(12px);
-            max-width: 320px;
+            max-width: 420px;
         }
         .gm-toast.visible { transform: translateY(0) scale(1); opacity: 1; }
         
@@ -183,6 +184,20 @@
         const value = typeof stored === 'number' ? stored : parseFloat(stored);
         if (Number.isNaN(value)) return CONFIG.defaults.urlSimilarityThreshold;
         return Math.min(Math.max(value, 0), 1);
+    }
+
+    function getClampedIntegerSetting(key, defaultValue, min, max) {
+        const stored = GM_getValue(key, defaultValue);
+        const value = typeof stored === 'number' ? stored : parseInt(stored, 10);
+        if (Number.isNaN(value)) return defaultValue;
+        return Math.min(Math.max(value, min), max);
+    }
+
+    function readClampedIntegerFromInput(elementId, defaultValue, min, max) {
+        const input = document.getElementById(elementId);
+        const value = parseInt(input.value, 10);
+        if (Number.isNaN(value)) return defaultValue;
+        return Math.min(Math.max(value, min), max);
     }
 
     // Compute Levenshtein distance between two strings
@@ -383,6 +398,80 @@
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
 
+    function buildTranslationPrompt() {
+        return `You are a CSV translator.
+Input format: id,"text content"
+Task: Translate "text content" to Simplified Chinese.
+
+Rules:
+1. Keep each "id" exactly as-is.
+2. Output exactly one CSV line for every input line, in the same order: id,"translated_text".
+3. Escape any double quotes in the translated text by doubling them (e.g., " becomes "").
+4. If the text is already Chinese (i.e., contains predominantly Chinese characters), keep it unchanged.
+5. Do not translate proper nouns (names, brands, places, organizations, etc.). Keep them in the original language.
+6. For specialist or technical terms without a widely accepted Chinese translation, keep them in English.
+7. Preserve all HTML markup, placeholders, variables, and format tokens exactly as they appear.
+8. Keep sentence structure close to the original. Do not merge, split, omit, or reorder records.
+9. Never output Markdown fences, CSV headers, explanations, or blank lines.
+10. Never include newline characters inside translated_text.
+
+Provide only the translated CSV lines.
+`;
+    }
+
+    function createTranslationBatches(entries, batchNodeCount) {
+        const batches = [];
+        for (let i = 0; i < entries.length; i += batchNodeCount) {
+            const slice = entries.slice(i, i + batchNodeCount);
+            batches.push({
+                index: batches.length,
+                entries: slice,
+                csvInput: buildCsvFromEntries(slice),
+                resultLines: [],
+                pendingCsvBuffer: '',
+                appliedIds: new Set(),
+                attempts: 0
+            });
+        }
+        return batches;
+    }
+
+    function createProgressState(totalNodes, totalBatches, workerCount) {
+        return {
+            totalNodes,
+            translatedNodes: 0,
+            totalBatches,
+            finishedBatches: 0,
+            failedBatches: 0,
+            runningBatches: 0,
+            workerCount,
+            retriedBatches: 0
+        };
+    }
+
+    function getProgressText() {
+        const progress = state.translationProgress;
+        if (!progress) return '正在翻译...';
+
+        const percent = progress.totalNodes === 0
+            ? 0
+            : Math.floor((progress.translatedNodes / progress.totalNodes) * 100);
+        const retryText = progress.retriedBatches > 0 ? ` | 重试 ${progress.retriedBatches}` : '';
+        const failureText = progress.failedBatches > 0 ? ` | 失败 ${progress.failedBatches}` : '';
+
+        return `翻译中 ${progress.translatedNodes}/${progress.totalNodes} (${percent}%) | 批次 ${progress.finishedBatches}/${progress.totalBatches} | 活动 ${progress.runningBatches}/${progress.workerCount}${retryText}${failureText}`;
+    }
+
+    function refreshProgressToast(force = false) {
+        if (!state.currentToastId || !state.translationProgress) return;
+
+        const now = Date.now();
+        if (!force && now - state.lastProgressUpdateAt < 120) return;
+
+        state.lastProgressUpdateAt = now;
+        state.currentToastId = updateToast(state.currentToastId, getProgressText(), 'loading');
+    }
+
     // ================= Initialization =================
 
     /**
@@ -504,54 +593,96 @@
 
     // ================= CSV Processing =================
 
-    // Generate CSV and node mapping
-    function generateCsvAndMap(nodes) {
+    // Generate translation entries and node mapping
+    function generateTranslationEntries(nodes) {
         state.textNodeMap.clear();
-        let csv = "id,text\n";
         const tagCounters = {};
 
-        nodes.forEach((node, index) => {
+        return nodes.map((node, index) => {
             const tag = node.parentElement.tagName.toUpperCase();
             if (!tagCounters[tag]) tagCounters[tag] = 0;
+
             const id = `${tag}_${tagCounters[tag]++}_${index}`;
-            
             state.textNodeMap.set(id, node);
-            
-            // CSV escape: double quotes and newlines
-            const safeText = node.nodeValue.replace(/"/g, '""').replace(/[\r\n]+/g, ' ');
-            csv += `${id},"${safeText}"\n`;
+
+            return {
+                id,
+                node,
+                text: node.nodeValue.replace(/"/g, '""').replace(/[\r\n]+/g, ' ')
+            };
         });
-        return csv;
     }
 
-    // Apply CSV translation results to DOM
+    function buildCsvFromEntries(entries) {
+        return entries.map(entry => `${entry.id},"${entry.text}"`).join('\n');
+    }
+
+    function parseCsvTranslationLine(rawLine) {
+        const line = rawLine.trim();
+        if (!line || /^```(?:csv)?\s*$/i.test(line) || /^id\s*,/i.test(line)) {
+            return null;
+        }
+
+        const match = line.match(/^([^,]+),"(.*)"$/);
+        if (!match) return null;
+
+        return {
+            line,
+            id: match[1],
+            text: match[2].replace(/""/g, '"')
+        };
+    }
+
+    function applyPreparedTranslation(preparedLine) {
+        const node = state.textNodeMap.get(preparedLine.id);
+        if (!node) return 0;
+
+        if (!state.originalTexts.has(node)) {
+            state.originalTexts.set(node, node.nodeValue);
+        }
+
+        node.nodeValue = preparedLine.text;
+        state.isTranslated = true;
+        return 1;
+    }
+
+    function applyCsvTranslationLine(rawLine) {
+        const preparedLine = parseCsvTranslationLine(rawLine);
+        if (!preparedLine) return 0;
+        return applyPreparedTranslation(preparedLine);
+    }
+
     function applyCsvTranslation(csvText) {
-        const regex = /^([^,]+),"(.*)"$/;
-        const lines = csvText.split('\n');
         let count = 0;
+        csvText.split('\n').forEach(line => {
+            count += applyCsvTranslationLine(line);
+        });
+        return count;
+    }
+
+    function flushBatchCsvBuffer(batch, force = false) {
+        const segments = batch.pendingCsvBuffer.replace(/\r/g, '').split('\n');
+        const lines = force ? segments : segments.slice(0, -1);
+        batch.pendingCsvBuffer = force ? '' : (segments[segments.length - 1] || '');
+
+        let appliedCount = 0;
 
         lines.forEach(line => {
-            line = line.trim();
-            if (!line) return;
-            
-            const match = line.match(regex);
-            if (match) {
-                const id = match[1];
-                const text = match[2].replace(/""/g, '"');
-                
-                const node = state.textNodeMap.get(id);
-                if (node) {
-                    // Save original text if not already saved
-                    if (!state.originalTexts.has(node)) {
-                        state.originalTexts.set(node, node.nodeValue);
-                    }
-                    node.nodeValue = text;
-                    count++;
-                }
-            }
+            const preparedLine = parseCsvTranslationLine(line);
+            if (!preparedLine || batch.appliedIds.has(preparedLine.id)) return;
+
+            batch.appliedIds.add(preparedLine.id);
+            batch.resultLines.push(preparedLine.line);
+            appliedCount += applyPreparedTranslation(preparedLine);
         });
-        state.isTranslated = true;
-        return count;
+
+        return appliedCount;
+    }
+
+    function appendBatchTranslationChunk(batch, chunkText) {
+        if (!chunkText) return 0;
+        batch.pendingCsvBuffer += chunkText;
+        return flushBatchCsvBuffer(batch, false);
     }
 
     // Restore original text to DOM
@@ -561,6 +692,7 @@
             node.nodeValue = originalText;
             count++;
         });
+        state.originalTexts.clear();
         state.isTranslated = false;
         return count;
     }
@@ -585,161 +717,483 @@
             openSettings();
             return;
         }
-    
+
         state.isTranslating = true;
+        state.isTranslated = false;
+        state.originalTexts.clear();
+        state.translationProgress = null;
+        state.lastProgressUpdateAt = 0;
         state.currentToastId = showToast('正在分析页面结构...', 'loading', 0);
-    
+
         try {
             const currentUrl = window.location.href;
             const cacheEnabled = GM_getValue('gm_cache_enable', true);
             const nodes = extractTextNodes();
-            
+
             if (nodes.length === 0) throw new Error('未找到可翻译的文本');
-            
-            const csvInput = generateCsvAndMap(nodes);
-    
+
+            const entries = generateTranslationEntries(nodes);
+
             // Try cache first
             if (cacheEnabled) {
                 const cachedData = getCache(currentUrl);
                 if (cachedData) {
-                    updateToast(state.currentToastId, '正在从缓存加载...', 'loading');
+                    state.currentToastId = updateToast(state.currentToastId, '正在从缓存加载...', 'loading');
                     const count = applyCsvTranslation(cachedData);
-                    updateToast(state.currentToastId, `⚡ 缓存已加载 (${count} 个节点)`, 'success');
-                    state.isTranslating = false;
+                    state.currentToastId = updateToast(state.currentToastId, `⚡ 缓存已加载 (${count} 个节点)`, 'success');
                     return;
                 }
             }
-    
-            updateToast(state.currentToastId, `正在翻译 ${nodes.length} 个文本片段...`, 'loading');
-    
-            const model = GM_getValue('gm_model_input', '') || GM_getValue('gm_model', '');
+
+            const batchNodeCount = getClampedIntegerSetting('gm_batch_node_count', CONFIG.defaults.batchNodeCount, 1, 5000);
+            const concurrency = getClampedIntegerSetting('gm_concurrency', CONFIG.defaults.concurrency, 1, 32);
+            const batches = createTranslationBatches(entries, batchNodeCount);
+            const workerCount = Math.min(concurrency, batches.length);
+            const model = GM_getValue('gm_model_input', '').trim()
+                || GM_getValue('gm_model', '')
+                || CONFIG.platforms[platform].models[0];
             const isDebug = GM_getValue('gm_debug', false);
-    
-            if (isDebug) console.log('CSV Input:', csvInput);
-    
-            const prompt = `You are a CSV translator.
-Input format: id,"text content"
-Task: Translate "text content" to Simplified Chinese.
 
-Rules:
-1. Keep the "id" exactly as is.
-2. Output a valid CSV line: id,"translated_text". Escape any double quotes in the translated text by doubling them (e.g., " becomes "").
-3. If the text is already Chinese (i.e., contains predominantly Chinese characters), keep it unchanged; do not translate.
-4. Do not translate proper nouns (names, brands, places, organizations, etc.). Keep them in their original language.
-5. For specialist/technical terms that lack a widely accepted Chinese translation, keep them in English. Only translate if a common Chinese equivalent exists.
-6. The IDs are derived from HTML tags; the text may contain HTML markup or format placeholders (e.g., {0}, %s, %1$s, etc.). Preserve all such markup and placeholders exactly as they appear. Only translate the natural language text that surrounds them.
-7. Maintain consistency in layout and word order: keep the translation as structurally close to the original as possible, without unnecessary reordering.
-
-Provide only the translated CSV line, with no additional commentary.
-`;
-
-            if (platform === 'gemini') {
-                callGeminiAPI(apiKey, model, prompt, csvInput, currentUrl, cacheEnabled, isDebug);
-            } else if (platform === 'openrouter') {
-                callOpenRouterAPI(apiKey, model, prompt, csvInput, currentUrl, cacheEnabled, isDebug);
-            }
-    
-        } catch (e) {
-            console.error(e);
-            updateToast(state.currentToastId, 'Error: ' + e.message, 'error');
-            state.isTranslating = false;
-        }
-    }
-
-    function callGeminiAPI(apiKey, model, prompt, csvInput, currentUrl, cacheEnabled, isDebug) {
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: `${CONFIG.platforms.gemini.endpoint}/${model}:generateContent`,
-            headers: {
-                "Content-Type": "application/json",
-                "x-goog-api-key": apiKey
-            },
-            data: JSON.stringify({
-                system_instruction: { parts: { text: prompt } },
-                contents: [{ parts: [{ text: csvInput }] }]
-            }),
-            onload: (res) => handleAPIResponse(res, currentUrl, cacheEnabled, isDebug, 'gemini'),
-            onerror: (err) => handleAPIError(err)
-        });
-    }
-
-    function callOpenRouterAPI(apiKey, model, prompt, csvInput, currentUrl, cacheEnabled, isDebug) {
-        const reasoningEnabled = GM_getValue('gm_reasoning_enable', true);
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: CONFIG.platforms.openrouter.endpoint,
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`
-            },
-            data: JSON.stringify({
-                model: model,
-                messages: [
-                    { role: "system", content: prompt },
-                    { role: "user", content: csvInput }
-                ],
-                reasoning: {
-                    enabled: reasoningEnabled
-                }
-            }),
-            onload: (res) => handleAPIResponse(res, currentUrl, cacheEnabled, isDebug, 'openrouter'),
-            onerror: (err) => handleAPIError(err)
-        });
-    }
-
-    function handleAPIResponse(res, currentUrl, cacheEnabled, isDebug, platform) {
-        try {
-            if (res.status !== 200) {
-                handleError(res);
-                return;
-            }
-            
-            const data = JSON.parse(res.responseText || '{}');
-            let resultCsv;
-            
-            if (platform === 'gemini') {
-                resultCsv = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            } else if (platform === 'openrouter') {
-                resultCsv = data.choices?.[0]?.message?.content;
+            if (isDebug) {
+                console.log('[Gemini Translator] Translation entries:', entries.length);
+                console.log('[Gemini Translator] Batch count:', batches.length, 'Worker count:', workerCount);
             }
 
-            if (!resultCsv) {
-                throw new Error('API 返回内容为空');
-            }
+            state.translationProgress = createProgressState(entries.length, batches.length, workerCount);
+            state.currentToastId = updateToast(
+                state.currentToastId,
+                `已拆分为 ${batches.length} 批，准备启动 ${workerCount} 个并发请求...`,
+                'loading'
+            );
+            refreshProgressToast(true);
 
-            resultCsv = resultCsv
-                .replace(/^```csv\s*/i, '')
-                .replace(/^```\s*/i, '')
-                .replace(/\s*```$/, '');
+            const resultCsv = await translateAllBatches({
+                platform,
+                apiKey,
+                model,
+                prompt: buildTranslationPrompt(),
+                batches,
+                isDebug
+            });
 
-            if (isDebug) console.log('CSV Output:', resultCsv);
-
-            const count = applyCsvTranslation(resultCsv);
-
-            if (cacheEnabled) {
+            if (cacheEnabled && resultCsv) {
                 setCache(currentUrl, resultCsv);
             }
 
-            updateToast(state.currentToastId, `✅ 翻译完成 (${count} 个节点)`, 'success');
+            state.currentToastId = updateToast(
+                state.currentToastId,
+                `✅ 翻译完成 (${state.translationProgress.translatedNodes}/${entries.length} 个节点，${batches.length} 批)`,
+                'success'
+            );
         } catch (e) {
             console.error(e);
-            updateToast(state.currentToastId, 'Error: ' + e.message, 'error');
+            const partialCount = state.originalTexts.size;
+            const partialHint = partialCount > 0 ? `；已应用 ${partialCount} 个节点，可再次翻译以还原` : '';
+            state.currentToastId = updateToast(state.currentToastId, 'Error: ' + e.message + partialHint, 'error');
         } finally {
+            state.isTranslated = state.originalTexts.size > 0;
             state.isTranslating = false;
+            state.translationProgress = null;
+            state.lastProgressUpdateAt = 0;
         }
     }
 
-    function handleAPIError(err) {
-        console.error(err);
-        updateToast(state.currentToastId, '网络错误', 'error');
-        state.isTranslating = false;
+    async function translateAllBatches({ platform, apiKey, model, prompt, batches, isDebug }) {
+        const errors = [];
+        const pendingBatchIndexes = batches.map((_, index) => index);
+        const maxBatchRetries = CONFIG.defaults.maxBatchRetries;
+
+        async function worker() {
+            while (true) {
+                const batchIndex = pendingBatchIndexes.shift();
+                if (typeof batchIndex !== 'number') return;
+
+                const batch = batches[batchIndex];
+                state.translationProgress.runningBatches++;
+                refreshProgressToast(true);
+
+                try {
+                    batch.attempts++;
+                    await translateSingleBatch({ batch, platform, apiKey, model, prompt, isDebug });
+                    state.translationProgress.finishedBatches++;
+                } catch (error) {
+                    const revertedCount = resetBatchForRetry(batch);
+                    if (revertedCount > 0) {
+                        state.translationProgress.translatedNodes = Math.max(0, state.translationProgress.translatedNodes - revertedCount);
+                    }
+
+                    if (batch.attempts <= maxBatchRetries) {
+                        state.translationProgress.retriedBatches++;
+                        pendingBatchIndexes.push(batchIndex);
+
+                        if (isDebug) {
+                            console.warn(`[Gemini Translator] Batch ${batch.index + 1} failed on attempt ${batch.attempts}, re-queued:`, error);
+                        }
+                    } else {
+                        errors.push({ batchIndex, error, attempts: batch.attempts });
+                        state.translationProgress.failedBatches++;
+
+                        if (isDebug) {
+                            console.error(`[Gemini Translator] Batch ${batch.index + 1} exhausted retries after ${batch.attempts} attempts:`, error);
+                        }
+                    }
+                } finally {
+                    state.translationProgress.runningBatches = Math.max(0, state.translationProgress.runningBatches - 1);
+                    refreshProgressToast(true);
+                }
+            }
+        }
+
+        const workers = Array.from({ length: state.translationProgress.workerCount }, () => worker());
+        await Promise.all(workers);
+
+        if (errors.length > 0) {
+            const firstError = errors[0];
+            throw new Error(`第 ${firstError.batchIndex + 1} 批在 ${firstError.attempts} 次尝试后仍然失败: ${firstError.error.message}`);
+        }
+
+        return batches
+            .map(batch => batch.resultLines.join('\n'))
+            .filter(Boolean)
+            .join('\n');
     }
 
-    function handleError(res) {
-        const err = JSON.parse(res.responseText || '{}');
-        const msg = err.error?.message || `Status ${res.status}`;
-        updateToast(state.currentToastId, 'API 请求失败: ' + msg, 'error');
-        state.isTranslating = false;
+    function resetBatchForRetry(batch) {
+        let revertedCount = 0;
+
+        batch.appliedIds.forEach(id => {
+            const node = state.textNodeMap.get(id);
+            const originalText = node ? state.originalTexts.get(node) : null;
+            if (!node || originalText == null) return;
+
+            node.nodeValue = originalText;
+            revertedCount++;
+        });
+
+        batch.pendingCsvBuffer = '';
+        batch.resultLines = [];
+        batch.appliedIds.clear();
+
+        return revertedCount;
+    }
+
+    function translateSingleBatch({ batch, platform, apiKey, model, prompt, isDebug }) {
+        return new Promise((resolve, reject) => {
+            const requestOptions = createStreamRequestOptions(platform, apiKey, model, prompt, batch.csvInput);
+            const parserState = { buffer: '' };
+            const textDecoder = new TextDecoder();
+            let processedLength = 0;
+            let settled = false;
+            let streamStarted = false;
+            let streamFinalizeTimer = null;
+
+            const finishWithError = (error) => {
+                if (settled) return;
+                if (streamFinalizeTimer) {
+                    clearTimeout(streamFinalizeTimer);
+                    streamFinalizeTimer = null;
+                }
+                settled = true;
+                reject(error instanceof Error ? error : new Error(String(error)));
+            };
+
+            const finishSuccessfully = () => {
+                if (settled) return;
+                if (streamFinalizeTimer) {
+                    clearTimeout(streamFinalizeTimer);
+                    streamFinalizeTimer = null;
+                }
+                settled = true;
+                resolve();
+            };
+
+            const finalizeBatch = () => {
+                const trailingCount = flushBatchCsvBuffer(batch, true);
+                if (trailingCount > 0) {
+                    state.translationProgress.translatedNodes += trailingCount;
+                    refreshProgressToast(true);
+                }
+
+                if (batch.appliedIds.size !== batch.entries.length) {
+                    throw new Error(`返回 ${batch.appliedIds.size}/${batch.entries.length} 条结果`);
+                }
+
+                if (isDebug) {
+                    console.log(`[Gemini Translator] Batch ${batch.index + 1} output:`, batch.resultLines.join('\n'));
+                }
+            };
+
+            const handlePayload = (payload) => {
+                const chunkText = extractStreamTextFromPayload(payload, platform);
+                const appliedCount = appendBatchTranslationChunk(batch, chunkText);
+                if (appliedCount > 0) {
+                    state.translationProgress.translatedNodes += appliedCount;
+                    refreshProgressToast();
+                }
+            };
+
+            const processIncomingText = (responseBody, force = false) => {
+                if (!responseBody) return;
+                if (responseBody.length < processedLength) {
+                    processedLength = 0;
+                }
+
+                const delta = responseBody.slice(processedLength);
+                processedLength = responseBody.length;
+
+                if (delta) {
+                    consumeSSEPayload(delta, parserState, handlePayload);
+                }
+
+                if (force) {
+                    flushSSEBuffer(parserState, handlePayload);
+                }
+            };
+
+            const processIncomingChunk = (chunk, force = false) => {
+                if (chunk == null) {
+                    if (force) {
+                        flushSSEBuffer(parserState, handlePayload);
+                    }
+                    return;
+                }
+
+                if (typeof chunk === 'string') {
+                    consumeSSEPayload(chunk, parserState, handlePayload);
+                } else {
+                    consumeSSEPayload(textDecoder.decode(chunk, { stream: !force }), parserState, handlePayload);
+                }
+
+                if (force) {
+                    flushSSEBuffer(parserState, handlePayload);
+                }
+            };
+
+            const consumeReadableStream = async (stream) => {
+                if (!stream) {
+                    throw new Error('Tampermonkey 未提供流对象');
+                }
+
+                if (typeof stream.getReader === 'function') {
+                    const reader = stream.getReader();
+                    try {
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            processIncomingChunk(value, false);
+                        }
+                        processIncomingChunk(null, true);
+                        return;
+                    } finally {
+                        if (typeof reader.releaseLock === 'function') {
+                            reader.releaseLock();
+                        }
+                    }
+                }
+
+                if (typeof stream.read === 'function') {
+                    while (true) {
+                        const result = await stream.read();
+                        if (!result || result.done) break;
+                        processIncomingChunk(result.value, false);
+                    }
+                    processIncomingChunk(null, true);
+                    return;
+                }
+
+                throw new Error('无法识别的流对象类型');
+            };
+
+            const finalizeFromLoadFallback = (res) => {
+                if (settled) return;
+
+                try {
+                    const fallbackText = res.responseText || (typeof res.response === 'string' ? res.response : '');
+                    if (fallbackText) {
+                        processIncomingText(fallbackText, true);
+                    } else {
+                        processIncomingChunk(null, true);
+                    }
+
+                    if (isDebug) {
+                        console.log(`[Gemini Translator] Batch ${batch.index + 1} finalized from onload fallback.`);
+                    }
+
+                    finalizeBatch();
+                    finishSuccessfully();
+                } catch (error) {
+                    finishWithError(error);
+                }
+            };
+
+            GM_xmlhttpRequest({
+                ...requestOptions,
+                onloadstart: (res) => {
+                    if (settled || !res?.response) return;
+
+                    streamStarted = true;
+                    (async () => {
+                        try {
+                            if (isHttpErrorStatus(res.status)) {
+                                throw new Error(getResponseErrorMessage(res));
+                            }
+
+                            await consumeReadableStream(res.response);
+                            finalizeBatch();
+                            finishSuccessfully();
+                        } catch (error) {
+                            finishWithError(error);
+                        }
+                    })();
+                },
+                onprogress: (res) => {
+                    if (settled || streamStarted) return;
+                    try {
+                        processIncomingText(res.responseText || res.response || '', false);
+                    } catch (error) {
+                        finishWithError(error);
+                    }
+                },
+                onload: (res) => {
+                    if (settled) return;
+
+                    try {
+                        if (isHttpErrorStatus(res.status)) {
+                            throw new Error(getResponseErrorMessage(res));
+                        }
+
+                        if (streamStarted) {
+                            if (streamFinalizeTimer) {
+                                clearTimeout(streamFinalizeTimer);
+                            }
+                            streamFinalizeTimer = setTimeout(() => finalizeFromLoadFallback(res), 150);
+                            return;
+                        }
+
+                        processIncomingText(res.responseText || res.response || '', true);
+                        finalizeBatch();
+                        finishSuccessfully();
+                    } catch (error) {
+                        finishWithError(error);
+                    }
+                },
+                onerror: (err) => finishWithError(new Error(getNetworkErrorMessage(err)))
+            });
+        });
+    }
+
+    function createStreamRequestOptions(platform, apiKey, model, prompt, csvInput) {
+        if (platform === 'gemini') {
+            return {
+                method: 'POST',
+                url: `${CONFIG.platforms.gemini.endpoint}/${model}:streamGenerateContent?alt=sse`,
+                responseType: 'stream',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': apiKey
+                },
+                data: JSON.stringify({
+                    system_instruction: { parts: [{ text: prompt }] },
+                    contents: [{ parts: [{ text: csvInput }] }]
+                })
+            };
+        }
+
+        const reasoningEnabled = GM_getValue('gm_reasoning_enable', true);
+        return {
+            method: 'POST',
+            url: CONFIG.platforms.openrouter.endpoint,
+            responseType: 'stream',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            },
+            data: JSON.stringify({
+                model,
+                messages: [
+                    { role: 'system', content: prompt },
+                    { role: 'user', content: csvInput }
+                ],
+                reasoning: {
+                    enabled: reasoningEnabled
+                },
+                stream: true
+            })
+        };
+    }
+
+    function consumeSSEPayload(chunk, parserState, onPayload) {
+        parserState.buffer += chunk.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const events = parserState.buffer.split('\n\n');
+        parserState.buffer = events.pop() || '';
+        events.forEach(event => dispatchSSEEvent(event, onPayload));
+    }
+
+    function flushSSEBuffer(parserState, onPayload) {
+        if (!parserState.buffer.trim()) {
+            parserState.buffer = '';
+            return;
+        }
+
+        dispatchSSEEvent(parserState.buffer, onPayload);
+        parserState.buffer = '';
+    }
+
+    function dispatchSSEEvent(rawEvent, onPayload) {
+        if (!rawEvent.trim()) return;
+
+        const dataLines = rawEvent
+            .split('\n')
+            .map(line => line.trimEnd())
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart());
+
+        if (dataLines.length === 0) return;
+
+        const payload = dataLines.join('\n').trim();
+        if (!payload || payload === '[DONE]') return;
+        onPayload(payload);
+    }
+
+    function extractStreamTextFromPayload(payload, platform) {
+        const data = JSON.parse(payload);
+
+        if (data.error?.message) {
+            throw new Error(data.error.message);
+        }
+
+        if (platform === 'gemini') {
+            return (data.candidates || [])
+                .flatMap(candidate => candidate.content?.parts || [])
+                .map(part => part.text || '')
+                .join('');
+        }
+
+        const hasErrorFinishReason = (data.choices || []).some(choice => choice.finish_reason === 'error');
+        if (hasErrorFinishReason) {
+            throw new Error('OpenRouter 流式响应中断');
+        }
+
+        return (data.choices || [])
+            .map(choice => choice.delta?.content || '')
+            .join('');
+    }
+
+    function getResponseErrorMessage(res) {
+        try {
+            const err = JSON.parse(res.responseText || '{}');
+            return err.error?.message || `Status ${res.status}`;
+        } catch {
+            return `Status ${res.status}`;
+        }
+    }
+
+    function isHttpErrorStatus(status) {
+        return typeof status === 'number' && status >= 400;
+    }
+
+    function getNetworkErrorMessage(err) {
+        return err?.error || err?.statusText || '网络错误';
     }
 
     // ================= UI Components =================
@@ -752,7 +1206,7 @@ Provide only the translated CSV line, with no additional commentary.
             <div id="gm-settings-overlay">
                 <div id="gm-settings-panel">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.0.1</h3>
+                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.1.0</h3>
                     </div>
                     
                     <div>
@@ -784,6 +1238,17 @@ Provide only the translated CSV line, with no additional commentary.
                          <label class="gm-checkbox-label gm-hidden" id="gm-reasoning-container">
                             <input type="checkbox" id="gm-reasoning"> 启用推理 (Reasoning)
                         </label>
+                    </div>
+
+                    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+                        <div>
+                            <label class="gm-label">批大小 (节点)</label>
+                            <input type="number" id="gm-batch-size" class="gm-input" min="1" max="5000" step="1" placeholder="500">
+                        </div>
+                        <div>
+                            <label class="gm-label">并发线程</label>
+                            <input type="number" id="gm-concurrency" class="gm-input" min="1" max="32" step="1" placeholder="8">
+                        </div>
                     </div>
 
                     <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
@@ -856,7 +1321,12 @@ Provide only the translated CSV line, with no additional commentary.
             const similarity = Number.isNaN(similarityInput)
                 ? CONFIG.defaults.urlSimilarityThreshold
                 : Math.min(Math.max(similarityInput / 100, 0), 1);
+            const batchNodeCount = readClampedIntegerFromInput('gm-batch-size', CONFIG.defaults.batchNodeCount, 1, 5000);
+            const concurrency = readClampedIntegerFromInput('gm-concurrency', CONFIG.defaults.concurrency, 1, 32);
+
             GM_setValue('gm_url_similarity_threshold', similarity);
+            GM_setValue('gm_batch_node_count', batchNodeCount);
+            GM_setValue('gm_concurrency', concurrency);
 
             GM_setValue('gm_max_cache_size', parseInt(document.getElementById('gm-max-cache-size').value));
             GM_setValue('gm_cache_ttl', parseInt(document.getElementById('gm-cache-ttl').value));
@@ -938,6 +1408,8 @@ Provide only the translated CSV line, with no additional commentary.
         document.getElementById('gm-cache').checked = GM_getValue('gm_cache_enable', true);
         document.getElementById('gm-debug').checked = GM_getValue('gm_debug', false);
         document.getElementById('gm-reasoning').checked = GM_getValue('gm_reasoning_enable', true);
+        document.getElementById('gm-batch-size').value = getClampedIntegerSetting('gm_batch_node_count', CONFIG.defaults.batchNodeCount, 1, 5000);
+        document.getElementById('gm-concurrency').value = getClampedIntegerSetting('gm_concurrency', CONFIG.defaults.concurrency, 1, 32);
         const similarity = getUrlSimilarityThreshold();
         document.getElementById('gm-url-similarity').value = Math.round(similarity * 100);
         document.getElementById('gm-max-cache-size').value = GM_getValue('gm_max_cache_size', CONFIG.defaults.maxCacheSize);
@@ -982,6 +1454,8 @@ Provide only the translated CSV line, with no additional commentary.
         if (type !== 'loading') {
             setTimeout(() => removeToast(id), 3000);
         }
+
+        return id;
     }
 
     function getToastContent(text, type) {
