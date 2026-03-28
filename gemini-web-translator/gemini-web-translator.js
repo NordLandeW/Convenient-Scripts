@@ -56,6 +56,7 @@
         },
         cachePrefix: 'gm_cache_v7_',
         cacheMetaKey: 'gm_cache_meta',
+        finishNodeId: '__FINISH__',
         defaults: {
             platform: 'gemini',
             maxCacheSize: 10 * 1024 * 1024, // 10MB
@@ -405,17 +406,18 @@ Task: Translate "text content" to Simplified Chinese.
 
 Rules:
 1. Keep each "id" exactly as-is.
-2. Output exactly one CSV line for every input line, in the same order: id,"translated_text".
-3. Escape any double quotes in the translated text by doubling them (e.g., " becomes "").
-4. If the text is already Chinese (i.e., contains predominantly Chinese characters), keep it unchanged.
-5. Do not translate proper nouns (names, brands, places, organizations, etc.). Keep them in the original language.
-6. For specialist or technical terms without a widely accepted Chinese translation, keep them in English.
+2. Output a CSV line only for nodes that actually need translation. If a node remains unchanged, do not output that node.
+3. Escape any double quotes in translated_text by doubling them (e.g., " becomes "").
+4. If the text is already Chinese (i.e., contains predominantly Chinese characters), keep it unchanged and omit that node from output.
+5. Do not translate proper nouns (names, brands, places, organizations, etc.). Keep them in the original language. If the whole node remains unchanged, omit it.
+6. For specialist or technical terms without a widely accepted Chinese translation, keep them in English. If the whole node remains unchanged, omit it.
 7. Preserve all HTML markup, placeholders, variables, and format tokens exactly as they appear.
 8. Keep sentence structure close to the original. Do not merge, split, omit, or reorder records.
 9. Never output Markdown fences, CSV headers, explanations, or blank lines.
 10. Never include newline characters inside translated_text.
+11. After all translated nodes have been output, output exactly one final line: ${CONFIG.finishNodeId},"finish".
 
-Provide only the translated CSV lines.
+Provide only the translated CSV lines plus the final finish line.
 `;
     }
 
@@ -426,11 +428,15 @@ Provide only the translated CSV lines.
             batches.push({
                 index: batches.length,
                 entries: slice,
+                entryIndexes: new Map(slice.map((entry, entryIndex) => [entry.id, entryIndex])),
                 csvInput: buildCsvFromEntries(slice),
                 resultLines: [],
                 pendingCsvBuffer: '',
                 appliedIds: new Set(),
-                attempts: 0
+                attempts: 0,
+                nextEntryIndex: 0,
+                finishReceived: false,
+                completed: false
             });
         }
         return batches;
@@ -439,7 +445,9 @@ Provide only the translated CSV lines.
     function createProgressState(totalNodes, totalBatches, workerCount) {
         return {
             totalNodes,
-            translatedNodes: 0,
+            updatedNodes: 0,
+            skippedNodes: 0,
+            completedNodes: 0,
             totalBatches,
             finishedBatches: 0,
             failedBatches: 0,
@@ -453,13 +461,14 @@ Provide only the translated CSV lines.
         const progress = state.translationProgress;
         if (!progress) return '正在翻译...';
 
+        const completedNodes = progress.updatedNodes + progress.skippedNodes;
         const percent = progress.totalNodes === 0
             ? 0
-            : Math.floor((progress.translatedNodes / progress.totalNodes) * 100);
+            : Math.floor((completedNodes / progress.totalNodes) * 100);
         const retryText = progress.retriedBatches > 0 ? ` | 重试 ${progress.retriedBatches}` : '';
         const failureText = progress.failedBatches > 0 ? ` | 失败 ${progress.failedBatches}` : '';
 
-        return `翻译中 ${progress.translatedNodes}/${progress.totalNodes} (${percent}%) | 批次 ${progress.finishedBatches}/${progress.totalBatches} | 活动 ${progress.runningBatches}/${progress.workerCount}${retryText}${failureText}`;
+        return `翻译中 ${completedNodes}/${progress.totalNodes} (${percent}%) | 已更新 ${progress.updatedNodes} | 已跳过 ${progress.skippedNodes} | 批次 ${progress.finishedBatches}/${progress.totalBatches} | 活动 ${progress.runningBatches}/${progress.workerCount}${retryText}${failureText}`;
     }
 
     function refreshProgressToast(force = false) {
@@ -626,7 +635,17 @@ Provide only the translated CSV lines.
         const match = line.match(/^([^,]+),"(.*)"$/);
         if (!match) return null;
 
+        if (match[1] === CONFIG.finishNodeId) {
+            return {
+                type: 'finish',
+                line,
+                id: match[1],
+                text: match[2]
+            };
+        }
+
         return {
+            type: 'translation',
             line,
             id: match[1],
             text: match[2].replace(/""/g, '"')
@@ -648,7 +667,7 @@ Provide only the translated CSV lines.
 
     function applyCsvTranslationLine(rawLine) {
         const preparedLine = parseCsvTranslationLine(rawLine);
-        if (!preparedLine) return 0;
+        if (!preparedLine || preparedLine.type !== 'translation') return 0;
         return applyPreparedTranslation(preparedLine);
     }
 
@@ -660,27 +679,50 @@ Provide only the translated CSV lines.
         return count;
     }
 
+    function getBatchSkippedCount(batch) {
+        return Math.max(0, batch.nextEntryIndex - batch.appliedIds.size);
+    }
+
     function flushBatchCsvBuffer(batch, force = false) {
         const segments = batch.pendingCsvBuffer.replace(/\r/g, '').split('\n');
         const lines = force ? segments : segments.slice(0, -1);
         batch.pendingCsvBuffer = force ? '' : (segments[segments.length - 1] || '');
 
         let appliedCount = 0;
+        let skippedCount = 0;
 
         lines.forEach(line => {
             const preparedLine = parseCsvTranslationLine(line);
-            if (!preparedLine || batch.appliedIds.has(preparedLine.id)) return;
+            if (!preparedLine) return;
+
+            if (preparedLine.type === 'finish') {
+                if (batch.nextEntryIndex < batch.entries.length) {
+                    skippedCount += batch.entries.length - batch.nextEntryIndex;
+                    batch.nextEntryIndex = batch.entries.length;
+                }
+                batch.finishReceived = true;
+                batch.resultLines.push(preparedLine.line);
+                return;
+            }
+
+            if (batch.appliedIds.has(preparedLine.id)) return;
+
+            const entryIndex = batch.entryIndexes.get(preparedLine.id);
+            if (typeof entryIndex === 'number' && entryIndex >= batch.nextEntryIndex) {
+                skippedCount += entryIndex - batch.nextEntryIndex;
+                batch.nextEntryIndex = entryIndex + 1;
+            }
 
             batch.appliedIds.add(preparedLine.id);
             batch.resultLines.push(preparedLine.line);
             appliedCount += applyPreparedTranslation(preparedLine);
         });
 
-        return appliedCount;
+        return { appliedCount, skippedCount };
     }
 
     function appendBatchTranslationChunk(batch, chunkText) {
-        if (!chunkText) return 0;
+        if (!chunkText) return { appliedCount: 0, skippedCount: 0 };
         batch.pendingCsvBuffer += chunkText;
         return flushBatchCsvBuffer(batch, false);
     }
@@ -782,7 +824,7 @@ Provide only the translated CSV lines.
 
             state.currentToastId = updateToast(
                 state.currentToastId,
-                `✅ 翻译完成 (${state.translationProgress.translatedNodes}/${entries.length} 个节点，${batches.length} 批)`,
+                `✅ 翻译完成 (完成 ${state.translationProgress.completedNodes}/${entries.length} 个节点，更新 ${state.translationProgress.updatedNodes} 个节点，跳过 ${state.translationProgress.skippedNodes} 个节点，${batches.length} 批)`,
                 'success'
             );
         } catch (e) {
@@ -815,11 +857,14 @@ Provide only the translated CSV lines.
                 try {
                     batch.attempts++;
                     await translateSingleBatch({ batch, platform, apiKey, model, prompt, isDebug });
-                    state.translationProgress.finishedBatches++;
                 } catch (error) {
+                    const skippedCount = getBatchSkippedCount(batch);
                     const revertedCount = resetBatchForRetry(batch);
                     if (revertedCount > 0) {
-                        state.translationProgress.translatedNodes = Math.max(0, state.translationProgress.translatedNodes - revertedCount);
+                        state.translationProgress.updatedNodes = Math.max(0, state.translationProgress.updatedNodes - revertedCount);
+                    }
+                    if (skippedCount > 0) {
+                        state.translationProgress.skippedNodes = Math.max(0, state.translationProgress.skippedNodes - skippedCount);
                     }
 
                     if (batch.attempts <= maxBatchRetries) {
@@ -873,6 +918,9 @@ Provide only the translated CSV lines.
         batch.pendingCsvBuffer = '';
         batch.resultLines = [];
         batch.appliedIds.clear();
+        batch.nextEntryIndex = 0;
+        batch.finishReceived = false;
+        batch.completed = false;
 
         return revertedCount;
     }
@@ -908,14 +956,25 @@ Provide only the translated CSV lines.
             };
 
             const finalizeBatch = () => {
-                const trailingCount = flushBatchCsvBuffer(batch, true);
-                if (trailingCount > 0) {
-                    state.translationProgress.translatedNodes += trailingCount;
+                const { appliedCount, skippedCount } = flushBatchCsvBuffer(batch, true);
+                if (appliedCount > 0) {
+                    state.translationProgress.updatedNodes += appliedCount;
+                }
+                if (skippedCount > 0) {
+                    state.translationProgress.skippedNodes += skippedCount;
+                }
+                if (appliedCount > 0 || skippedCount > 0) {
                     refreshProgressToast(true);
                 }
 
-                if (batch.appliedIds.size !== batch.entries.length) {
-                    throw new Error(`返回 ${batch.appliedIds.size}/${batch.entries.length} 条结果`);
+                if (!batch.finishReceived) {
+                    throw new Error('流式响应未输出 finish 结点');
+                }
+
+                if (!batch.completed) {
+                    batch.completed = true;
+                    state.translationProgress.completedNodes += batch.entries.length;
+                    state.translationProgress.finishedBatches++;
                 }
 
                 if (isDebug) {
@@ -925,9 +984,14 @@ Provide only the translated CSV lines.
 
             const handlePayload = (payload) => {
                 const chunkText = extractStreamTextFromPayload(payload, platform);
-                const appliedCount = appendBatchTranslationChunk(batch, chunkText);
+                const { appliedCount, skippedCount } = appendBatchTranslationChunk(batch, chunkText);
                 if (appliedCount > 0) {
-                    state.translationProgress.translatedNodes += appliedCount;
+                    state.translationProgress.updatedNodes += appliedCount;
+                }
+                if (skippedCount > 0) {
+                    state.translationProgress.skippedNodes += skippedCount;
+                }
+                if (appliedCount > 0 || skippedCount > 0) {
                     refreshProgressToast();
                 }
             };
