@@ -45,3 +45,8 @@
   * 即修复 Gemini 网页端引入的一个“bug”。
 * nautilus
   * 有关 nautilus 的各类脚本。
+* pixiv-dl
+  * 通过 aria2c RPC 批量下载 pixiv 图片。
+  * 从 CSV 导出文件中读取 `original` (URL) 和 `fileName` (保存路径) 列。
+  * 自动跳过已下载的文件，支持重复运行。
+  * 无外部依赖。
