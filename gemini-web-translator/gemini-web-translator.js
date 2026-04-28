@@ -573,7 +573,7 @@ Provide only the translated CSV lines plus the final finish line.
                     }
 
                     // Skip no-translate elements
-                    if (parent.closest('[translate="no"], .notranslate')) {
+                    if (parent.closest('[translate="no"], .notranslate, gm-translator, qr-scanner-ui, #gm-translator-container')) {
                         return NodeFilter.FILTER_REJECT;
                     }
 

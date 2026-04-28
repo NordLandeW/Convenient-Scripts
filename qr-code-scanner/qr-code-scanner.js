@@ -807,10 +807,10 @@
 
         bindEvents() {
             document.addEventListener('click', (e) => {
-                if (this.resultModal.classList.contains('active') && !this.resultModal.contains(e.target)) {
+                if (this.resultModal?.classList.contains('active') && !this.resultModal.contains(e.target)) {
                     this.closeModal(this.resultModal);
                 }
-                if (this.settingsModal.classList.contains('active') && !this.settingsModal.contains(e.target)) {
+                if (this.settingsModal?.classList.contains('active') && !this.settingsModal.contains(e.target)) {
                     this.closeModal(this.settingsModal);
                 }
             });
@@ -843,9 +843,9 @@
                     } else {
                         this.btn.classList.add('visible');
                     }
-                } else if (this.isUIInitialized && this.btn.contains(target)) {
+                } else if (this.isUIInitialized && this.btn?.contains(target)) {
                     clearTimeout(this.hideTimer);
-                } else {
+                } else if (this.isUIInitialized) {
                     this.startHideTimer();
                 }
             }, true);
@@ -915,6 +915,7 @@
         },
 
         showButtonOn(img) {
+            if (!this.btn) return;
             const rect = img.getBoundingClientRect();
             const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
             const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
@@ -924,9 +925,10 @@
         },
 
         startHideTimer() {
-            if (this.isHoveringButton) return;
+            if (this.isHoveringButton || !this.btn) return;
             clearTimeout(this.hideTimer);
             this.hideTimer = setTimeout(() => {
+                if (!this.btn) return;
                 this.btn.classList.remove('visible');
                 this.currentImg = null;
             }, 200);
