@@ -41,7 +41,7 @@
                     'gemini-2.5-pro',
                     'gemini-3.1-pro-preview',
                     'gemini-3-flash-preview',
-                    'gemini-3.1-flash-lite-preview',
+                    'gemini-3.1-flash-lite',
                 ]
             },
             openrouter: {
@@ -50,7 +50,7 @@
                 models: [
                     'google/gemini-2.5-pro',
                     'google/gemini-3-flash-preview',
-                    'google/gemini-3.1-flash-lite-preview',
+                    'google/gemini-3.1-flash-lite',
                 ]
             }
         },
