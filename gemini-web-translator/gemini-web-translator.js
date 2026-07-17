@@ -40,7 +40,7 @@
                 models: [
                     'gemini-2.5-pro',
                     'gemini-3.1-pro-preview',
-                    'gemini-3-flash-preview',
+                    'gemini-3.5-flash',
                     'gemini-3.1-flash-lite',
                 ]
             },
@@ -49,8 +49,10 @@
                 endpoint: 'https://openrouter.ai/api/v1/chat/completions',
                 models: [
                     'google/gemini-2.5-pro',
-                    'google/gemini-3-flash-preview',
+                    'google/gemini-3.5-flash',
                     'google/gemini-3.1-flash-lite',
+                    'deepseek/deepseek-v4-flash',
+                    'deepseek/deepseek-v4-pro',
                 ]
             }
         },
