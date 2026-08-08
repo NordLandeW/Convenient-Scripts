@@ -841,13 +841,6 @@ def main(args):
 
     try:
         if len(files_to_process) > 0:
-            console.print(
-                "[cyan][b]要为每个压缩包单独建立一个文件夹吗？[Y/n]：", end=""
-            )
-            question = input()
-            if question.lower() == "n":
-                print_info("将所有压缩包内的文件都解压到当前文件夹下喵❤")
-                extract_to_base_folder = True
             while True:
                 current_batch = files_to_process[:]
                 files_to_process = []
