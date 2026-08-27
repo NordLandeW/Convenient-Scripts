@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import sys
 
@@ -47,7 +48,10 @@ def move_temp_folders_to_recycle_bin(current_directory):
         item
         for item in items
         if os.path.isdir(os.path.join(current_directory, item))
-        and item.startswith("temp_extract")
+        and (
+            item == "temp_extract"
+            or re.fullmatch(r"temp_extract~\d+", item, re.IGNORECASE)
+        )
     ]
     if len(temp_folders) == 0:
         return False

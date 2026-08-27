@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import threading
 
@@ -24,6 +25,23 @@ def print_success(message):
 
 def print_warning(message):
     console.out(message, style="bold yellow underline")
+
+
+def _clear_directory(path):
+    """清空目录内容但保留目录本身，用于清理失败尝试留下的部分解压产物喵。"""
+    try:
+        entries = os.listdir(path)
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        entry_path = os.path.join(path, entry)
+        try:
+            if os.path.isdir(entry_path):
+                shutil.rmtree(entry_path)
+            else:
+                os.remove(entry_path)
+        except OSError:
+            pass
 
 
 def get_total_split_size(file_path: str) -> int:
@@ -65,6 +83,8 @@ def get_total_split_size(file_path: str) -> int:
 
 def extract_with_7zip(file_path, extract_to, password: str = None):
     """Extracts archive using 7-Zip with real-time progress reporting."""
+    # 每次尝试前清空目标目录，避免上一次错误密码的部分解压产物混入喵
+    _clear_directory(extract_to)
     command = ["7z", "x", file_path, f"-o{extract_to}", "-y", "-bsp1", "-bb3", "-sccUTF-8"]
     if password:
         command.extend(["-p" + password])
@@ -122,16 +142,20 @@ def extract_with_7zip(file_path, extract_to, password: str = None):
             err_log += err_line + "\n"
             # print_error(f"\n{err_line}\n")
             if err_line:
-                process.terminate()
-                # 检查错误信息
-                if "wrong password" in err_line.lower():
+                lowered = err_line.lower()
+                # 仅在确认为错误时才终止 7z，警告类输出只记录不误杀喵
+                if "wrong password" in lowered or "密码错误" in lowered:
                     result = -1
+                    process.terminate()
                     break
-                elif "cannot open" in err_line.lower():
+                if "cannot open" in lowered or "系统找不到" in lowered:
                     result = -2
+                    process.terminate()
                     break
-                else:
+                if "error" in lowered or "错误" in lowered:
                     result = -3
+                    process.terminate()
+                    break
 
     # 实时输出进度
     with Progress(
@@ -185,6 +209,8 @@ def extract_with_bandizip(file_path, extract_to, password=None):
     Returns:
         int: 1 for success, -1 for wrong password, -2 for invalid file, -3 for other errors.
     """
+    # 每次尝试前清空目标目录，避免上一次错误密码的部分解压产物混入喵
+    _clear_directory(extract_to)
     # 构建命令，避免在参数内使用引号，让subprocess处理路径
     command = ["bz", "x", f"-o:{extract_to}", "-aoa", "-y"]
     if password:
