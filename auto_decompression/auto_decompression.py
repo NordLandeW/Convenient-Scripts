@@ -514,13 +514,9 @@ def recursive_extract(
     last_compressed_file_name = get_archive_base_name(file_path)
 
     passwords = sorted(pwdDictionary.items(), key=lambda item: item[1], reverse=True)
-    if last_success_password is not None:
-        password = last_success_password
-    elif passwords:
-        password = passwords[0][0]
-    else:
-        # 密码本为空：不预设密码，让 7-Zip 按未加密尝试喵
-        password = None
+    password = (
+        last_success_password if last_success_password is not None else passwords[0][0]
+    )
 
     while True:
         tryResult = extract_with_7zip(file_path, temp_folder, password)
@@ -778,43 +774,29 @@ class FileManager:
     def __init__(self, queue_path, lock_path):
         self.queue_path = queue_path
         self.lock_path = lock_path
-        self.manager = Manager()
-        self.files_to_process = self.manager.list()
+        manager = Manager()
+        self.files_to_process = manager.list()
         self.process = Process(target=self.queue_listener)
-        self.process.daemon = True
         self.process.start()
 
     def queue_listener(self):
         while True:
-            try:
-                lock = FileLock(self.lock_path)
-                if os.path.exists(self.queue_path):
-                    with lock.acquire(timeout=0):
-                        with open(self.queue_path, "r", encoding="utf-8") as f:
-                            lines = f.readlines()
-                        if lines:
-                            os.remove(self.queue_path)
-                            for line in lines:
-                                self.files_to_process.append(line.strip())
-            except Timeout:
-                # 写入方正在持锁追加任务，跳过本轮下次再取，监听进程不再崩溃喵
-                pass
+            lock = FileLock(self.lock_path)
+            if os.path.exists(self.queue_path):
+                with lock.acquire(timeout=0):
+                    with open(self.queue_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    if lines:
+                        os.remove(self.queue_path)
+                        for line in lines:
+                            self.files_to_process.append(line.strip())
             time.sleep(0.1)
 
     def stop(self):
-        if self.process.is_alive():
-            self.process.terminate()
-        self.process.join(timeout=1)
-        try:
-            self.manager.shutdown()
-        except Exception:
-            pass
+        self.process.terminate()
 
     def __del__(self):
-        try:
-            self.stop()
-        except Exception:
-            pass
+        self.stop()
 
 
 def main(args):
