@@ -76,8 +76,10 @@ def parse_cli_arguments(argv):
 def _run_primary(args, password_book, queue):
     password_book.ensure_gist_config()
     if args.update_dict:
+        # This is a pull-only command. A failed pull has not loaded the local
+        # book, so exit must not upload the empty in-memory dictionary either.
+        password_book.skip_gist_sync = True
         if password_book.pull_from_gist_if_possible():
-            password_book.skip_gist_sync = True
             return 0
         print_error("强制拉取密码本失败喵。")
         return 1

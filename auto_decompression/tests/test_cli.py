@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stdout
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -133,6 +134,56 @@ class ImportAndHelpTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for option in ("--embedded-scan-depth", "--flatten-single-file", "--trash-on-success", "--config-dir", "--show-paths", "--update-dict", "--check-dict-conflict-on-startup", "--use-binwalk"):
             self.assertIn(option, result.stdout)
+
+
+class DictionaryUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(redirect_stdout(io.StringIO()))
+        self.temp = tempfile.TemporaryDirectory(prefix="autodec-update-")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.config = root / "config"
+        self.data = root / "data"
+        self.config.mkdir()
+        self.data.mkdir()
+        self.local = self.data / "dict.json"
+        self.original_bytes = b'{ "valuable-local-password": 9 }\n'
+        self.local.write_bytes(self.original_bytes)
+        (self.config / "gist_config.json").write_text(json.dumps({
+            "token": "fixture-token", "gist_id": "fixture-id", "file": "dict.json"
+        }), encoding="utf-8")
+        self.enterContext(patch.object(cli, "PlatformDirs", return_value=SimpleNamespace(
+            user_config_dir=str(self.config), user_data_dir=str(self.data)
+        )))
+        self.enterContext(patch.object(cli.time, "sleep"))
+        self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("unexpected network request")))
+        self.report = self.enterContext(patch.object(cli, "error_end"))
+        self.fetch = self.enterContext(patch.object(cli.PasswordBook, "_fetch_from_gist"))
+        self.upload = self.enterContext(patch.object(cli.PasswordBook, "_update_gist", return_value=True))
+
+    def test_failed_pull_keeps_local_bytes_and_never_uploads(self):
+        self.fetch.return_value = (None, None)
+        self.assertEqual(cli.main(["--update-dict"]), 1)
+        self.assertEqual(self.local.read_bytes(), self.original_bytes)
+        self.upload.assert_not_called()
+        self.fetch.assert_called_once()
+        self.report.assert_not_called()
+
+    def test_pull_parse_exception_also_never_uploads(self):
+        self.fetch.return_value = ({"remote": 4}, "invalid-timestamp")
+        self.assertEqual(cli.main(["--update-dict"]), 1)
+        self.assertEqual(self.local.read_bytes(), self.original_bytes)
+        self.upload.assert_not_called()
+        self.fetch.assert_called_once()
+        self.report.assert_called_once()
+
+    def test_successful_pull_replaces_local_dictionary_without_uploading(self):
+        self.fetch.return_value = ({"remote": 4}, "2026-01-01T00:00:00Z")
+        self.assertEqual(cli.main(["--update-dict"]), 0)
+        self.assertEqual(json.loads(self.local.read_text(encoding="utf-8")), {"remote": 4})
+        self.upload.assert_not_called()
+        self.fetch.assert_called_once()
+        self.report.assert_not_called()
 
 
 if __name__ == "__main__":
