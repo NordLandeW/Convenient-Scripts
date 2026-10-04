@@ -1,227 +1,20 @@
-import json
-import subprocess
+"""Command-line entry for single-chain archive unwrapping."""
+
+import argparse
 import os
 import sys
-import shutil
-import traceback
-import argparse
-import extract_hidden_zip as hiddenZip
-import send2trash
-from rich.console import Console
-from rich.progress import Progress
-import rich.progress
-import requests
-from platformdirs import PlatformDirs
-import datetime as _dt
-import atexit
 import time
-from extraction import (
-    extract_with_7zip,
-    handle_bandizip_extraction,
-    manual_password_entry,
-    try_passwords,
-)
-from housekeeping import (
-    RECOVER_SUFFIX,
-    _RECYCLED_RESERVED_PATHS,
-    _ensure_directory,
-    _is_reserved_path,
-    _normalize_path_for_compare,
-    _pick_unique_name,
-    create_unique_directory,
-    detect_single_same_named_file,
-    move_file_with_unique_suffix,
-    move_path_with_collision_handling,
-    move_temp_folders_to_recycle_bin,
-    print_error,
-    print_info,
-    print_success,
-    print_warning,
-    remove_autodec_files,
-    should_flatten_prefixed_files,
-)
-from structure import (
-    filter_non_primary_split_inputs,
-    get_archive_base_name,
-    group_archive_files,
-    is_likely_archive_filename,
-    list_related_archive_parts,
-)
+import traceback
 
+from platformdirs import PlatformDirs
+
+from console import console, print_error, print_info, print_warning
+from housekeeping import _ensure_directory
+from instance_queue import InstanceQueue
+from passwords import PasswordBook
+from workflow import DEFAULT_EMBEDDED_SCAN_MAX_LEVEL, ExtractionWorkflow
 
 __version__ = "1.2.1"
-console = Console()
-_dirs = PlatformDirs(appname="auto_decompression", appauthor="NordLandeW")
-CONFIG_DIR = _dirs.user_config_dir
-DATA_DIR = _dirs.user_data_dir
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-extract_to_base_folder = False
-auto_flatten_single_file = True
-pwdFilename = "dict.json"
-pwdDictionary = {}
-DEFAULT_EMBEDDED_SCAN_MAX_LEVEL = 2  # Max recursion depth to check for hidden embedded files
-embedded_scan_depth_setting = DEFAULT_EMBEDDED_SCAN_MAX_LEVEL
-CLI_ARGS = None
-SMALL_NON_ARCHIVE_IGNORE_THRESHOLD = 20 * 1024  # Threshold in bytes to ignore small non-archive files during recursion
-
-
-GIST_CONFIG_FILE = "gist_config.json"
-_gist_cfg = None  # {token:str, gist_id:str, file:str}
-_gist_remote_ts = None  # 上一次拉取时远程文件 updated_at（datetime）
-_skip_gist_sync = False
-
-
-def _cfg_path(fname):
-    return os.path.join(CONFIG_DIR, fname)
-
-def _load_gist_config():
-    cfg_path = _cfg_path(GIST_CONFIG_FILE)
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
-
-def _save_gist_config(cfg):
-    cfg_path = _cfg_path(GIST_CONFIG_FILE)
-    try:
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print_warning(f"保存 Gist 配置失败喵：{e}")
-
-def _gist_headers(token):
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-    }
-
-def _fetch_from_gist(cfg):
-    """
-    Fetches password dictionary from GitHub Gist.
-    
-    Returns:
-        tuple: (content_dict, updated_at_str) or (None, None) on failure.
-    """
-    try:
-        r = requests.get(
-            f"https://api.github.com/gists/{cfg['gist_id']}",
-            headers=_gist_headers(cfg['token']),
-        )
-        if r.status_code == 200:
-            gist = r.json()
-            file_info = gist["files"].get(cfg["file"])
-            if file_info and file_info.get("content") is not None:
-                # Use gist-level updated_at as individual files don't have it
-                return json.loads(file_info["content"] or "{}"), gist["updated_at"]
-    except Exception as e:
-        print_warning(f"拉取 Gist 时出错喵：{e}")
-    return None, None
-
-def _update_gist(cfg, content_str):
-    try:
-        payload = {"files": {cfg["file"]: {"content": content_str}}}
-        r = requests.patch(
-            f"https://api.github.com/gists/{cfg['gist_id']}",
-            headers=_gist_headers(cfg['token']),
-            json=payload,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print_warning(f"更新 Gist 时出错喵：{e}")
-        return False
-
-def _create_new_gist(token, file_name):
-    payload = {
-        "description": "password‑dict sync",
-        "public": False,
-        "files": {file_name: {"content": "{}"}},
-    }
-    r = requests.post("https://api.github.com/gists", headers=_gist_headers(token), json=payload)
-    if r.status_code == 201:
-        return r.json()["id"]
-    print_error(f"创建 Gist 失败喵：{r.text}")
-    sys.exit(1)
-
-def _setup_gist_interactive():
-    global pwdDictionary
-    global _gist_remote_ts
-    console.print("[cyan][b]检测到未配置 Gist，同步向导启动喵~")
-    console.print("[cyan][b]请输入 GitHub Token（需 gist 权限）喵：", end="")
-    token = input().strip()
-    console.print("[cyan][b]请输入已有 Gist ID 或直接回车自动创建喵：", end="")
-    gist_id = input().strip()
-    file_name = pwdFilename
-    
-    # 创建配置对象
-    cfg = {"token": token, "gist_id": gist_id, "file": file_name}
-    
-    # 检查是否提供了已有的 Gist ID
-    if gist_id != "":
-        # 检查本地是否有密码本
-        local_pwd_path = os.path.join(DATA_DIR, pwdFilename)
-        has_local_pwd = os.path.exists(local_pwd_path)
-        
-        # 尝试获取远程密码本信息
-        remote_dict, remote_ts_str = _fetch_from_gist(cfg)
-        
-        if remote_dict is not None:
-            # 远程 Gist 存在且可访问
-            if has_local_pwd:
-                # 本地和远程都存在，询问用户选择
-                local_mtime = _dt.datetime.fromtimestamp(os.path.getmtime(local_pwd_path), tz=_dt.timezone.utc)
-                remote_ts = _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00")) if remote_ts_str else None
-                
-                print_info(f"检测到本地密码本（最后修改时间：{local_mtime.astimezone().strftime('%Y-%m-%d %H:%M:%S')}）")
-                print_info(f"远程密码本（最后修改时间：{remote_ts.astimezone().strftime('%Y-%m-%d %H:%M:%S') if remote_ts else '未知'}）")
-                
-                console.print("[cyan][b]请选择操作：[1] 拉取远程密码本 [2] 上传本地密码本 [默认:1]：", end="")
-                choice = input().strip()
-                
-                if choice == "2":
-                    # 用户选择上传本地密码本
-                    print_info("将使用本地密码本并上传到 Gist")
-                    # 配置已创建，保存后会在退出时自动上传
-                else:
-                    # 用户选择拉取远程密码本或默认选项
-                    pwdDictionary = remote_dict
-                    _gist_remote_ts = remote_ts
-                    save_passwords()
-                    print_success("已从 Gist 拉取密码本喵！")
-            else:
-                # 本地不存在但远程存在，直接拉取
-                pwdDictionary = remote_dict
-                _gist_remote_ts = _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00")) if remote_ts_str else None
-                save_passwords()
-                print_success("已从 Gist 拉取密码本喵！")
-        else:
-            # 远程 Gist 不存在或无法访问
-            print_warning(f"无法访问指定的 Gist ID：{gist_id}，请检查 ID 是否正确或网络连接是否正常")
-            console.print("[cyan][b]是否要创建新的 Gist？[Y/n]：", end="")
-            create_new = input().strip().lower()
-            if create_new != "n":
-                gist_id = _create_new_gist(token, file_name)
-                cfg["gist_id"] = gist_id
-                print_success(f"已创建新的私密 Gist：{gist_id} 喵！")
-    else:
-        # 用户没有提供 Gist ID，创建新的
-        gist_id = _create_new_gist(token, file_name)
-        cfg["gist_id"] = gist_id
-        print_success(f"已创建新的私密 Gist：{gist_id} 喵！")
-    
-    _save_gist_config(cfg)
-    return cfg
-
-def _ensure_gist_config():
-    cfg = _load_gist_config()
-    if cfg is None:
-        cfg = _setup_gist_interactive()
-    return cfg
-
-def append_scr_path(relative_path):
-    return os.path.join(CONFIG_DIR, relative_path)
 
 
 def str2bool(value):
@@ -242,716 +35,144 @@ def parse_cli_arguments(argv):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "-e",
-        "--embedded-scan-depth",
-        type=int,
-        default=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL,
-        metavar="K",
+        "-e", "--embedded-scan-depth", type=int,
+        default=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL, metavar="K",
         help="在递归层级小于等于 K 时尝试检测及提取隐藏嵌入文件，设为 0 可禁用此功能",
     )
     parser.add_argument(
-        "--flatten-single-file",
-        type=str2bool,
-        default=True,
-        metavar="{true,false}",
+        "--flatten-single-file", type=str2bool, default=True, metavar="{true,false}",
         help="检测到仅包含与压缩包同名的单个文件时是否自动扁平化喵（默认 true）。",
     )
     parser.add_argument(
-        "--trash-on-success",
-        type=str2bool,
-        default=True,
-        metavar="{true,false}",
-        help="当（递归）解压成功时，将被解压的原始压缩文件（含分卷）移动到回收站喵（默认 true）。"
+        "--trash-on-success", type=str2bool, default=True, metavar="{true,false}",
+        help="当（递归）解压成功时，将被解压的原始压缩文件（含分卷）移动到回收站喵（默认 true）。",
     )
     parser.add_argument(
-        "--config-dir",
-        type=str,
-        default=None,
+        "--config-dir", type=str, default=None,
         help="指定配置文件（不含密码字典）的所在文件夹喵，密码字典将存放在数据目录中。",
     )
     parser.add_argument(
-        "--show-paths",
-        action="store_true",
+        "--show-paths", action="store_true",
         help="输出当前配置与数据目录的绝对路径并退出。",
     )
     parser.add_argument(
-        "--update-dict",
-        action="store_true",
+        "--update-dict", action="store_true",
         help="强制从 Gist 拉取最新的密码本并退出程序。",
     )
     parser.add_argument(
-        "--check-dict-conflict-on-startup",
-        action="store_true",
+        "--check-dict-conflict-on-startup", action="store_true",
         help="程序启动后立即检查本地密码本与 Gist 是否一致；若冲突则交互询问处理方式。",
     )
     parser.add_argument(
-        "--use-binwalk",
-        action="store_true",
+        "--use-binwalk", action="store_true",
         help="启用 binwalk 进行隐藏嵌入文件判定喵（默认关闭，使用手写签名搜索）。",
     )
     parser.add_argument(
-        "files",
-        nargs="*",
-        help="需解压的压缩文件路径，可直接拖拽物件到脚本上喵",
+        "files", nargs="*", help="需解压的压缩文件路径，可直接拖拽物件到脚本上喵",
     )
     return parser.parse_args(argv)
 
 
+def _run_primary(args, password_book, queue):
+    password_book.ensure_gist_config()
+    if args.update_dict:
+        if password_book.pull_from_gist_if_possible():
+            password_book.skip_gist_sync = True
+            return 0
+        print_error("强制拉取密码本失败喵。")
+        return 1
 
+    password_book.check_passwords()
+    if args.check_dict_conflict_on_startup:
+        password_book.check_dict_conflict_on_startup()
+    queue.start()
 
-def read_passwords():
-    global pwdDictionary
-    pwdPath = os.path.join(DATA_DIR, pwdFilename)
-    try:
-        with open(pwdPath, "r", encoding="utf-8") as file:
-            pwdDictionary = json.load(file)
-    except Exception as e:
-        print_warning(f"读取文件错误喵！错误信息：{e}")
-
-
-def save_passwords():
-    # print(str(pwdDictionary))
-    pwdPath = os.path.join(DATA_DIR, pwdFilename)
-    try:
-        with open(pwdPath, "w", encoding="utf-8") as file:
-            json.dump(pwdDictionary, file, ensure_ascii=False, indent=4)
-        # print(f"密码已成功保存到 {pwdPath} 喵～")
-    except Exception as e:
-        print_warning(f"保存密码时出错喵！请检查文件权限或路径。错误信息：{e}")
-
-
-def _pull_from_gist_if_possible():
-    """在本地文件缺失的情况下尝试从 Gist 拉取密码本，成功返回 True"""
-    global _gist_cfg, _gist_remote_ts, pwdDictionary
-    if _gist_cfg is None:
-        return False
-    remote_dict, ts = _fetch_from_gist(_gist_cfg)
-    if remote_dict is not None:
-        pwdDictionary = remote_dict
-        _gist_remote_ts = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
-        save_passwords()
-        print_success("已从 Gist 拉取密码本喵！")
-        return True
-    return False
-
-
-def check_passwords():
-    global pwdDictionary
-    pwdPath = os.path.join(DATA_DIR, pwdFilename)
-    if not os.path.exists(pwdPath):
-        _ensure_directory(DATA_DIR, "数据")
-        legacy_paths = (
-            os.path.join(CONFIG_DIR, pwdFilename),
-            os.path.join(SCRIPT_DIR, pwdFilename),
-        )
-        for legacy_path in legacy_paths:
-            if not os.path.exists(legacy_path):
-                continue
-            try:
-                with open(legacy_path, "r", encoding="utf-8") as file:
-                    legacy_data = json.load(file)
-                if not isinstance(legacy_data, dict):
-                    raise ValueError("密码本格式无效：期望 JSON 字典格式")
-                if not all(isinstance(value, int) for value in legacy_data.values()):
-                    raise ValueError("密码本格式无效：计数应为整数")
-            except Exception as e:
-                print_warning(f"旧密码本格式异常，跳过迁移喵：{e}")
-                continue
-            try:
-                shutil.copy2(legacy_path, pwdPath)
-                print_info(f"已将旧密码本迁移到新的数据目录喵：{legacy_path}")
-            except Exception as e:
-                print_warning(f"迁移旧密码本失败喵：{e}")
-            break
-    if not os.path.exists(pwdPath):
-        # 若本地缺失则优先尝试从 Gist 获取
-        if _pull_from_gist_if_possible():
-            return
-        pwdDictionary = {}
-    else:
-        read_passwords()
-
-
-def _sync_to_gist_before_exit():
-    global _gist_cfg, _gist_remote_ts, _skip_gist_sync
-    if _gist_cfg is None or getattr(sys.modules['__main__'], '_skip_gist_sync', False) or globals().get('_skip_gist_sync'):
-        return
-    pwdPath = os.path.join(DATA_DIR, pwdFilename)
-    if not os.path.exists(pwdPath):
-        return
-    local_mtime = _dt.datetime.fromtimestamp(os.path.getmtime(pwdPath), tz=_dt.timezone.utc)
-    remote_dict, remote_ts_str = _fetch_from_gist(_gist_cfg)
-    if remote_ts_str:
-        remote_ts = _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00"))
-    else:
-        remote_ts = None
-
-    if remote_ts and _gist_remote_ts and remote_ts > _gist_remote_ts and remote_ts > local_mtime:
-        print_warning("检测到远程密码本在本次会话期间发生更新，可能与本地冲突喵！")
-        print_warning(f"远程最后更新时间：{remote_ts.isoformat()} 本地最后更新时间：{local_mtime.isoformat()}")
-        # 冲突时依旧继续上传由用户自行决定，示例中选择继续
-
-    if _update_gist(_gist_cfg, json.dumps(pwdDictionary, ensure_ascii=False, indent=4)):
-        print_success("已同步密码本到 Gist 喵！")
-    else:
-        print_warning("同步到 Gist 失败喵，请稍后重试！")
-    time.sleep(1)
-
-
-def _check_dict_conflict_on_startup():
-    """启动时检查本地密码本与 Gist 是否一致，冲突时让用户选择处理方式。"""
-    global _gist_cfg, _gist_remote_ts, pwdDictionary, _skip_gist_sync
-
-    if _gist_cfg is None:
-        return
-
-    remote_dict, remote_ts_str = _fetch_from_gist(_gist_cfg)
-    if remote_dict is None:
-        print_warning("启动检查时无法拉取 Gist 密码本，已跳过冲突检查喵。")
-        return
-
-    remote_ts = (
-        _dt.datetime.fromisoformat(remote_ts_str.replace("Z", "+00:00"))
-        if remote_ts_str
-        else None
+    workflow = ExtractionWorkflow(
+        password_book,
+        embedded_scan_depth=args.embedded_scan_depth,
+        flatten_single_file=args.flatten_single_file,
+        trash_on_success=args.trash_on_success,
+        use_binwalk=args.use_binwalk,
     )
-    _gist_remote_ts = remote_ts
-
-    if remote_dict == pwdDictionary:
-        print_info("启动检查完成：本地密码本与 Gist 一致喵。")
-        return
-
-    pwd_path = os.path.join(DATA_DIR, pwdFilename)
-    local_mtime = (
-        _dt.datetime.fromtimestamp(os.path.getmtime(pwd_path), tz=_dt.timezone.utc)
-        if os.path.exists(pwd_path)
-        else None
-    )
-
-    print_warning("启动检查发现本地密码本与 Gist 不一致喵！")
-    print_info(
-        f"本地最后修改时间：{local_mtime.astimezone().strftime('%Y-%m-%d %H:%M:%S') if local_mtime else '未知'}"
-    )
-    print_info(
-        f"远程最后修改时间：{remote_ts.astimezone().strftime('%Y-%m-%d %H:%M:%S') if remote_ts else '未知'}"
-    )
-
-    while True:
-        console.print(
-            "[cyan][b]请选择冲突处理方式：[1] 拉取远程覆盖本地 [2] 上传本地覆盖远程 [3] 暂不处理且本次退出前不自动同步 [默认:1]：",
-            end="",
-        )
-        choice = input().strip()
-
-        if choice in ("", "1"):
-            pwdDictionary = remote_dict
-            save_passwords()
-            print_success("已拉取远程密码本并覆盖本地喵！")
-            return
-
-        if choice == "2":
-            if _update_gist(_gist_cfg, json.dumps(pwdDictionary, ensure_ascii=False, indent=4)):
-                refreshed_dict, refreshed_ts_str = _fetch_from_gist(_gist_cfg)
-                if refreshed_dict is not None:
-                    _gist_remote_ts = (
-                        _dt.datetime.fromisoformat(refreshed_ts_str.replace("Z", "+00:00"))
-                        if refreshed_ts_str
-                        else _gist_remote_ts
-                    )
-                print_success("已上传本地密码本到 Gist 喵！")
-            else:
-                print_warning("上传本地密码本到 Gist 失败喵，将保留本地内容继续运行。")
-            return
-
-        if choice == "3":
-            _skip_gist_sync = True
-            print_info("本次会话将跳过退出时自动同步到 Gist。")
-            return
-
-        print_warning("输入无效喵，请输入 1、2 或 3。")
-
-# 注册到 atexit，以便任何正常退出路径都会尝试同步
-atexit.register(_sync_to_gist_before_exit)
-
-def add_password(pwd, count=1):
-    if pwd == None:
-        return
-    if pwd in pwdDictionary:
-        pwdDictionary[pwd] += count
-    else:
-        pwdDictionary[pwd] = count
-
-
-import re
-import threading
-
-global_last_success_password = None
-
-
-def try_remove_directory(dir):
-    try:
-        shutil.rmtree(dir)
-    except:
-        pass
-
-def recursive_extract(
-    base_folder,
-    file_path,
-    last_success_password=None,
-    level=1,
-    embedded_scan_depth=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL,
-    source_archive_paths: set = None,
-):
-    """Recursively extracts archives, handling nested compressed files and passwords."""
-    global global_last_success_password
-    global extract_to_base_folder
-    global auto_flatten_single_file
-
-    source_archive_paths = set(source_archive_paths or [])
-
-    temp_folder = create_unique_directory(base_folder, "temp_extract")
-    orig_temp_folder = temp_folder  # 保存最初创建的临时目录路径
-    last_compressed_file_name = get_archive_base_name(file_path)
-
-    passwords = sorted(pwdDictionary.items(), key=lambda item: item[1], reverse=True)
-    password = (
-        last_success_password if last_success_password is not None else passwords[0][0]
-    )
-
-    while True:
-        tryResult = extract_with_7zip(file_path, temp_folder, password)
-        if tryResult == -1:
-            # Try dictionary passwords first (excluding current)
-            next_password = try_passwords(
-                file_path, temp_folder, passwords, password
-            )
-            # Try archive name as a password fallback
-            if next_password is None:
-                name_pwd = last_compressed_file_name
-                if name_pwd and name_pwd != password:
-                    print_info(
-                        f"Trying archive name '{name_pwd}' as password..."
-                    )
-                    if extract_with_7zip(file_path, temp_folder, name_pwd) > 0:
-                        next_password = name_pwd
-            # Request manual entry if all automated attempts fail
-            if next_password is None:
-                next_password = manual_password_entry(file_path, temp_folder, level)
-            if next_password is None:
-                print_warning(f"用户跳过了文件 {file_path} 的密码输入喵，将跳过该文件。")
-                try_remove_directory(orig_temp_folder)
-                return True
-            password = next_password
-            break
-        elif tryResult == -2:
-            # 7-Zip cannot open file; attempt alternative methods
-            if file_path.endswith(RECOVER_SUFFIX):
-                # Files extracted from hidden segments might require Bandizip
-                new_password = handle_bandizip_extraction(file_path, temp_folder, passwords, level)
-                if new_password:
-                    password = new_password # 更新当前密码
-                    break  # Bandizip成功，跳出while循环，继续后续处理
-                else:
-                    # Bandizip也失败了，这个文件没救了
-                    print_warning("Bandizip 也无法处理这个文件喵。")
-                    try_remove_directory(orig_temp_folder)
-                    return True # 结束当前分支的解压
-
-            # Search for embedded hidden archives if standard opening fails
-            found_embedded = False
-            for fmt in ["zip", "rar", "7z", "*"]:
-                if (
-                    level <= embedded_scan_depth
-                    and RECOVER_SUFFIX not in file_path
-                    and hiddenZip.has_embedded_signature(file_path, fmt)
-                ):
-                    print_info(
-                        f"Found embedded {fmt.upper() if fmt != '*' else 'file'}, extracting..."
-                    )
-                    hiddenZip.extract_embedded_file(
-                        file_path, file_path + RECOVER_SUFFIX, fmt
-                    )
-                    file_path = file_path + RECOVER_SUFFIX
-                    found_embedded = True
-                    break
-            
-            if found_embedded:
-                continue
-
-            # 如果以上所有尝试都失败了
-            try_remove_directory(orig_temp_folder)
-            return True
-        else:
-            break
-
-    global_last_success_password = password
-    add_password(password)
-
-    # Scan the temporary folder for files and group multi-volume archives
-    try:
-        grouped_files = group_archive_files(temp_folder)
-        # If the only item is a directory, go deeper.
-        while len(grouped_files) == 0 and len(os.listdir(temp_folder)) == 1:
-            only_item_name = os.listdir(temp_folder)[0]
-            deeper_folder = os.path.join(temp_folder, only_item_name)
-            if os.path.isdir(deeper_folder):
-                temp_folder = deeper_folder
-                last_compressed_file_name = os.path.basename(temp_folder)
-                grouped_files = group_archive_files(temp_folder)
-            else:
-                break  # Not a directory, stop digging
-    except FileNotFoundError:
-        # This can happen if extraction yields an empty folder that gets deleted.
-        grouped_files = []
-
-    # 在判定是否继续递归时，忽略用于混淆的小体积“非压缩文件”喵
-    filtered_grouped_files = []
-    for fname in grouped_files:
-        full_path = os.path.join(temp_folder, fname)
-        if not os.path.isfile(full_path):
-            continue
-
-        # 只对“看起来不像压缩包”的文件做体积阈值过滤
-        if not is_likely_archive_filename(fname):
-            try:
-                size = os.path.getsize(full_path)
-            except OSError:
-                size = SMALL_NON_ARCHIVE_IGNORE_THRESHOLD + 1
-
-            if size <= SMALL_NON_ARCHIVE_IGNORE_THRESHOLD:
-                # 这是一个小体积的非压缩文件，用于混淆时可以直接忽略喵
-                continue
-
-        filtered_grouped_files.append(fname)
-
-    grouped_files = filtered_grouped_files
-
-    finished = False
-    if len(grouped_files) == 1:
-        new_file_path = os.path.join(temp_folder, grouped_files[0])
-        finished = recursive_extract(
-            base_folder,
-            new_file_path,
-            password,
-            level + 1,
-            embedded_scan_depth=embedded_scan_depth,
-            source_archive_paths=source_archive_paths,
-        )
-        if not finished:
-            try:
-                os.remove(new_file_path)
-            except:
-                pass
-    else:
-        finished = True
-
-    if finished:
-        allow_replace_reserved = bool(
-            source_archive_paths
-            and CLI_ARGS is not None
-            and getattr(CLI_ARGS, "trash_on_success", False)
-        )
-
-        flattened_output_path = None
-        try:
-            temp_entries = os.listdir(temp_folder)
-        except FileNotFoundError:
-            temp_entries = []
-
-        if auto_flatten_single_file and not extract_to_base_folder and temp_entries:
-            single_file_path = detect_single_same_named_file(
-                temp_folder,
-                last_compressed_file_name,
-                entries=temp_entries,
-            )
-            if single_file_path:
-                flattened_output_path = move_file_with_unique_suffix(
-                    single_file_path,
-                    base_folder,
-                    reserved_paths=source_archive_paths,
-                    allow_replace_reserved=allow_replace_reserved,
-                )
-                print_success(
-                    f"检测到 {last_compressed_file_name}/"
-                    f"{os.path.basename(flattened_output_path)} 结构喵，"
-                    f"已直接将文件放置到目标目录：{flattened_output_path}"
-                )
-
-        if not flattened_output_path:
-            flatten_due_to_prefix = (
-                (not extract_to_base_folder)
-                and should_flatten_prefixed_files(
-                    temp_folder, temp_entries, last_compressed_file_name
-                )
-            )
-
-            if extract_to_base_folder or flatten_due_to_prefix:
-                target_folder = base_folder
-                for entry in temp_entries:
-                    move_path_with_collision_handling(
-                        os.path.join(temp_folder, entry),
-                        target_folder,
-                        reserved_paths=source_archive_paths,
-                        allow_replace_reserved=allow_replace_reserved,
-                    )
-
-                if flatten_due_to_prefix and not extract_to_base_folder:
-                    print_success(
-                        f"检测到 {last_compressed_file_name}/XY 前缀结构喵，"
-                        f"已移除 {last_compressed_file_name}/ 层级，"
-                        f"最终文件被移动到：{target_folder}"
-                    )
-                else:
-                    print_success(f"最终文件被移动到：{target_folder}")
-            else:
-                desired_target_folder = os.path.join(
-                    base_folder, last_compressed_file_name
-                )
-                needs_reserved_replacement = (
-                    allow_replace_reserved
-                    and os.path.exists(desired_target_folder)
-                    and _is_reserved_path(desired_target_folder, source_archive_paths)
-                )
-
-                if needs_reserved_replacement:
-                    target_folder = create_unique_directory(
-                        base_folder, f"{last_compressed_file_name}.AutoDecTmp"
-                    )
-                else:
-                    target_folder = create_unique_directory(
-                        base_folder, last_compressed_file_name
-                    )
-
-                for entry in temp_entries:
-                    shutil.move(os.path.join(temp_folder, entry), target_folder)
-
-                if needs_reserved_replacement:
-                    final_target_folder = target_folder
-                    try:
-                        send2trash.send2trash(desired_target_folder)
-                        os.rename(target_folder, desired_target_folder)
-                        final_target_folder = desired_target_folder
-                    except Exception:
-                        fallback_name = _pick_unique_name(
-                            base_folder, last_compressed_file_name, is_dir=True
-                        )
-                        fallback_path = os.path.join(base_folder, fallback_name)
-                        try:
-                            os.rename(target_folder, fallback_path)
-                            final_target_folder = fallback_path
-                        except Exception:
-                            final_target_folder = target_folder
-                    target_folder = final_target_folder
-
-                print_success(f"最终文件被移动到：{target_folder}")
-
-    try_remove_directory(orig_temp_folder)
-    return False
-
-
-SERVER_PORT = 65432
-
-from multiprocessing import Process, Manager
-import time
-from filelock import FileLock, Timeout
-
-# Function to send file path to the main instance
-queue_file_path = append_scr_path("queue_file.txt")
-queue_file_lock = append_scr_path("queue_file.lock")
-instance_lock = append_scr_path("instance.lock")
-
-
-def send_file_to_main_instance(file_paths):
-    print(str(file_paths))
-    lock = FileLock(queue_file_lock)
-    with lock.acquire(timeout=-1):
-        with open(queue_file_path, "a", encoding="utf-8") as f:
-            for file in file_paths:
-                f.write(file + "\n")
-
-
-class FileManager:
-    def __init__(self, queue_path, lock_path):
-        self.queue_path = queue_path
-        self.lock_path = lock_path
-        manager = Manager()
-        self.files_to_process = manager.list()
-        self.process = Process(target=self.queue_listener)
-        self.process.start()
-
-    def queue_listener(self):
-        while True:
-            lock = FileLock(self.lock_path)
-            if os.path.exists(self.queue_path):
-                with lock.acquire(timeout=0):
-                    with open(self.queue_path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                    if lines:
-                        os.remove(self.queue_path)
-                        for line in lines:
-                            self.files_to_process.append(line.strip())
-            time.sleep(0.1)
-
-    def stop(self):
-        self.process.terminate()
-
-    def __del__(self):
-        self.stop()
-
-
-def main(args):
-    global extract_to_base_folder, _gist_cfg, _gist_remote_ts, embedded_scan_depth_setting, auto_flatten_single_file, _skip_gist_sync
-
-    _gist_cfg = _ensure_gist_config()
-
-    if getattr(args, "update_dict", False):
-        if _pull_from_gist_if_possible():
-            _skip_gist_sync = True
-            import sys
-            sys.exit(0)
-        else:
-            print_error("强制拉取密码本失败喵。")
-            import sys
-            sys.exit(1)
-
-    check_passwords()
-
-    if getattr(args, "check_dict_conflict_on_startup", False):
-        _check_dict_conflict_on_startup()
-
-    manager = FileManager(queue_file_path, queue_file_lock)
-
-    embedded_scan_depth_setting = max(0, args.embedded_scan_depth)
-    auto_flatten_single_file = args.flatten_single_file
-    hiddenZip.USE_BINWALK = bool(args.use_binwalk)
-    if not auto_flatten_single_file:
+    if not args.flatten_single_file:
         print_info("已禁用同名单文件自动扁平化喵。")
-    if hiddenZip.USE_BINWALK:
+    if args.use_binwalk:
         print_info("已启用 binwalk 进行隐藏嵌入文件判定喵。")
     if args.embedded_scan_depth < 0:
         print_warning("嵌入检测层级小于 0 喵，已自动调整为 0（禁用嵌入扫描）。")
-    if embedded_scan_depth_setting == 0:
+    if workflow.embedded_scan_depth == 0:
         print_info("当前已禁用隐藏嵌入文件判定喵。")
-    elif embedded_scan_depth_setting != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
-        print_info(
-            f"隐藏嵌入文件判定最大层级已调整为 {embedded_scan_depth_setting} 层喵。"
-        )
+    elif workflow.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
+        print_info(f"隐藏嵌入文件判定最大层级已调整为 {workflow.embedded_scan_depth} 层喵。")
 
     files_to_process = list(args.files)
+    if not files_to_process:
+        print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
+        print_info("也可以输入想要添加的密码喵：")
+        while True:
+            password = input()
+            if password == "":
+                break
+            password_book.add_password(password, 0)
+            password_book.save_passwords()
+            print_info(f"已添加密码 {password} 喵！")
+        # Files submitted while entering passwords still belong to this primary.
+        files_to_process = queue.next_batch()
 
-    try:
-        if len(files_to_process) > 0:
-            while True:
-                current_batch = files_to_process[:]
-                files_to_process = []
-                current_batch = filter_non_primary_split_inputs(current_batch)
-                for file_path in current_batch:
-                    if file_path.lower().endswith(".apk"):
-                        print_info(f"跳过 .apk 文件：{file_path} 喵。")
-                        continue
-                    print_info(f"开始解压文件 {file_path} 喵❤")
-                    _RECYCLED_RESERVED_PATHS.clear()
-                    base_folder = os.path.dirname(file_path)
-                    if move_temp_folders_to_recycle_bin(base_folder):
-                        print_info(
-                            "检测到上一次非正常退出留下的临时文件夹喵！已经把它们全部移动到回收站了喵☆"
-                        )
-
-                    try:
-                        source_archive_paths = {
-                            _normalize_path_for_compare(p)
-                            for p in list_related_archive_parts(file_path)
-                        }
-                    except Exception:
-                        source_archive_paths = {_normalize_path_for_compare(file_path)}
-
-                    _ret = recursive_extract(
-                        base_folder,
-                        file_path,
-                        global_last_success_password,
-                        embedded_scan_depth=embedded_scan_depth_setting,
-                        source_archive_paths=source_archive_paths,
-                    )
-                    # 解压成功才执行回收站移动；失败（非密码错误导致）则不移动
-                    if _ret is False and hasattr(CLI_ARGS, "trash_on_success") and CLI_ARGS.trash_on_success:
-                        try:
-                            for p in list_related_archive_parts(file_path):
-                                if _normalize_path_for_compare(p) in _RECYCLED_RESERVED_PATHS:
-                                    # This path now points to extracted output after a reserved-name replacement.
-                                    continue
-                                if os.path.exists(p):
-                                    send2trash.send2trash(p)
-                                    print_info(f"已将被解压的原始压缩文件移动到回收站：{p}")
-                        except Exception as e:
-                            print_warning(f"移动原始压缩文件到回收站失败喵：{e}")
-                    remove_autodec_files(base_folder)
-                save_passwords()  # 保存到本地
-                if not manager.files_to_process:
-                    break
-                files_to_process.extend(manager.files_to_process)
-                manager.files_to_process[:] = []  # 使用切片赋值清空列表
-            print_info("解压完成，退出程序喵...")
-        else:
-            print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
-            print_info("也可以输入想要添加的密码喵：")
-            while True:
-                pwd = input()
-                if pwd != "":
-                    add_password(pwd, 0)
-                    save_passwords()
-                    print_info(f"已添加密码 {pwd} 喵！")
-                else:
-                    break
-    except Exception as e:
-        error_end(e)
+    while files_to_process:
+        workflow.process_files(files_to_process)
+        files_to_process = queue.next_batch()
+    if args.files:
+        print_info("解压完成，退出程序喵...")
+    return 0
 
 
-def error_end(e: Exception = None):
+def error_end(error=None):
     print_error(
         f"程序出现错误喵>.< 非常抱歉喵，下面是错误信息喵！\n{traceback.format_exc()}"
     )
     input()
 
 
-if __name__ == "__main__":
-    CLI_ARGS = parse_cli_arguments(sys.argv[1:])
+def main(argv=None):
+    args = parse_cli_arguments(sys.argv[1:] if argv is None else argv)
+    directories = PlatformDirs(appname="auto_decompression", appauthor="NordLandeW")
+    config_dir = (
+        os.path.abspath(args.config_dir) if args.config_dir else directories.user_config_dir
+    )
+    data_dir = directories.user_data_dir
+    _ensure_directory(config_dir, "配置")
+    _ensure_directory(data_dir, "数据")
+    if args.show_paths:
+        print_info(f"配置目录: {config_dir}")
+        print_info(f"数据目录: {data_dir}")
+        return 0
 
-    if CLI_ARGS.config_dir:
-        CONFIG_DIR = os.path.abspath(CLI_ARGS.config_dir)
-        # 更新依赖 CONFIG_DIR 的全局路径变量
-        queue_file_path = append_scr_path("queue_file.txt")
-        queue_file_lock = append_scr_path("queue_file.lock")
-        instance_lock = append_scr_path("instance.lock")
-
-    _ensure_directory(CONFIG_DIR, "配置")
-    _ensure_directory(DATA_DIR, "数据")
-
-    if CLI_ARGS.show_paths:
-        print_info(f"配置目录: {CONFIG_DIR}")
-        print_info(f"数据目录: {DATA_DIR}")
-        sys.exit(0)
-
+    book = None
     try:
-        lock = FileLock(instance_lock)
-        with lock.acquire(timeout=0):
-            try:
-                main(CLI_ARGS)
-                time.sleep(1)
-            except Exception as e:
-                error_end(e)
-    except Timeout:
-        if CLI_ARGS.files:
-            # Try to send file paths to the existing instance
-            send_file_to_main_instance(CLI_ARGS.files)
-        if CLI_ARGS.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
-            print_warning(
-                "已有实例正在运行，新的嵌入扫描层级参数未被应用喵。请先关闭原实例再重新运行。"
-            )
-        if CLI_ARGS.use_binwalk:
-            print_warning(
-                "已有实例正在运行，新的 --use-binwalk 参数未被应用喵。请先关闭原实例再重新运行。"
-            )
-        print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
-        pass
-    except Exception:
-        error_end()
+        with InstanceQueue(config_dir) as queue:
+            if not queue.claim_or_submit(args.files):
+                if args.files:
+                    print(str(args.files))
+                if args.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
+                    print_warning("已有实例正在运行，新的嵌入扫描层级参数未被应用喵。请先关闭原实例再重新运行。")
+                if args.use_binwalk:
+                    print_warning("已有实例正在运行，新的 --use-binwalk 参数未被应用喵。请先关闭原实例再重新运行。")
+                print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
+                return 0
+            book = PasswordBook(config_dir, data_dir, os.path.dirname(os.path.abspath(__file__)))
+            result = _run_primary(args, book, queue)
+        time.sleep(1)
+        return result
+    except Exception as error:
+        error_end(error)
+        return 1
+    finally:
+        # Only the primary constructs a book. Explicit finalization also makes
+        # imports and Windows multiprocessing children free of Gist exit hooks.
+        if book is not None:
+            book.sync_to_gist_before_exit()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

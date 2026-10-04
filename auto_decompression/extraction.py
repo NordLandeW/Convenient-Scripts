@@ -4,26 +4,9 @@ import subprocess
 import threading
 
 import rich.progress
-from rich.console import Console
 from rich.progress import Progress
 
-console = Console()
-
-
-def print_info(message):
-    console.out(message, style="blue")
-
-
-def print_error(message):
-    console.out(message, style="bold red")
-
-
-def print_success(message):
-    console.out(message, style="green")
-
-
-def print_warning(message):
-    console.out(message, style="bold yellow underline")
+from console import console, print_error, print_info, print_success, print_warning
 
 
 def get_total_split_size(file_path: str) -> int:
@@ -64,117 +47,131 @@ def get_total_split_size(file_path: str) -> int:
 
 
 def extract_with_7zip(file_path, extract_to, password: str = None):
-    """Extracts archive using 7-Zip with real-time progress reporting."""
+    """Extract with progress; return 1, -1 (password), -2 (not openable), or -3.
+
+    Both output pipes are drained before interpreting the exit status. A tool
+    failure must not authorize publishing partial output or recycling the source.
+    """
     command = ["7z", "x", file_path, f"-o{extract_to}", "-y", "-bsp1", "-bb3", "-sccUTF-8"]
     if password:
         command.extend(["-p" + password])
-
-    # 启动7z进程
-    # Use explicit UTF-8 encoding for stdout/stderr to avoid crashes on Windows (defaulting to GBK)
+    file_size = get_total_split_size(file_path)
     process = subprocess.Popen(
         command,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-
     task = -1
     last_percent = 0
-    file_size = get_total_split_size(file_path)
-    result = 1
-    err_log = ""
+    password_requested = False
+    stderr_lines = []
+    reader_errors = []
 
-    # 定义处理 stdout 的函数
+    def stop_process():
+        if process.poll() is None:
+            process.terminate()
+
     def handle_stdout():
-        nonlocal last_percent, task, result
-        for line in iter(process.stdout.readline, ""):
-            if process.poll() is not None:
-                break  # 进程已经结束
-            line = line.strip()
-            # print(": " + line)
-            if "- " in line:
-                current_file = line.split("- ", 1)[1].replace("\\", "/")
-                progress.update(task, filename=current_file, refresh=True)
-            if "%" in line:
-                match = re.search(r"(\d+)%", line)
-                if match:
-                    percent = int(match.group(0).replace("%", ""))
-                    progress_increment = (
-                        int((percent - last_percent) * file_size / 100) + 1
-                    )
-                    progress.update(task, advance=progress_increment, refresh=True)
-                    last_percent = percent
-            if "Everything is Ok" in line:
-                progress.update(
-                    task, advance=int(file_size - last_percent * file_size / 100) + 1
-                )
-                progress.refresh()
+        nonlocal last_percent, password_requested
+        try:
+            # Buffered final output remains meaningful after the process exits.
+            for line in iter(process.stdout.readline, ""):
+                line = line.strip()
+                if line.lower().startswith("enter password"):
+                    password_requested = True
+                if "- " in line:
+                    current_file = line.split("- ", 1)[1].replace("\\", "/")
+                    progress.update(task, filename=current_file, refresh=True)
+                if "%" in line:
+                    match = re.search(r"(\d+)%", line)
+                    if match:
+                        percent = int(match.group(1))
+                        progress_increment = int((percent - last_percent) * file_size / 100) + 1
+                        progress.update(task, advance=progress_increment, refresh=True)
+                        last_percent = percent
+                if "Everything is Ok" in line:
+                    progress.update(task, advance=int(file_size - last_percent * file_size / 100) + 1)
+                    progress.refresh()
+        except Exception as error:
+            reader_errors.append(error)
+            stop_process()
 
-    # 定义处理 stderr 的函数
     def handle_stderr():
-        nonlocal result
-        nonlocal err_log
-        for err_line in iter(process.stderr.readline, ""):
-            err_line = err_line.strip()
-            err_log += err_line + "\n"
-            # print_error(f"\n{err_line}\n")
-            if err_line:
-                process.terminate()
-                # 检查错误信息
-                if "wrong password" in err_line.lower():
-                    result = -1
-                    break
-                elif "cannot open" in err_line.lower():
-                    result = -2
-                    break
-                else:
-                    result = -3
+        try:
+            for line in iter(process.stderr.readline, ""):
+                stderr_lines.append(line)
+        except Exception as error:
+            reader_errors.append(error)
+            stop_process()
 
-    # 实时输出进度
-    with Progress(
-        rich.progress.SpinnerColumn(finished_text="✅"),
-        rich.progress.TextColumn(
-            "[cyan][b]{task.fields[filename]}[/cyan][/b]",
-            table_column=rich.progress.Column(max_width=75),
-        ),
-        rich.progress.BarColumn(),
-        "[progress.percentage]{task.percentage:>3.1f}%",
-        "•",
-        rich.progress.FileSizeColumn(),
-        "•",
-        rich.progress.TransferSpeedColumn(),
-        "•",
-        rich.progress.TimeElapsedColumn(),
-        "/",
-        rich.progress.TimeRemainingColumn(),
-        transient=True,
-    ) as progress:
+    stdout_thread = threading.Thread(target=handle_stdout)
+    stderr_thread = threading.Thread(target=handle_stderr)
+    try:
+        with Progress(
+            rich.progress.SpinnerColumn(finished_text="✅"),
+            rich.progress.TextColumn(
+                "[cyan][b]{task.fields[filename]}[/cyan][/b]",
+                table_column=rich.progress.Column(max_width=75),
+            ),
+            rich.progress.BarColumn(),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•", rich.progress.FileSizeColumn(),
+            "•", rich.progress.TransferSpeedColumn(),
+            "•", rich.progress.TimeElapsedColumn(),
+            "/", rich.progress.TimeRemainingColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Decompress...", total=file_size, filename="")
+            stdout_thread.start()
+            stderr_thread.start()
+            stdout_thread.join()
+            stderr_thread.join()
+            returncode = process.wait()
+    finally:
+        stop_process()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        for thread in (stdout_thread, stderr_thread):
+            if thread.ident is not None:
+                thread.join()
+        process.stdout.close()
+        process.stderr.close()
 
-        task = progress.add_task("Decompress...", total=file_size, filename="")
-
-        # 启动线程来处理 stdout 和 stderr
-        stdout_thread = threading.Thread(target=handle_stdout)
-        stderr_thread = threading.Thread(target=handle_stderr)
-
-        stdout_thread.start()
-        stderr_thread.start()
-
-        # 等待线程完成
-        stdout_thread.join()
-        stderr_thread.join()
+    err_log = "".join(stderr_lines)
+    lowered = err_log.lower()
+    if "wrong password" in lowered:
+        result = -1
+    elif "cannot open" in lowered or "can not open" in lowered:
+        result = -2
+    elif password_requested and returncode != 0:
+        # An empty dictionary first tries without a password. Do not let 7z
+        # consume interactive input: route its prompt through our name/manual
+        # password fallback instead of mistaking stdin EOF for a fatal failure.
+        result = -1
+    elif returncode != 0 or err_log.strip() or reader_errors:
+        result = -3
+    else:
+        result = 1
 
     if result == -1:
         print_info(f"密码 {password} 尝试错误喵。")
     elif result == -2:
         print_info(f"{file_path}\n可能不是压缩文件喵。")
     elif result == -3:
-        print_warning(f"未定义错误（可能是密码错误喵）。错误日志：\n{err_log}")
+        print_warning(
+            f"未定义错误（可能是密码错误喵）。返回码：{returncode}。错误日志：\n{err_log}"
+        )
     else:
         print_success("解压完成，没有错误喵。")
-
     return result
 
 
@@ -198,7 +195,11 @@ def extract_with_bandizip(file_path, extract_to, password=None):
         before_files = set()
 
     # 执行 Bandizip 解压
-    process = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+    process = subprocess.run(
+        command, capture_output=True, text=True, encoding='utf-8', errors='ignore',
+        stdin=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
     
     # 分析错误输出以确定具体错误类型
     stderr_output = process.stderr.lower()
@@ -211,12 +212,22 @@ def extract_with_bandizip(file_path, extract_to, password=None):
     
     # 检查是否为无法打开文件的错误
     if ("cannot open" in combined_output or 
-        "Unknown archive" in combined_output or 
+        "unknown archive" in combined_output or
         "unsupported" in combined_output or
         "corrupted" in combined_output or
         "系统找不到指定的文件" in combined_output or
         "file not found" in combined_output):
         return -2
+
+    # A non-zero exit code is a failure even when some files were produced.
+    if process.returncode != 0:
+        print_error("Bandizip 执行出现未知错误喵：")
+        print_error(f"返回码: {process.returncode}")
+        if process.stdout.strip():
+            print_error(f"标准输出: {process.stdout}")
+        if process.stderr.strip():
+            print_error(f"错误输出: {process.stderr}")
+        return -3
 
     # Get directory contents after extraction
     try:
@@ -227,17 +238,6 @@ def extract_with_bandizip(file_path, extract_to, password=None):
     new_files = after_files - before_files
 
     if not new_files:
-        # 如果返回码不为0且没有新文件，可能是其他错误
-        if process.returncode != 0:
-            # 输出详细的错误信息
-            print_error("Bandizip 执行出现未知错误喵：")
-            print_error(f"命令: {' '.join(command)}")
-            print_error(f"返回码: {process.returncode}")
-            if process.stdout.strip():
-                print_error(f"标准输出: {process.stdout}")
-            if process.stderr.strip():
-                print_error(f"错误输出: {process.stderr}")
-            return -3
         return -2  # 没有新文件，可能不是压缩文件
 
     # Check if any new file has size > 0

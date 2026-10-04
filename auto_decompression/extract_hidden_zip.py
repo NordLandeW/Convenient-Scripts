@@ -4,7 +4,7 @@ import os
 import json
 import subprocess
 import re
-from rich.console import Console
+from console import console
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -19,7 +19,6 @@ from rich.progress import (
 CHUNK_SIZE = 256 * 1024 * 1024  # 256 MB
 COPY_BUFFER_SIZE = 8 * 1024 * 1024  # 8 MB
 
-console = Console()
 
 # Search mode: True for binwalk, False for manual signature scanning
 USE_BINWALK = False

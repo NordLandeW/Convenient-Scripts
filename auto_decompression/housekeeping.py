@@ -3,30 +3,9 @@ import shutil
 import sys
 
 import send2trash
-from rich.console import Console
+from console import print_error, print_info, print_success
 
-console = Console()
 RECOVER_SUFFIX = ".AutoDecRecovered"
-
-# When extracted output reuses the source archive filename, we must avoid trashing the output
-# later in the global "trash-on-success" step.
-_RECYCLED_RESERVED_PATHS = set()
-
-
-def print_info(message):
-    console.out(message, style="blue")
-
-
-def print_error(message):
-    console.out(message, style="bold red")
-
-
-def print_success(message):
-    console.out(message, style="green")
-
-
-def print_warning(message):
-    console.out(message, style="bold yellow underline")
 
 
 def _ensure_directory(path, label):
@@ -127,6 +106,7 @@ def move_path_with_collision_handling(
     dest_dir: str,
     reserved_paths: set = None,
     allow_replace_reserved: bool = False,
+    recycled_reserved_paths: set = None,
 ) -> str:
     """
     Moves a file or directory into dest_dir while keeping names stable when possible.
@@ -164,7 +144,8 @@ def move_path_with_collision_handling(
 
         try:
             os.rename(temp_path, desired_path)
-            _RECYCLED_RESERVED_PATHS.add(_normalize_path_for_compare(desired_path))
+            if recycled_reserved_paths is not None:
+                recycled_reserved_paths.add(_normalize_path_for_compare(desired_path))
             return desired_path
         except Exception:
             fallback_name = _pick_unique_name(dest_dir, desired_name, is_dir=is_dir)
@@ -183,6 +164,7 @@ def move_file_with_unique_suffix(
     dest_dir: str,
     reserved_paths: set = None,
     allow_replace_reserved: bool = False,
+    recycled_reserved_paths: set = None,
 ) -> str:
     """Backward-compatible wrapper around `move_path_with_collision_handling()` for files."""
     return move_path_with_collision_handling(
@@ -190,6 +172,7 @@ def move_file_with_unique_suffix(
         dest_dir,
         reserved_paths=reserved_paths,
         allow_replace_reserved=allow_replace_reserved,
+        recycled_reserved_paths=recycled_reserved_paths,
     )
 
 

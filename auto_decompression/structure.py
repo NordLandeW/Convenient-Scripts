@@ -1,7 +1,8 @@
 import os
 import re
 
-from housekeeping import _normalize_path_for_compare, print_info
+from console import print_info
+from housekeeping import _normalize_path_for_compare
 
 
 def get_archive_base_name(filename):
