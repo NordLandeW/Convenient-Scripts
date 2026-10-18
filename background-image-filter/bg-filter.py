@@ -22,6 +22,23 @@ from loguru import logger
 RESAMPLE_FILTER = Image.Resampling.LANCZOS
 
 
+def prepare_for_resampling(img):
+    """Convert modes that cannot be interpolated correctly to RGB(A).
+
+    Resizing a P-mode image directly interpolates palette indices instead of
+    colors, producing broken, jagged lines. Palette transparency is kept by
+    converting to RGBA.
+    """
+    if img.mode in ("RGBA", "LA", "PA") or (
+        img.mode == "P" and "transparency" in img.info
+    ):
+        return img.convert("RGBA")
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    img.load()
+    return img
+
+
 def resize_to_fit(img, max_size):
     """Downscale to fit within max_size, preserving aspect ratio.
 
@@ -29,6 +46,7 @@ def resize_to_fit(img, max_size):
     source. thumbnail() may let the JPEG decoder subsample (draft mode) and
     uses a reducing gap, which softens fine detail before the final filter.
     """
+    img = prepare_for_resampling(img)
     scale = min(max_size[0] / img.width, max_size[1] / img.height, 1.0)
     size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
     if size == img.size:
@@ -583,7 +601,8 @@ class PreviewWindow:
         y = (sh - h) // 2
         self.top.geometry(f"{w}x{h}+{x}+{y}")
         try:
-            self.original_image = Image.open(self.img_path)
+            with Image.open(self.img_path) as img:
+                self.original_image = prepare_for_resampling(img)
         except Exception as e:
             logger.error(f"无法打开图片: {self.img_path}\n{e}")
             self.top.destroy()
@@ -863,7 +882,8 @@ class PreviewWindow:
     def load_image(self):
         self.img_path = self.image_list[self.index]
         try:
-            self.original_image = Image.open(self.img_path)
+            with Image.open(self.img_path) as img:
+                self.original_image = prepare_for_resampling(img)
         except Exception as e:
             logger.error(f"无法打开图片: {self.img_path}\n{e}")
             return
