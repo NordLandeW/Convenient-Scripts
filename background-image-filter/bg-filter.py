@@ -686,8 +686,6 @@ class PreviewWindow:
         self.min_zoom = float(self.slider["from"])
         self.max_zoom = float(self.slider["to"])
         self._ignore_zoom_callback = False
-        self._zoom_after_id = None
-        self._pending_zoom_value = None
         
         self.show_screen_ratio_var = tk.BooleanVar(value=False)
         self.screen_ratio_checkbox = tk.Checkbutton(self.top, text="显示屏幕比例遮挡",
@@ -985,20 +983,8 @@ class PreviewWindow:
             logger.error(f"缩放更新错误: {e}")
             return
 
-        if getattr(self, "_zoom_after_id", None) is not None:
-            try:
-                self.top.after_cancel(self._zoom_after_id)
-            except Exception:
-                pass
-
-        self._pending_zoom_value = zoom_value
-        self._zoom_after_id = self.top.after(100, self._apply_debounced_zoom)
-
-    def _apply_debounced_zoom(self):
-        self._zoom_after_id = None
-        zoom_value = self._pending_zoom_value
-        if zoom_value is None:
-            return
+        # The interim image is cheap and the Lanczos render is already
+        # debounced, so update the visible zoom immediately.
         self.change_zoom(zoom_value, update_slider=False)
 
     def change_zoom(self, new_zoom, focal_point=None, update_slider=False, reset_offsets=False):
