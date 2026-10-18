@@ -17,6 +17,10 @@ except ImportError:
     windll = None
 from loguru import logger
 
+# Highest-quality resampling filter Pillow provides. Used for both thumbnail
+# downscaling and preview zooming; HAMMING softened fine detail noticeably.
+RESAMPLE_FILTER = Image.Resampling.LANCZOS
+
 def _print_progress(cur, total, prefix=""):
     pct = cur * 100 // total
     sys.stdout.write(f"\r{prefix}{cur}/{total}  {pct}%")
@@ -513,7 +517,7 @@ class ImageBrowser:
         try:
             with Image.open(img_path) as img:
                 img_copy = img.copy()
-            img_copy.thumbnail(target_size, Image.Resampling.HAMMING)
+            img_copy.thumbnail(target_size, RESAMPLE_FILTER)
             return img_copy
         except Exception as e:
             logger.error(f"生成缩略图失败 {img_path}: {e}")
@@ -703,7 +707,7 @@ class PreviewWindow:
         needs_resample = self.cached_image_size != new_size or self.photo is None
         if needs_resample:
             try:
-                resized = self.original_image.resize(new_size, Image.Resampling.HAMMING)
+                resized = self.original_image.resize(new_size, RESAMPLE_FILTER)
                 self.photo = ImageTk.PhotoImage(resized)
             except Exception as e:
                 logger.error(f"图片调整大小失败: {e}")
