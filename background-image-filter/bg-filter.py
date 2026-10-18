@@ -21,6 +21,20 @@ from loguru import logger
 # downscaling and preview zooming; HAMMING softened fine detail noticeably.
 RESAMPLE_FILTER = Image.Resampling.LANCZOS
 
+
+def resize_to_fit(img, max_size):
+    """Downscale to fit within max_size, preserving aspect ratio.
+
+    Unlike Image.thumbnail(), this always resamples from the fully decoded
+    source. thumbnail() may let the JPEG decoder subsample (draft mode) and
+    uses a reducing gap, which softens fine detail before the final filter.
+    """
+    scale = min(max_size[0] / img.width, max_size[1] / img.height, 1.0)
+    size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+    if size == img.size:
+        return img.copy()
+    return img.resize(size, RESAMPLE_FILTER)
+
 def _print_progress(cur, total, prefix=""):
     pct = cur * 100 // total
     sys.stdout.write(f"\r{prefix}{cur}/{total}  {pct}%")
@@ -516,9 +530,7 @@ class ImageBrowser:
     def generate_thumbnail_image(self, img_path, target_size):
         try:
             with Image.open(img_path) as img:
-                img_copy = img.copy()
-            img_copy.thumbnail(target_size, RESAMPLE_FILTER)
-            return img_copy
+                return resize_to_fit(img, target_size)
         except Exception as e:
             logger.error(f"生成缩略图失败 {img_path}: {e}")
             return None
