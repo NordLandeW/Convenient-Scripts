@@ -20,6 +20,7 @@ from loguru import logger
 # Highest-quality resampling filter Pillow provides. Used for both thumbnail
 # downscaling and preview zooming; HAMMING softened fine detail noticeably.
 RESAMPLE_FILTER = Image.Resampling.LANCZOS
+THUMBNAIL_WORKERS = min(8, max(4, os.cpu_count() or 4))
 
 
 def prepare_for_resampling(img):
@@ -43,15 +44,17 @@ def resize_to_fit(img, max_size):
     """Downscale to fit within max_size, preserving aspect ratio.
 
     Unlike Image.thumbnail(), this always resamples from the fully decoded
-    source. thumbnail() may let the JPEG decoder subsample (draft mode) and
-    uses a reducing gap, which softens fine detail before the final filter.
+    source. thumbnail() may let the JPEG decoder subsample (draft mode), which
+    softens fine detail before the final filter. A reducing gap of 3.0 is
+    Pillow's documented near-fair two-step optimization: it avoids that decoder
+    subsampling while cutting large-reduction cost substantially.
     """
     img = prepare_for_resampling(img)
     scale = min(max_size[0] / img.width, max_size[1] / img.height, 1.0)
     size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
     if size == img.size:
         return img.copy()
-    return img.resize(size, RESAMPLE_FILTER)
+    return img.resize(size, RESAMPLE_FILTER, reducing_gap=3.0)
 
 def _print_progress(cur, total, prefix=""):
     pct = cur * 100 // total
@@ -264,8 +267,9 @@ class ImageBrowser:
             self.screen_ratio = screen_width / screen_height
             
         self.placeholder_image = ImageTk.PhotoImage(Image.new("RGB", (10, 10), "gray"))
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.executor = ThreadPoolExecutor(max_workers=THUMBNAIL_WORKERS)
         self._resize_after_id = None
+        self._thumbnail_refresh_id = None
         self.setup_ui()
         self.master.bind("<Left>", lambda event: self.prev_page())
         self.master.bind("<Right>", lambda event: self.next_page())
@@ -298,7 +302,16 @@ class ImageBrowser:
         self.page_label.pack(side=tk.LEFT, padx=5)
         next_button = tk.Button(top_frame, text="下一页", command=self.next_page)
         next_button.pack(side=tk.LEFT, padx=5)
-        
+
+        tk.Label(top_frame, text="跳至").pack(side=tk.LEFT, padx=(10, 2))
+        self.page_jump_entry = tk.Entry(top_frame, width=5)
+        self.page_jump_entry.pack(side=tk.LEFT, padx=2)
+        self.page_jump_entry.config(state="disabled")
+        self.page_jump_entry.bind("<Return>", lambda event: self.jump_to_page())
+        tk.Label(top_frame, text="页").pack(side=tk.LEFT, padx=(0, 2))
+        jump_button = tk.Button(top_frame, text="跳转", command=self.jump_to_page)
+        jump_button.pack(side=tk.LEFT, padx=2)
+
         self.show_overlay_var = tk.BooleanVar(value=False)
         overlay_checkbox = tk.Checkbutton(top_frame, text="比例遮挡", 
                                          variable=self.show_overlay_var, 
@@ -400,6 +413,8 @@ class ImageBrowser:
 
         self.score_cache = score_dict
         self.sorted_images = sorted(self.images, key=lambda x: score_dict[x], reverse=True)
+        if self.middle_frame.winfo_width() > 1 and self.middle_frame.winfo_height() > 1:
+            self.display_page()
 
     def get_cached_image_info(self, img_path):
         info = self.image_info_cache.get(img_path)
@@ -418,10 +433,13 @@ class ImageBrowser:
 
         if total_pages == 0:
             self.page_label.config(text="第 0/0 页")
+            self._sync_page_entry(0)
             return
 
         if self.current_page >= total_pages:
             self.current_page = max(total_pages - 1, 0)
+
+        self._sync_page_entry(total_pages)
 
         start_index = self.current_page * self.page_size
         end_index = start_index + self.page_size
@@ -542,8 +560,15 @@ class ImageBrowser:
         if key not in self.thumbnail_futures:
             future = self.executor.submit(self.generate_thumbnail_image, img_path, target_size)
             self.thumbnail_futures[key] = future
-            future.add_done_callback(lambda fut, key=key: self.master.after(0, self.thumbnail_done_callback, key, fut))
+            future.add_done_callback(lambda fut, key=key: self._schedule_thumbnail_callback(key, fut))
         return self.placeholder_image
+
+    def _schedule_thumbnail_callback(self, key, future):
+        try:
+            self.master.after(0, self.thumbnail_done_callback, key, future)
+        except (RuntimeError, tk.TclError):
+            # The window was closed while a thumbnail was still generating.
+            pass
 
     def generate_thumbnail_image(self, img_path, target_size):
         try:
@@ -561,6 +586,40 @@ class ImageBrowser:
                 self.thumbnails[key] = photo
             except Exception as e:
                 logger.error(f"转换 PhotoImage 失败: {e}")
+        if self._thumbnail_refresh_id is None:
+            self._thumbnail_refresh_id = self.master.after(30, self._refresh_thumbnails)
+
+    def _refresh_thumbnails(self):
+        self._thumbnail_refresh_id = None
+        self.display_page()
+
+    def _sync_page_entry(self, total_pages):
+        if total_pages <= 0:
+            self.page_jump_entry.delete(0, tk.END)
+            self.page_jump_entry.config(state="disabled")
+            return
+        self.page_jump_entry.config(state="normal")
+        if self.page_jump_entry.focus_get() == self.page_jump_entry:
+            return
+        self.page_jump_entry.delete(0, tk.END)
+        self.page_jump_entry.insert(0, str(self.current_page + 1))
+
+    def jump_to_page(self):
+        total_pages = (len(self.sorted_images) + self.page_size - 1) // self.page_size if self.sorted_images else 0
+        if total_pages == 0:
+            return
+        text = self.page_jump_entry.get().strip()
+        try:
+            page = int(text)
+        except ValueError:
+            messagebox.showerror("错误", f"无效的页码: {text}")
+            self.page_jump_entry.delete(0, tk.END)
+            self.page_jump_entry.insert(0, str(self.current_page + 1))
+            return
+        page = max(1, min(total_pages, page))
+        self.current_page = page - 1
+        self.page_jump_entry.delete(0, tk.END)
+        self.page_jump_entry.insert(0, str(page))
         self.display_page()
 
     def prev_page(self):
