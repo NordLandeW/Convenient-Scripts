@@ -671,6 +671,8 @@ class PreviewWindow:
         self._render_generation = 0
         self._render_after_id = None
         self._pending_render_size = None
+        self._high_quality_image = None
+        self._rendered_size = None
         self.top.protocol("WM_DELETE_WINDOW", self._on_close)
         self.zoom_level = 1.0
         self.canvas = tk.Canvas(self.top, bg="gray")
@@ -806,26 +808,43 @@ class PreviewWindow:
             self._cancel_pending_render()
             try:
                 resized = self.original_image.resize(new_size, RESAMPLE_FILTER)
-                self.photo = ImageTk.PhotoImage(resized)
             except Exception as e:
                 logger.error(f"图片调整大小失败: {e}")
                 return
-            self.cached_image_size = new_size
-            if self.image_item is None:
-                self.image_item = self.canvas.create_image(
-                    canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
-            else:
-                self.canvas.itemconfigure(self.image_item, image=self.photo)
+            self._high_quality_image = resized
+            self._rendered_size = new_size
+            self._set_display_image(resized, new_size)
             self._refresh_displayed_image()
-        elif self.cached_image_size != new_size:
-            # Keep the previous resolution visible while the new size is
-            # generated off the UI thread.
-            self._schedule_preview_render(new_size)
-        else:
+        elif new_size == self._rendered_size:
             self._cancel_pending_render()
+            if self.cached_image_size != new_size:
+                self._set_display_image(self._high_quality_image, new_size)
+            self._refresh_displayed_image()
+        else:
+            # Zoom immediately with a fast filter from the last high-quality
+            # image; replace it with a Lanczos render once it is ready.
+            if self.cached_image_size != new_size:
+                try:
+                    interim = self._high_quality_image.resize(
+                        new_size, Image.Resampling.BILINEAR)
+                except Exception as e:
+                    logger.error(f"预览快速缩放失败: {e}")
+                    return
+                self._set_display_image(interim, new_size)
+            self._schedule_preview_render(new_size)
             self._refresh_displayed_image()
 
         self._update_info_label()
+
+    def _set_display_image(self, pil_image, size):
+        self.photo = ImageTk.PhotoImage(pil_image)
+        self.cached_image_size = size
+        if self.image_item is None:
+            self.image_item = self.canvas.create_image(
+                self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2,
+                anchor=tk.CENTER, image=self.photo)
+        else:
+            self.canvas.itemconfigure(self.image_item, image=self.photo)
 
     def _refresh_displayed_image(self):
         if self.photo is None or self.cached_image_size is None:
@@ -897,7 +916,7 @@ class PreviewWindow:
         if self._closed:
             return
         size = self._pending_render_size
-        if size is None or self.cached_image_size == size:
+        if size is None or self._rendered_size == size:
             return
         self._pending_render_size = None
         self._render_generation += 1
@@ -935,17 +954,12 @@ class PreviewWindow:
         if self._closed or generation != self._render_generation:
             return
         try:
-            self.photo = ImageTk.PhotoImage(resized)
+            self._high_quality_image = resized
+            self._rendered_size = size
+            self._set_display_image(resized, size)
         except Exception as e:
             logger.error(f"转换 PhotoImage 失败: {e}")
             return
-        self.cached_image_size = size
-        if self.image_item is None:
-            self.image_item = self.canvas.create_image(
-                self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2,
-                anchor=tk.CENTER, image=self.photo)
-        else:
-            self.canvas.itemconfigure(self.image_item, image=self.photo)
         self._refresh_displayed_image()
         self._update_info_label()
 
@@ -1070,6 +1084,8 @@ class PreviewWindow:
             logger.error(f"无法打开图片: {self.img_path}\n{e}")
             return
         self._cancel_pending_render()
+        self._high_quality_image = None
+        self._rendered_size = None
         self.photo = None
         self.cached_image_size = None
         self.visible_size = None
