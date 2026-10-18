@@ -666,6 +666,12 @@ class PreviewWindow:
             logger.error(f"无法打开图片: {self.img_path}\n{e}")
             self.top.destroy()
             return
+        self._closed = False
+        self._preview_executor = ThreadPoolExecutor(max_workers=1)
+        self._render_generation = 0
+        self._render_after_id = None
+        self._pending_render_size = None
+        self.top.protocol("WM_DELETE_WINDOW", self._on_close)
         self.zoom_level = 1.0
         self.canvas = tk.Canvas(self.top, bg="gray")
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -778,6 +784,8 @@ class PreviewWindow:
         self.display_image()
 
     def display_image(self):
+        if self._closed:
+            return
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
         if canvas_width <= 1 or canvas_height <= 1:
@@ -794,47 +802,66 @@ class PreviewWindow:
         new_height = max(int(orig_height * effective_zoom), 1)
         new_size = (new_width, new_height)
 
-        needs_resample = self.cached_image_size != new_size or self.photo is None
-        if needs_resample:
+        if self.photo is None:
+            self._cancel_pending_render()
             try:
                 resized = self.original_image.resize(new_size, RESAMPLE_FILTER)
                 self.photo = ImageTk.PhotoImage(resized)
             except Exception as e:
                 logger.error(f"图片调整大小失败: {e}")
                 return
+            self.cached_image_size = new_size
             if self.image_item is None:
-                self.image_item = self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
+                self.image_item = self.canvas.create_image(
+                    canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
             else:
                 self.canvas.itemconfigure(self.image_item, image=self.photo)
-            self.cached_image_size = new_size
-        elif self.image_item is None:
-            self.image_item = self.canvas.create_image(canvas_width / 2, canvas_height / 2, anchor=tk.CENTER, image=self.photo)
+            self._refresh_displayed_image()
+        elif self.cached_image_size != new_size:
+            # Keep the previous resolution visible while the new size is
+            # generated off the UI thread.
+            self._schedule_preview_render(new_size)
+        else:
+            self._cancel_pending_render()
+            self._refresh_displayed_image()
 
-        self.max_offset_x = max((new_width - canvas_width) / 2, 0)
-        self.max_offset_y = max((new_height - canvas_height) / 2, 0)
+        self._update_info_label()
+
+    def _refresh_displayed_image(self):
+        if self.photo is None or self.cached_image_size is None:
+            return
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        if canvas_width <= 1 or canvas_height <= 1:
+            return
+        displayed_width, displayed_height = self.cached_image_size
+        self.max_offset_x = max((displayed_width - canvas_width) / 2, 0)
+        self.max_offset_y = max((displayed_height - canvas_height) / 2, 0)
         self.cached_canvas_size = (canvas_width, canvas_height)
 
         visible_size = None
         if self.show_screen_ratio_var.get():
             try:
+                orig_width, orig_height = self.original_image.size
                 image_ratio = orig_width / orig_height
             except ZeroDivisionError:
                 image_ratio = 0
             if image_ratio > 0:
                 if image_ratio > self.screen_ratio:
-                    visible_width = new_height * self.screen_ratio
-                    visible_height = new_height
+                    visible_width = displayed_height * self.screen_ratio
+                    visible_height = displayed_height
                 else:
-                    visible_width = new_width
-                    visible_height = new_width / self.screen_ratio
-                visible_width = min(visible_width, new_width)
-                visible_height = min(visible_height, new_height)
+                    visible_width = displayed_width
+                    visible_height = displayed_width / self.screen_ratio
+                visible_width = min(visible_width, displayed_width)
+                visible_height = min(visible_height, displayed_height)
                 visible_size = (visible_width, visible_height)
         self.visible_size = visible_size
 
         self._clamp_offsets()
         self._update_canvas_position(redraw_overlay=True)
 
+    def _update_info_label(self):
         self.top.title(f"预览: {os.path.basename(self.img_path)}")
         info = self.get_cached_image_info(self.img_path)
         if info is not None:
@@ -843,6 +870,97 @@ class PreviewWindow:
             aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
             info_text = f"分辨率: {width}x{height}, 大小: {file_size} 字节, 总分: {total_score:.1f}, 比例分: {aspect_score:.1f}"
             self.info_label.config(text=info_text)
+
+    def _cancel_pending_render(self):
+        if self._render_after_id is not None:
+            try:
+                self.top.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+            self._render_after_id = None
+        self._pending_render_size = None
+        self._render_generation += 1
+
+    def _schedule_preview_render(self, size):
+        if self._pending_render_size != size:
+            self._pending_render_size = size
+            self._render_generation += 1
+        if self._render_after_id is not None:
+            try:
+                self.top.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+        self._render_after_id = self.top.after(60, self._start_preview_render)
+
+    def _start_preview_render(self):
+        self._render_after_id = None
+        if self._closed:
+            return
+        size = self._pending_render_size
+        if size is None or self.cached_image_size == size:
+            return
+        self._pending_render_size = None
+        self._render_generation += 1
+        generation = self._render_generation
+        image = self.original_image
+        future = self._preview_executor.submit(self._render_preview_image, generation, image, size)
+        future.add_done_callback(self._preview_render_done)
+
+    def _render_preview_image(self, generation, image, size):
+        if generation != self._render_generation:
+            return None
+        try:
+            return generation, size, image.resize(size, RESAMPLE_FILTER)
+        except Exception:
+            logger.exception("预览图渲染失败")
+            return None
+
+    def _preview_render_done(self, future):
+        try:
+            result = future.result()
+        except Exception:
+            logger.exception("预览图渲染失败")
+            return
+        if result is None or self._closed:
+            return
+        generation, size, resized = result
+        if generation != self._render_generation:
+            return
+        try:
+            self.top.after(0, self._apply_preview_render, generation, size, resized)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _apply_preview_render(self, generation, size, resized):
+        if self._closed or generation != self._render_generation:
+            return
+        try:
+            self.photo = ImageTk.PhotoImage(resized)
+        except Exception as e:
+            logger.error(f"转换 PhotoImage 失败: {e}")
+            return
+        self.cached_image_size = size
+        if self.image_item is None:
+            self.image_item = self.canvas.create_image(
+                self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2,
+                anchor=tk.CENTER, image=self.photo)
+        else:
+            self.canvas.itemconfigure(self.image_item, image=self.photo)
+        self._refresh_displayed_image()
+        self._update_info_label()
+
+    def _on_close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._render_after_id is not None:
+            try:
+                self.top.after_cancel(self._render_after_id)
+            except Exception:
+                pass
+            self._render_after_id = None
+        self._preview_executor.shutdown(wait=False, cancel_futures=True)
+        self.top.destroy()
 
     def update_zoom(self, val):
         if self._ignore_zoom_callback:
@@ -885,12 +1003,17 @@ class PreviewWindow:
         canvas_height = self.canvas.winfo_height()
         if canvas_width > 1 and canvas_height > 1:
             base_zoom = min(canvas_width / orig_width, canvas_height / orig_height)
-            old_effective_zoom = base_zoom * self.zoom_level
             new_effective_zoom = base_zoom * new_zoom
-            old_width = orig_width * old_effective_zoom
-            old_height = orig_height * old_effective_zoom
             new_width = orig_width * new_effective_zoom
             new_height = orig_height * new_effective_zoom
+            if self.photo is not None and self.cached_image_size is not None:
+                # Scale from the resolution actually on screen, not from a
+                # newer zoom whose render has not completed yet.
+                old_width, old_height = self.cached_image_size
+            else:
+                old_effective_zoom = base_zoom * self.zoom_level
+                old_width = orig_width * old_effective_zoom
+                old_height = orig_height * old_effective_zoom
 
             if not reset_offsets and old_width > 0 and old_height > 0:
                 image_center_x = canvas_width / 2 + self.view_offset_x
@@ -946,6 +1069,7 @@ class PreviewWindow:
         except Exception as e:
             logger.error(f"无法打开图片: {self.img_path}\n{e}")
             return
+        self._cancel_pending_render()
         self.photo = None
         self.cached_image_size = None
         self.visible_size = None
