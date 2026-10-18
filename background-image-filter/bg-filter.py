@@ -21,6 +21,7 @@ from loguru import logger
 # downscaling and preview zooming; HAMMING softened fine detail noticeably.
 RESAMPLE_FILTER = Image.Resampling.LANCZOS
 THUMBNAIL_WORKERS = min(8, max(4, os.cpu_count() or 4))
+PREFETCH_WORKERS = 2
 
 
 def prepare_for_resampling(img):
@@ -254,6 +255,8 @@ class ImageBrowser:
         self.sorted_images = []
         self.thumbnails = {}
         self.thumbnail_futures = {}
+        self.prefetch_futures = {}
+        self._last_thumbnail_size = None
         self.image_info_cache = {}
         self.score_cache = {}
         self.current_page = 0
@@ -268,6 +271,7 @@ class ImageBrowser:
             
         self.placeholder_image = ImageTk.PhotoImage(Image.new("RGB", (10, 10), "gray"))
         self.executor = ThreadPoolExecutor(max_workers=THUMBNAIL_WORKERS)
+        self.prefetch_executor = ThreadPoolExecutor(max_workers=PREFETCH_WORKERS)
         self._resize_after_id = None
         self._thumbnail_refresh_id = None
         self.setup_ui()
@@ -460,6 +464,9 @@ class ImageBrowser:
             cell_width = (frame_width - (columns + 1) * outer_pad) / columns
             cell_height = (frame_height - (rows + 1) * outer_pad) / rows
         target_size = (int(cell_width), int(cell_height))
+        if target_size != self._last_thumbnail_size:
+            self._last_thumbnail_size = target_size
+            self._cancel_prefetch()
         cell_pad = 2
 
         for idx, img_path in enumerate(page_images):
@@ -498,6 +505,7 @@ class ImageBrowser:
                 self.draw_thumbnail_overlay(cell_canvas, img_path, target_size)
         
         self.page_label.config(text=f"第 {self.current_page + 1}/{total_pages} 页")
+        self.prefetch_adjacent_pages(target_size)
 
     def draw_thumbnail_overlay(self, canvas, img_path, target_size):
         try:
@@ -557,10 +565,17 @@ class ImageBrowser:
         key = (img_path, target_size)
         if key in self.thumbnails:
             return self.thumbnails[key]
-        if key not in self.thumbnail_futures:
-            future = self.executor.submit(self.generate_thumbnail_image, img_path, target_size)
-            self.thumbnail_futures[key] = future
-            future.add_done_callback(lambda fut, key=key: self._schedule_thumbnail_callback(key, fut))
+        if key in self.thumbnail_futures:
+            return self.placeholder_image
+        prefetch_future = self.prefetch_futures.pop(key, None)
+        if prefetch_future is not None:
+            if not prefetch_future.cancelled():
+                self.thumbnail_futures[key] = prefetch_future
+                prefetch_future.add_done_callback(lambda fut, key=key: self._schedule_thumbnail_callback(key, fut))
+                return self.placeholder_image
+        future = self.executor.submit(self.generate_thumbnail_image, img_path, target_size)
+        self.thumbnail_futures[key] = future
+        future.add_done_callback(lambda fut, key=key: self._schedule_thumbnail_callback(key, fut))
         return self.placeholder_image
 
     def _schedule_thumbnail_callback(self, key, future):
@@ -579,15 +594,72 @@ class ImageBrowser:
             return None
 
     def thumbnail_done_callback(self, key, fut):
-        pil_image = fut.result()
-        if pil_image is not None:
+        self.thumbnail_futures.pop(key, None)
+        if key not in self.thumbnails:
             try:
-                photo = ImageTk.PhotoImage(pil_image)
-                self.thumbnails[key] = photo
-            except Exception as e:
-                logger.error(f"转换 PhotoImage 失败: {e}")
+                pil_image = fut.result()
+            except Exception:
+                pil_image = None
+            if pil_image is not None:
+                try:
+                    self.thumbnails[key] = ImageTk.PhotoImage(pil_image)
+                except Exception as e:
+                    logger.error(f"转换 PhotoImage 失败: {e}")
         if self._thumbnail_refresh_id is None:
             self._thumbnail_refresh_id = self.master.after(30, self._refresh_thumbnails)
+
+    def _cancel_prefetch(self):
+        for future in self.prefetch_futures.values():
+            future.cancel()
+        self.prefetch_futures.clear()
+
+    def prefetch_adjacent_pages(self, target_size):
+        total_pages = (len(self.sorted_images) + self.page_size - 1) // self.page_size if self.sorted_images else 0
+        if total_pages == 0:
+            return
+
+        desired_paths = set()
+        for page in (self.current_page - 1, self.current_page + 1):
+            if 0 <= page < total_pages:
+                start = page * self.page_size
+                desired_paths.update(self.sorted_images[start:start + self.page_size])
+
+        for key, future in list(self.prefetch_futures.items()):
+            if key[1] != target_size or key[0] not in desired_paths:
+                future.cancel()
+                self.prefetch_futures.pop(key, None)
+
+        for img_path in desired_paths:
+            self.prefetch_thumbnail(img_path, target_size)
+
+    def prefetch_thumbnail(self, img_path, target_size):
+        key = (img_path, target_size)
+        if key in self.thumbnails or key in self.thumbnail_futures or key in self.prefetch_futures:
+            return
+        future = self.prefetch_executor.submit(self.generate_thumbnail_image, img_path, target_size)
+        self.prefetch_futures[key] = future
+        future.add_done_callback(lambda fut, key=key: self._schedule_prefetch_callback(key, fut))
+
+    def _schedule_prefetch_callback(self, key, future):
+        try:
+            self.master.after(0, self.prefetch_done_callback, key, future)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def prefetch_done_callback(self, key, future):
+        self.prefetch_futures.pop(key, None)
+        if key in self.thumbnails:
+            return
+        try:
+            pil_image = future.result()
+        except Exception:
+            return
+        if pil_image is None:
+            return
+        try:
+            self.thumbnails[key] = ImageTk.PhotoImage(pil_image)
+        except Exception as e:
+            logger.error(f"转换 PhotoImage 失败: {e}")
 
     def _refresh_thumbnails(self):
         self._thumbnail_refresh_id = None
@@ -673,6 +745,10 @@ class PreviewWindow:
         self._pending_render_size = None
         self._high_quality_image = None
         self._rendered_size = None
+        self._neighbor_executor = ThreadPoolExecutor(max_workers=1)
+        self._neighbor_cache = {}
+        self._neighbor_futures = {}
+        self._prefetch_canvas_size = None
         self.top.protocol("WM_DELETE_WINDOW", self._on_close)
         self.zoom_level = 1.0
         self.canvas = tk.Canvas(self.top, bg="gray")
@@ -730,6 +806,7 @@ class PreviewWindow:
         self.canvas.bind("<Enter>", lambda event: self.canvas.focus_set())
 
         self.display_image()
+        self._prefetch_neighbors()
 
     def start_drag(self, event):
         self.canvas.focus_set()
@@ -782,6 +859,7 @@ class PreviewWindow:
     def _delayed_display_image(self):
         self._canvas_resize_after_id = None
         self.display_image()
+        self._prefetch_neighbors()
 
     def display_image(self):
         if self._closed:
@@ -971,6 +1049,11 @@ class PreviewWindow:
             except Exception:
                 pass
             self._render_after_id = None
+        for future in self._neighbor_futures.values():
+            future.cancel()
+        self._neighbor_futures.clear()
+        self._neighbor_cache.clear()
+        self._neighbor_executor.shutdown(wait=False, cancel_futures=True)
         self._preview_executor.shutdown(wait=False, cancel_futures=True)
         self.top.destroy()
 
@@ -1061,14 +1144,125 @@ class PreviewWindow:
             self.index += 1
             self.load_image()
 
+    def _neighbor_paths(self):
+        paths = []
+        if self.index > 0:
+            paths.append(self.image_list[self.index - 1])
+        if self.index < len(self.image_list) - 1:
+            paths.append(self.image_list[self.index + 1])
+        return paths
+
+    def _prefetch_neighbors(self):
+        if self._closed:
+            return
+        canvas_size = (self.canvas.winfo_width(), self.canvas.winfo_height())
+        if canvas_size[0] <= 1 or canvas_size[1] <= 1:
+            return
+        if self._prefetch_canvas_size != canvas_size:
+            self._prefetch_canvas_size = canvas_size
+            for future in self._neighbor_futures.values():
+                future.cancel()
+            self._neighbor_futures.clear()
+            self._neighbor_cache.clear()
+
+        paths = self._neighbor_paths()
+        for path in list(self._neighbor_cache):
+            if path not in paths:
+                self._neighbor_cache.pop(path, None)
+        for path, future in list(self._neighbor_futures.items()):
+            if path not in paths:
+                future.cancel()
+                self._neighbor_futures.pop(path, None)
+
+        for path in paths:
+            if path in self._neighbor_cache or path in self._neighbor_futures:
+                continue
+            future = self._neighbor_executor.submit(
+                self._render_neighbor, path, canvas_size)
+            self._neighbor_futures[path] = future
+            future.add_done_callback(
+                lambda fut, path=path: self._schedule_neighbor_done(path, fut))
+
+    def _render_neighbor(self, path, canvas_size):
+        try:
+            with Image.open(path) as img:
+                original = prepare_for_resampling(img)
+            canvas_width, canvas_height = canvas_size
+            base_zoom = min(canvas_width / original.width, canvas_height / original.height)
+            fit_size = (max(int(original.width * base_zoom), 1),
+                        max(int(original.height * base_zoom), 1))
+            fit_image = original.resize(fit_size, RESAMPLE_FILTER)
+            return path, original, fit_size, fit_image
+        except Exception:
+            logger.exception(f"预渲染相邻图片失败: {path}")
+            return None
+
+    def _schedule_neighbor_done(self, path, future):
+        try:
+            self.top.after(0, self._neighbor_done, path, future)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _neighbor_done(self, path, future):
+        self._neighbor_futures.pop(path, None)
+        if self._closed or path not in self._neighbor_paths():
+            return
+        try:
+            result = future.result()
+        except Exception:
+            return
+        if result is None:
+            return
+        path, original, fit_size, fit_image = result
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        if canvas_width <= 1 or canvas_height <= 1:
+            return
+        base_zoom = min(canvas_width / original.width, canvas_height / original.height)
+        expected_size = (max(int(original.width * base_zoom), 1),
+                         max(int(original.height * base_zoom), 1))
+        if expected_size != fit_size:
+            return
+        self._neighbor_cache[path] = (original, fit_size, fit_image)
+
     def load_image(self):
         self.img_path = self.image_list[self.index]
-        try:
-            with Image.open(self.img_path) as img:
-                self.original_image = prepare_for_resampling(img)
-        except Exception as e:
-            logger.error(f"无法打开图片: {self.img_path}\n{e}")
-            return
+        cached = self._neighbor_cache.pop(self.img_path, None)
+        if cached is not None:
+            original, fit_size, fit_image = cached
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            base_zoom = min(canvas_width / original.width, canvas_height / original.height)
+            expected_size = (max(int(original.width * base_zoom), 1),
+                             max(int(original.height * base_zoom), 1))
+            if expected_size == fit_size:
+                self.original_image = original
+                self._cancel_pending_render()
+                self.zoom_level = 1.0
+                self._ignore_zoom_callback = True
+                try:
+                    self.slider.set(1.0)
+                finally:
+                    self._ignore_zoom_callback = False
+                self._high_quality_image = fit_image
+                self._rendered_size = fit_size
+                self.cached_image_size = fit_size
+                self.visible_size = None
+                self.view_offset_x = 0
+                self.view_offset_y = 0
+                self._set_display_image(fit_image, fit_size)
+                self._refresh_displayed_image()
+                self._update_info_label()
+                self._prefetch_neighbors()
+                return
+            self.original_image = original
+        else:
+            try:
+                with Image.open(self.img_path) as img:
+                    self.original_image = prepare_for_resampling(img)
+            except Exception as e:
+                logger.error(f"无法打开图片: {self.img_path}\n{e}")
+                return
         self._cancel_pending_render()
         self._high_quality_image = None
         self._rendered_size = None
@@ -1078,6 +1272,7 @@ class PreviewWindow:
         self.view_offset_x = 0
         self.view_offset_y = 0
         self.change_zoom(1.0, update_slider=True, reset_offsets=True)
+        self._prefetch_neighbors()
 
     def open_external_and_copy(self):
         open_external_and_copy(self.img_path)
