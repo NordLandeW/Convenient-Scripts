@@ -332,8 +332,12 @@ def apply_modern_style(app):
     else:
         app.setStyle("Fusion")
 
+    # Segoe UI has no CJK glyphs; relying on the platform fallback picked
+    # SimSun (宋体) on some machines. Prefer the modern Windows UI font for
+    # Chinese first, then the native Segoe UI variants.
     families = set(QFontDatabase.families())
-    for name in ("Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI"):
+    for name in ("Microsoft YaHei UI", "Microsoft YaHei",
+                 "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI"):
         if name in families:
             app.setFont(QFont(name, 10))
             break

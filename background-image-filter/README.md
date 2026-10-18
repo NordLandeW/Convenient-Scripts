@@ -14,7 +14,7 @@ python bg-filter.py --folder "D:\Pictures" --page-size 12 --ratio 16:9
 
 ## Qt 版本
 
-`bg-filter.py` 是 PySide6 (Qt 6) 实现。旧的 Tk 实现保留为 `bg-filter-tk.py`，功能相同，便于对照或回退。界面使用 Qt 原生的 Windows 11 (WinUI) 控件样式和 Segoe UI；其他平台自动回退到 Fusion。
+`bg-filter.py` 是 PySide6 (Qt 6) 实现。旧的 Tk 实现保留为 `bg-filter-tk.py`，功能相同，便于对照或回退。界面使用 Qt 原生的 Windows 11 (WinUI) 控件样式，中文优先 Microsoft YaHei UI、英文回退 Segoe UI；其他平台自动回退到 Fusion。
 
 渲染路径：
 
