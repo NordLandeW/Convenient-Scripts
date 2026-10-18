@@ -1,1 +1,4 @@
 loguru
+Pillow
+PySide6
+pywin32>=306; sys_platform == "win32"
