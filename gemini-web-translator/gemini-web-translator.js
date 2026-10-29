@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Gemini Webpage Translator
 // @namespace    http://tampermonkey.net/
-// @version      7.1.0
-// @description  Translate webpages using Gemini or OpenRouter API.
+// @version      7.3.0
+// @description  Translate webpages using Gemini, OpenRouter, or OpenAI (Chat Completions / Responses).
 // @author       NordLandeW
 // @match        *://*/*
 // @exclude      *://challenges.cloudflare.com/*
@@ -25,6 +25,8 @@
 // @grant        GM_registerMenuCommand
 // @connect      generativelanguage.googleapis.com
 // @connect      openrouter.ai
+// @connect      api.openai.com
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -38,23 +40,64 @@
                 name: 'Google Gemini',
                 endpoint: 'https://generativelanguage.googleapis.com/v1beta/models',
                 models: [
-                    'gemini-2.5-pro',
                     'gemini-3.1-pro-preview',
-                    'gemini-3.5-flash',
-                    'gemini-3.1-flash-lite',
+                    'gemini-3.8-flash',
+                    'gemini-4-argon',
+                    'gemini-3.5-flash-lite',
                 ]
             },
             openrouter: {
                 name: 'OpenRouter',
                 endpoint: 'https://openrouter.ai/api/v1/chat/completions',
                 models: [
-                    'google/gemini-2.5-pro',
-                    'google/gemini-3.5-flash',
-                    'google/gemini-3.1-flash-lite',
+                    'google/gemini-3.1-pro-preview',
+                    'google/gemini-3.8-flash',
+                    'google/gemini-4-argon',
+                    'google/gemini-3.5-flash-lite',
+                    'openai/gpt-6-luna',
+                    'openai/gpt-6.1-sol',
+                    'openai/gpt-6.1-terra',
+                    'openai/gpt-6-astra',
                     'deepseek/deepseek-v4-flash',
                     'deepseek/deepseek-v4-pro',
                 ]
+            },
+            openai: {
+                name: 'OpenAI / 兼容 API',
+                endpoint: 'https://api.openai.com/v1',
+                models: [
+                    'gpt-6-luna',
+                    'gpt-6.1-sol',
+                    'gpt-6.1-terra',
+                    'gpt-6-astra',
+                ]
             }
+        },
+        openaiServiceTiers: ['', 'auto', 'default', 'flex', 'priority', 'fast', 'scale', 'ultrafast'],
+        // Model IDs and effort support verified against provider docs on 2026-10-29.
+        reasoningProfiles: {
+            'gemini-4-argon': ['low', 'medium', 'high'],
+            'gemini-3.8-flash': ['low', 'medium', 'high'],
+            'gemini-3.1-pro-preview': ['low', 'medium', 'high'],
+            'gemini-3.5-flash-lite': ['minimal', 'low', 'medium', 'high'],
+            'gemini-3.6-flash': ['minimal', 'low', 'medium', 'high'],
+            'gemini-3.1-flash-lite': ['minimal', 'low', 'medium', 'high'],
+            'gemini-3-flash-preview': ['minimal', 'low', 'medium', 'high'],
+            'gemini-3-pro-preview': ['low', 'high'],
+            'gpt-6-astra': ['low', 'medium', 'high', 'xhigh', 'max'],
+            'gpt-6.1-sol': ['low', 'medium', 'high', 'xhigh', 'max'],
+            'gpt-6.1-terra': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+            'gpt-6-luna': ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+        },
+        reasoningEffortLabels: {
+            '': '默认（不指定强度）',
+            none: 'None（关闭推理）',
+            minimal: 'Minimal（极低）',
+            low: 'Low（低）',
+            medium: 'Medium（中）',
+            high: 'High（高）',
+            xhigh: 'XHigh（极高）',
+            max: 'Max（最高）'
         },
         cachePrefix: 'gm_cache_v7_',
         cacheMetaKey: 'gm_cache_meta',
@@ -79,6 +122,8 @@
         ],
         defaults: {
             platform: 'gemini',
+            openaiProtocol: 'chat',
+            openaiServiceTier: 'auto',
             maxCacheSize: 10 * 1024 * 1024, // 10MB
             cacheTTL: 7 * 24 * 60 * 60 * 1000, // 7 days
             urlSimilarityThreshold: 0.95,
@@ -99,7 +144,9 @@
         translationProgress: null,
         lastProgressUpdateAt: 0,
         activeTranslationRunId: 0,
-        activeRequests: new Set()
+        activeRequests: new Set(),
+        settingsPlatform: null,
+        settingsDrafts: new Map()
     };
 
     // ================= 样式表 =================
@@ -140,12 +187,14 @@
         
         #gm-settings-panel {
             background: #2b2c30; border: 1px solid rgba(255,255,255,0.1);
-            width: 420px; border-radius: 16px; padding: 32px;
+            width: 420px; max-width: calc(100vw - 32px); max-height: 90vh; overflow-y: auto;
+            box-sizing: border-box; border-radius: 16px; padding: 32px;
             box-shadow: 0 24px 48px rgba(0,0,0,0.5);
             transform: scale(0.92) translateY(10px); transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
             display: flex; flex-direction: column; gap: 16px;
         }
         #gm-settings-overlay.open #gm-settings-panel { transform: scale(1) translateY(0); }
+        #gm-settings-panel > * { flex-shrink: 0; }
 
         /* Form Elements */
         .gm-label { color: #9aa0a6; font-size: 12px; font-weight: 600; margin-bottom: 6px; display: block; letter-spacing: 0.5px; text-transform: uppercase;}
@@ -231,6 +280,62 @@
 
     function getTargetLanguage() {
         return normalizeTargetLanguage(GM_getValue('gm_target_language', CONFIG.defaults.targetLanguage));
+    }
+
+    function getPlatformModelSettings(platform) {
+        // Keep existing model settings when upgrading from the shared model keys.
+        const useLegacy = platform === GM_getValue('gm_platform', CONFIG.defaults.platform);
+        return {
+            model: GM_getValue(`gm_model_${platform}`, useLegacy ? GM_getValue('gm_model', '') : ''),
+            customModel: GM_getValue(`gm_model_input_${platform}`, useLegacy ? GM_getValue('gm_model_input', '') : '')
+        };
+    }
+
+    function getOpenAIProtocol() {
+        const protocol = GM_getValue('gm_openai_protocol', CONFIG.defaults.openaiProtocol);
+        return protocol === 'responses' ? protocol : CONFIG.defaults.openaiProtocol;
+    }
+
+    function getReasoningEfforts(platform, model) {
+        const modelId = String(model).replace(/^(?:google|openai)\//, '').replace(/:[^:]+$/, '');
+        const profileId = Object.keys(CONFIG.reasoningProfiles).find(id =>
+            modelId === id || new RegExp(`^${id.replace(/\./g, '\\.')}-(?:\\d{8}|\\d{4}-\\d{2}-\\d{2})$`).test(modelId));
+        if (profileId) return CONFIG.reasoningProfiles[profileId];
+        if (platform === 'gemini') {
+            // Gemini 2.5 uses token budgets rather than thinkingLevel.
+            if (modelId.startsWith('gemini-2.')) return [];
+            return ['low', 'medium', 'high'];
+        }
+        if (modelId.startsWith('gpt-4')) return [];
+        // Compatible APIs and custom models may expose the complete effort enum.
+        return ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+    }
+
+    function getSavedReasoningEffort(platform) {
+        const legacy = platform === 'openrouter' && !GM_getValue('gm_reasoning_enable', true) ? 'none' : '';
+        return GM_getValue(`gm_reasoning_effort_${platform}`, legacy);
+    }
+
+    function getReasoningEffort(platform, model) {
+        const effort = getSavedReasoningEffort(platform);
+        return getReasoningEfforts(platform, model).includes(effort) ? effort : '';
+    }
+
+    function getOpenAIServiceTier(protocol) {
+        const tier = GM_getValue('gm_openai_service_tier', CONFIG.defaults.openaiServiceTier);
+        if (!CONFIG.openaiServiceTiers.includes(tier) || (tier === 'ultrafast' && protocol !== 'responses')) {
+            return CONFIG.defaults.openaiServiceTier;
+        }
+        return tier;
+    }
+
+    function normalizeOpenAIBaseUrl(value) {
+        const url = new URL(String(value || '').trim() || CONFIG.platforms.openai.endpoint);
+        if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+            throw new Error('API Base URL 必须是 HTTP(S) 地址，且不含认证信息、查询参数或片段');
+        }
+        url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/(?:chat\/completions|responses)$/i, '') || '/v1';
+        return url.href.replace(/\/+$/, '');
     }
 
     // Compute Levenshtein distance between two strings
@@ -884,8 +989,9 @@ Provide only the translated CSV lines plus the final finish line.
             const concurrency = getClampedIntegerSetting('gm_concurrency', CONFIG.defaults.concurrency, 1, 32);
             const batches = createTranslationBatches(entries, batchNodeCount);
             const workerCount = Math.min(concurrency, batches.length);
-            const model = GM_getValue('gm_model_input', '').trim()
-                || GM_getValue('gm_model', '')
+            const modelSettings = getPlatformModelSettings(platform);
+            const model = modelSettings.customModel.trim()
+                || modelSettings.model
                 || CONFIG.platforms[platform].models[0];
             const isDebug = GM_getValue('gm_debug', false);
 
@@ -1282,7 +1388,15 @@ Provide only the translated CSV lines plus the final finish line.
     }
 
     function createStreamRequestOptions(platform, apiKey, model, prompt, csvInput) {
+        const reasoningEffort = getReasoningEffort(platform, model);
         if (platform === 'gemini') {
+            const body = {
+                system_instruction: { parts: [{ text: prompt }] },
+                contents: [{ parts: [{ text: csvInput }] }]
+            };
+            if (reasoningEffort) {
+                body.generationConfig = { thinkingConfig: { thinkingLevel: reasoningEffort } };
+            }
             return {
                 method: 'POST',
                 url: `${CONFIG.platforms.gemini.endpoint}/${model}:streamGenerateContent?alt=sse`,
@@ -1291,39 +1405,58 @@ Provide only the translated CSV lines plus the final finish line.
                     'Content-Type': 'application/json',
                     'x-goog-api-key': apiKey
                 },
-                data: JSON.stringify({
-                    system_instruction: { parts: [{ text: prompt }] },
-                    contents: [{ parts: [{ text: csvInput }] }]
-                })
+                data: JSON.stringify(body)
             };
         }
 
-        const reasoningEnabled = GM_getValue('gm_reasoning_enable', true);
-        return {
-            method: 'POST',
-            url: CONFIG.platforms.openrouter.endpoint,
-            responseType: 'stream',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
-            data: JSON.stringify({
+        const protocol = platform === 'openai' ? getOpenAIProtocol() : 'chat';
+        const body = protocol === 'responses'
+            ? { model, instructions: prompt, input: csvInput, stream: true, store: false }
+            : {
                 model,
                 messages: [
                     { role: 'system', content: prompt },
                     { role: 'user', content: csvInput }
                 ],
-                reasoning: {
-                    enabled: reasoningEnabled
-                },
                 stream: true
-            })
+            };
+        let url;
+        if (platform === 'openai') {
+            const baseUrl = normalizeOpenAIBaseUrl(GM_getValue('gm_openai_base_url', ''));
+            url = `${baseUrl}/${protocol === 'responses' ? 'responses' : 'chat/completions'}`;
+            const serviceTier = getOpenAIServiceTier(protocol);
+            if (serviceTier) body.service_tier = serviceTier;
+            body.store = false;
+            if (reasoningEffort) {
+                if (protocol === 'responses') body.reasoning = { effort: reasoningEffort };
+                else body.reasoning_effort = reasoningEffort;
+            }
+        } else {
+            url = CONFIG.platforms.openrouter.endpoint;
+            if (reasoningEffort) {
+                body.reasoning = reasoningEffort === 'none'
+                    ? { enabled: false }
+                    : { effort: reasoningEffort };
+            }
+        }
+
+        return {
+            method: 'POST',
+            url,
+            responseType: 'stream',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            },
+            data: JSON.stringify(body)
         };
     }
 
     function consumeSSEPayload(chunk, parserState, onPayload) {
-        parserState.buffer += chunk.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-        const events = parserState.buffer.split('\n\n');
+        // Keep line endings intact until a complete event arrives, including
+        // when the transport splits a CRLF pair across two chunks.
+        parserState.buffer += chunk;
+        const events = parserState.buffer.split(/\r\n\r\n|\n\n|\r\r/);
         parserState.buffer = events.pop() || '';
         events.forEach(event => dispatchSSEEvent(event, onPayload));
     }
@@ -1342,7 +1475,7 @@ Provide only the translated CSV lines plus the final finish line.
         if (!rawEvent.trim()) return;
 
         const dataLines = rawEvent
-            .split('\n')
+            .split(/\r\n|\n|\r/)
             .map(line => line.trimEnd())
             .filter(line => line.startsWith('data:'))
             .map(line => line.slice(5).trimStart());
@@ -1364,13 +1497,39 @@ Provide only the translated CSV lines plus the final finish line.
         if (platform === 'gemini') {
             return (data.candidates || [])
                 .flatMap(candidate => candidate.content?.parts || [])
+                .filter(part => !part.thought)
                 .map(part => part.text || '')
                 .join('');
         }
 
+        if (platform === 'openai') {
+            if (data.type === 'error') {
+                throw new Error(data.message || data.code || 'OpenAI 流式响应错误');
+            }
+            if (data.type === 'response.failed' || data.type === 'response.incomplete') {
+                throw new Error(data.response?.error?.message
+                    || `OpenAI 响应未完成: ${data.response?.incomplete_details?.reason || data.type}`);
+            }
+            if (data.type === 'response.refusal.delta' || data.type === 'response.refusal.done') {
+                throw new Error(`OpenAI 拒绝翻译: ${data.delta || data.refusal || ''}`);
+            }
+            if (data.type === 'response.output_text.delta') {
+                return typeof data.delta === 'string' ? data.delta : '';
+            }
+            // Completed events contain the full output again. Only deltas
+            // belong in the CSV buffer; ignore lifecycle and reasoning events.
+            if (data.type?.startsWith('response.')) return '';
+        }
+
         const hasErrorFinishReason = (data.choices || []).some(choice => choice.finish_reason === 'error');
         if (hasErrorFinishReason) {
-            throw new Error('OpenRouter 流式响应中断');
+            throw new Error(`${CONFIG.platforms[platform].name} 流式响应中断`);
+        }
+        if (platform === 'openai') {
+            const interrupted = (data.choices || []).find(choice => ['length', 'content_filter'].includes(choice.finish_reason));
+            if (interrupted) throw new Error(`OpenAI 响应未完成: ${interrupted.finish_reason}`);
+            const refusal = (data.choices || []).find(choice => choice.delta?.refusal);
+            if (refusal) throw new Error(`OpenAI 拒绝翻译: ${refusal.delta.refusal}`);
         }
 
         return (data.choices || [])
@@ -1405,7 +1564,7 @@ Provide only the translated CSV lines plus the final finish line.
             <div id="gm-settings-overlay">
                 <div id="gm-settings-panel">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.1.0</h3>
+                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.3.0</h3>
                     </div>
                     
                     <div>
@@ -1413,6 +1572,7 @@ Provide only the translated CSV lines plus the final finish line.
                         <select id="gm-platform" class="gm-select">
                             <option value="gemini">Google Gemini</option>
                             <option value="openrouter">OpenRouter</option>
+                            <option value="openai">OpenAI / 兼容 API</option>
                         </select>
                     </div>
 
@@ -1429,11 +1589,38 @@ Provide only the translated CSV lines plus the final finish line.
                         <label class="gm-label" id="gm-key-label">API 密钥</label>
                         <input type="text" id="gm-key" class="gm-input gm-input-secret" placeholder="粘贴 API 密钥" spellcheck="false">
                     </div>
+
+                    <div id="gm-openai-settings" class="gm-hidden">
+                        <label class="gm-label">API Base URL</label>
+                        <input type="url" id="gm-openai-base-url" class="gm-input" placeholder="https://api.openai.com/v1" spellcheck="false">
+                        <label class="gm-label" style="margin-top:12px">API 协议</label>
+                        <select id="gm-openai-protocol" class="gm-select">
+                            <option value="chat">Chat Completions (/chat/completions)</option>
+                            <option value="responses">Responses (/responses)</option>
+                        </select>
+                        <label class="gm-label" style="margin-top:12px">Service Tier（服务等级）</label>
+                        <select id="gm-openai-service-tier" class="gm-select">
+                            <option value="">不发送（兼容接口）</option>
+                            <option value="auto">Auto（跟随项目设置）</option>
+                            <option value="default">Default（标准）</option>
+                            <option value="flex">Flex</option>
+                            <option value="priority">Priority</option>
+                            <option value="fast">Fast</option>
+                            <option value="scale">Scale</option>
+                            <option value="ultrafast" id="gm-openai-ultrafast">Ultrafast（仅 Responses）</option>
+                        </select>
+                    </div>
                     
                     <div>
                         <label class="gm-label">模型</label>
                         <select id="gm-model" class="gm-select" style="margin-bottom:8px"></select>
-                        <input type="text" id="gm-model-input" class="gm-input" placeholder="或手动输入模型代码">
+                        <input type="text" id="gm-model-input" class="gm-input" placeholder="手动模型代码（优先于列表）">
+                    </div>
+
+                    <div>
+                        <label class="gm-label">Reasoning / Thinking 强度</label>
+                        <select id="gm-reasoning-effort" class="gm-select"></select>
+                        <div id="gm-reasoning-hint" style="color:#9aa0a6; font-size:12px; margin-top:6px"></div>
                     </div>
 
                     <div class="gm-checkbox-group">
@@ -1442,9 +1629,6 @@ Provide only the translated CSV lines plus the final finish line.
                         </label>
                         <label class="gm-checkbox-label">
                             <input type="checkbox" id="gm-debug"> 调试模式
-                        </label>
-                         <label class="gm-checkbox-label gm-hidden" id="gm-reasoning-container">
-                            <input type="checkbox" id="gm-reasoning"> 启用推理 (Reasoning)
                         </label>
                     </div>
 
@@ -1511,21 +1695,35 @@ Provide only the translated CSV lines plus the final finish line.
 
         // Platform selection handler
         document.getElementById('gm-platform').onchange = updatePlatformUI;
+        document.getElementById('gm-openai-protocol').onchange = updateOpenAIProtocolUI;
+        document.getElementById('gm-model').onchange = () => updateReasoningUI();
+        document.getElementById('gm-model-input').oninput = () => updateReasoningUI();
         document.getElementById('gm-target-language-select').onchange = updateTargetLanguageUI;
         
         document.getElementById('gm-save').onclick = () => {
             const platform = document.getElementById('gm-platform').value;
-            
-            // Save all API keys regardless of selected platform
-            GM_setValue(`gm_api_key_${platform}`, document.getElementById('gm-key').value.trim());
-            
+            let openaiBaseUrl;
+            try {
+                openaiBaseUrl = normalizeOpenAIBaseUrl(document.getElementById('gm-openai-base-url').value);
+            } catch (error) {
+                showToast(error.message, 'error');
+                return;
+            }
+
+            capturePlatformSettings();
+            state.settingsDrafts.forEach((draft, draftPlatform) => {
+                GM_setValue(`gm_api_key_${draftPlatform}`, draft.apiKey);
+                GM_setValue(`gm_model_${draftPlatform}`, draft.model);
+                GM_setValue(`gm_model_input_${draftPlatform}`, draft.customModel);
+                GM_setValue(`gm_reasoning_effort_${draftPlatform}`, draft.reasoningEffort);
+            });
             GM_setValue('gm_platform', platform);
             GM_setValue('gm_target_language', readTargetLanguageFromUI());
-            GM_setValue('gm_model', document.getElementById('gm-model').value);
-            GM_setValue('gm_model_input', document.getElementById('gm-model-input').value.trim());
+            GM_setValue('gm_openai_base_url', openaiBaseUrl);
+            GM_setValue('gm_openai_protocol', document.getElementById('gm-openai-protocol').value);
+            GM_setValue('gm_openai_service_tier', document.getElementById('gm-openai-service-tier').value);
             GM_setValue('gm_cache_enable', document.getElementById('gm-cache').checked);
             GM_setValue('gm_debug', document.getElementById('gm-debug').checked);
-            GM_setValue('gm_reasoning_enable', document.getElementById('gm-reasoning').checked);
 
             const similarityInput = parseFloat(document.getElementById('gm-url-similarity').value);
             const similarity = Number.isNaN(similarityInput)
@@ -1562,17 +1760,35 @@ Provide only the translated CSV lines plus the final finish line.
     }
 
     // Update UI based on selected platform
+    function capturePlatformSettings() {
+        if (!state.settingsPlatform) return;
+        state.settingsDrafts.set(state.settingsPlatform, {
+            apiKey: document.getElementById('gm-key').value.trim(),
+            model: document.getElementById('gm-model').value,
+            customModel: document.getElementById('gm-model-input').value.trim(),
+            reasoningEffort: document.getElementById('gm-reasoning-effort').value
+        });
+    }
+
     function updatePlatformUI() {
+        capturePlatformSettings();
         const platform = document.getElementById('gm-platform').value;
+        state.settingsPlatform = platform;
         const modelSelect = document.getElementById('gm-model');
         const keyInput = document.getElementById('gm-key');
-        
-        // Load saved API key for this platform
-        keyInput.value = GM_getValue(`gm_api_key_${platform}`, '');
+        const draft = state.settingsDrafts.get(platform) || {
+            ...getPlatformModelSettings(platform),
+            apiKey: GM_getValue(`gm_api_key_${platform}`, ''),
+            reasoningEffort: getSavedReasoningEffort(platform)
+        };
+        keyInput.value = draft.apiKey;
+        document.getElementById('gm-model-input').value = draft.customModel;
         
         // Update model dropdown
         modelSelect.innerHTML = '';
-        const models = CONFIG.platforms[platform].models;
+        // Keep a previously selected model visible even if it left the preset list.
+        const models = [...CONFIG.platforms[platform].models];
+        if (draft.model && !models.includes(draft.model)) models.push(draft.model);
         models.forEach(model => {
             const option = document.createElement('option');
             option.value = model;
@@ -1581,19 +1797,42 @@ Provide only the translated CSV lines plus the final finish line.
         });
         
         // Restore saved model if it exists in the list
-        const savedModel = GM_getValue('gm_model', '');
+        const savedModel = draft.model;
         if (models.includes(savedModel)) {
             modelSelect.value = savedModel;
         }
 
-        // Toggle Reasoning option
-        const reasoningContainer = document.getElementById('gm-reasoning-container');
-        if (reasoningContainer) {
-            if (platform === 'openrouter') {
-                reasoningContainer.classList.remove('gm-hidden');
-            } else {
-                reasoningContainer.classList.add('gm-hidden');
-            }
+        document.getElementById('gm-openai-settings').classList.toggle('gm-hidden', platform !== 'openai');
+        updateReasoningUI(draft.reasoningEffort);
+    }
+
+    function updateReasoningUI(savedEffort) {
+        const platform = document.getElementById('gm-platform').value;
+        const model = document.getElementById('gm-model-input').value.trim()
+            || document.getElementById('gm-model').value;
+        const select = document.getElementById('gm-reasoning-effort');
+        const selectedEffort = savedEffort ?? select.value;
+        const efforts = getReasoningEfforts(platform, model);
+        select.innerHTML = '';
+        ['', ...efforts].forEach(effort => {
+            const option = document.createElement('option');
+            option.value = effort;
+            option.textContent = CONFIG.reasoningEffortLabels[effort];
+            select.appendChild(option);
+        });
+        select.value = efforts.includes(selectedEffort) ? selectedEffort : '';
+        select.disabled = efforts.length === 0;
+        document.getElementById('gm-reasoning-hint').textContent = efforts.length === 0
+            ? '此模型不支持按强度设置；使用模型默认行为。'
+            : '默认保留服务端行为；自定义模型的可用档位以服务端为准。';
+    }
+
+    function updateOpenAIProtocolUI() {
+        const isResponses = document.getElementById('gm-openai-protocol').value === 'responses';
+        document.getElementById('gm-openai-ultrafast').disabled = !isResponses;
+        const tierSelect = document.getElementById('gm-openai-service-tier');
+        if (!isResponses && tierSelect.value === 'ultrafast') {
+            tierSelect.value = CONFIG.defaults.openaiServiceTier;
         }
     }
 
@@ -1651,16 +1890,21 @@ Provide only the translated CSV lines plus the final finish line.
 
     function openSettings() {
         ensureUI();
+        state.settingsPlatform = null;
+        state.settingsDrafts.clear();
         const platform = GM_getValue('gm_platform', CONFIG.defaults.platform);
         document.getElementById('gm-platform').value = platform;
+        document.getElementById('gm-openai-base-url').value = GM_getValue('gm_openai_base_url', '');
+        const protocol = getOpenAIProtocol();
+        document.getElementById('gm-openai-protocol').value = protocol;
+        document.getElementById('gm-openai-service-tier').value = getOpenAIServiceTier(protocol);
+        updateOpenAIProtocolUI();
         
         updatePlatformUI();
         
         setTargetLanguageUI(getTargetLanguage());
-        document.getElementById('gm-model-input').value = GM_getValue('gm_model_input', '');
         document.getElementById('gm-cache').checked = GM_getValue('gm_cache_enable', true);
         document.getElementById('gm-debug').checked = GM_getValue('gm_debug', false);
-        document.getElementById('gm-reasoning').checked = GM_getValue('gm_reasoning_enable', true);
         document.getElementById('gm-batch-size').value = getClampedIntegerSetting('gm_batch_node_count', CONFIG.defaults.batchNodeCount, 1, 5000);
         document.getElementById('gm-concurrency').value = getClampedIntegerSetting('gm_concurrency', CONFIG.defaults.concurrency, 1, 32);
         const similarity = getUrlSimilarityThreshold();
@@ -1669,6 +1913,7 @@ Provide only the translated CSV lines plus the final finish line.
         document.getElementById('gm-cache-ttl').value = GM_getValue('gm_cache_ttl', CONFIG.defaults.cacheTTL);
         
         updateCacheStats();
+        document.getElementById('gm-settings-panel').scrollTop = 0;
         document.getElementById('gm-settings-overlay').classList.add('open');
     }
     
