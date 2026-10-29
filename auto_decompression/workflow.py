@@ -14,6 +14,7 @@ import extract_hidden_zip as hiddenZip
 from console import print_info, print_warning
 from extraction import (
     extract_with_7zip,
+    get_password_workers,
     handle_bandizip_extraction,
     manual_password_entry,
     try_passwords,
@@ -55,8 +56,10 @@ class ExtractionWorkflow:
         trash_on_success=True,
         extract_to_base_folder=False,
         use_binwalk=False,
+        password_workers=None,
     ):
         self.password_book = password_book
+        self.password_workers = get_password_workers(password_workers)
         self.embedded_scan_depth = max(0, embedded_scan_depth)
         self.auto_flatten_single_file = flatten_single_file
         self.trash_on_success = trash_on_success
@@ -100,7 +103,10 @@ class ExtractionWorkflow:
         while True:
             try_result = extract_with_7zip(file_path, temp_folder, password)
             if try_result == -1:
-                next_password = try_passwords(file_path, temp_folder, passwords, password)
+                next_password = try_passwords(
+                    file_path, temp_folder, passwords, password,
+                    password_workers=self.password_workers,
+                )
                 if next_password is None:
                     name_pwd = last_compressed_file_name
                     if name_pwd and name_pwd != password:
@@ -118,7 +124,8 @@ class ExtractionWorkflow:
             elif try_result == -2:
                 if file_path.endswith(RECOVER_SUFFIX):
                     new_password = handle_bandizip_extraction(
-                        file_path, temp_folder, passwords, level
+                        file_path, temp_folder, passwords, level,
+                        password_workers=self.password_workers,
                     )
                     if new_password:
                         password = new_password

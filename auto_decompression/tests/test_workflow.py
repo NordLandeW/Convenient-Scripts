@@ -208,6 +208,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.recycled, [])
         self.manual.assert_called_once()
 
+    def test_parallel_password_workers_is_forwarded_to_dictionary(self):
+        source = self.source()
+        self.archives["outer.zip"] = -1
+        self.run_files(source, password_workers=3)
+        self.assertEqual(self.dictionary.call_args.kwargs["password_workers"], 3)
+
     def test_backend_failure_does_not_publish_partial_files_or_recycle_source(self):
         source = self.source()
 
@@ -370,13 +376,14 @@ class WorkflowTests(unittest.TestCase):
         self.signature.side_effect = lambda filename, fmt: fmt == "zip"
         self.hidden_extract.side_effect = lambda source, target, fmt: Path(target).write_bytes(b"recovered")
 
-        def bandizip(filename, destination, passwords, level):
+        def bandizip(filename, destination, passwords, level, *, password_workers):
             self.materialize(destination, {"a.txt": b"a", "b.txt": b"b"})
             return "alternate"
 
         self.bandizip.side_effect = bandizip
-        self.run_files(source, embedded_scan_depth=1)
+        self.run_files(source, embedded_scan_depth=1, password_workers=3)
         self.bandizip.assert_called_once()
+        self.assertEqual(self.bandizip.call_args.kwargs["password_workers"], 3)
         self.assertTrue(self.bandizip.call_args.args[0].endswith(".AutoDecRecovered"))
         self.assertEqual(self.tree(self.base), {
             "cover": None, "cover/a.txt": b"a", "cover/b.txt": b"b"

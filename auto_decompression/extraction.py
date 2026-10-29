@@ -1,3 +1,4 @@
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import os
 import re
 import subprocess
@@ -262,15 +263,17 @@ def extract_with_bandizip(file_path, extract_to, password=None):
     return -3
 
 
-def handle_bandizip_extraction(file_path, temp_folder, passwords, level):
+def handle_bandizip_extraction(file_path, temp_folder, passwords, level, *, password_workers=None):
     """
-    使用 Bandizip 处理解压，会遍历密码字典并支持手动输入。
+    使用 Bandizip 并行测试密码字典，找到密码后单次解压，并支持手动输入。
     成功则返回密码，失败则返回 None。
     """
     print_info("7zip 打不开这个提取出来的文件，换用 Bandizip 试试喵...")
-    # 1. 尝试密码字典中的所有密码
-    for pwd_item in passwords:
-        pwd = pwd_item[0]
+    # 1. 只读并行测试，不让多个解压进程同时写入同一文件夹。
+    pwd = _find_password(
+        file_path, passwords, password_workers=password_workers, backend="bz"
+    )
+    if pwd is not None:
         result = extract_with_bandizip(file_path, temp_folder, pwd)
         if result == 1:  # 成功
             print_success(f"Bandizip 使用密码 '{pwd}' 解压成功喵！")
@@ -305,14 +308,99 @@ def handle_bandizip_extraction(file_path, temp_folder, passwords, level):
             return None
 
 
-def try_passwords(file_path, extract_to, passwords, last_tried_password):
-    """Iterates through dictionary passwords to find a match."""
-    for password in passwords:
-        password = password[0]
-        if last_tried_password == password:
-            continue
-        if extract_with_7zip(file_path, extract_to, password) > 0:
-            return password
+def get_password_workers(workers=None):
+    """Default to 80% of hardware threads (floor), with at least one worker."""
+    if workers is None:
+        return max(1, (os.cpu_count() or 1) * 4 // 5)
+    if not isinstance(workers, int) or workers < 1:
+        raise ValueError("password_workers must be a positive integer")
+    return workers
+
+
+def _test_archive_password(file_path, password, stop_event, *, backend="7z"):
+    """Read-only integrity probe; reap the child promptly when another wins."""
+    if stop_event.is_set():
+        return False
+    if backend == "bz":
+        command = ["bz", "t", "-y", f"-p:{password}", file_path]
+    else:
+        # One process per worker: prevent nested 7z decoder thread pools from
+        # multiplying the configured CPU budget. Test mode writes no files.
+        command = ["7z", "t", file_path, f"-p{password}", "-mmt=1", "-y", "-bd"]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        while not stop_event.is_set():
+            try:
+                return process.wait(timeout=0.1) == 0
+            except subprocess.TimeoutExpired:
+                pass
+        return False
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def _find_password(file_path, passwords, last_tried_password=None, *, password_workers=None, backend="7z"):
+    """Probe a bounded window in dictionary order; first verified match wins."""
+    worker_limit = get_password_workers(password_workers)
+    candidates = list(dict.fromkeys(
+        password for password, _ in passwords if password != last_tried_password
+    ))
+    if not candidates:
+        return None
+    workers = min(worker_limit, len(candidates))
+    print_info(f"使用 {workers} 个线程并行测试 {len(candidates)} 个候选密码喵。")
+    remaining = iter(candidates)
+    stop_event = threading.Event()
+    # Never enqueue the whole dictionary. Cancellation therefore leaves at
+    # most `workers` active/queued probes, all stopped before real extraction.
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="password-test") as executor:
+        pending = {}
+        try:
+            while True:
+                while len(pending) < workers:
+                    password = next(remaining, None)
+                    if password is None:
+                        break
+                    future = executor.submit(
+                        _test_archive_password, file_path, password, stop_event,
+                        backend=backend,
+                    )
+                    pending[future] = password
+                if not pending:
+                    return None
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # Insertion order preserves dictionary preference when several
+                # tests finish in the same batch, without waiting on slow ones.
+                for future in list(pending):
+                    if future in completed:
+                        password = pending.pop(future)
+                        if future.result():
+                            return password
+        finally:
+            stop_event.set()
+            for future in pending:
+                future.cancel()
+
+
+def try_passwords(file_path, extract_to, passwords, last_tried_password, *, password_workers=None):
+    """Test passwords concurrently, then extract only once on the caller thread."""
+    password = _find_password(
+        file_path, passwords, last_tried_password, password_workers=password_workers
+    )
+    if password is not None and extract_with_7zip(file_path, extract_to, password) > 0:
+        return password
     return None
 
 

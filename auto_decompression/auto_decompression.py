@@ -9,6 +9,7 @@ import traceback
 from platformdirs import PlatformDirs
 
 from console import console, print_error, print_info, print_warning
+from extraction import get_password_workers
 from housekeeping import _ensure_directory
 from instance_queue import InstanceQueue
 from passwords import PasswordBook
@@ -28,6 +29,13 @@ def str2bool(value):
     raise argparse.ArgumentTypeError("flatten-single-file 期望布尔值喵（true/false）")
 
 
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("线程数必须为正整数喵")
+    return number
+
+
 def parse_cli_arguments(argv):
     parser = argparse.ArgumentParser(
         prog="auto_decompression",
@@ -38,6 +46,10 @@ def parse_cli_arguments(argv):
         "-e", "--embedded-scan-depth", type=int,
         default=DEFAULT_EMBEDDED_SCAN_MAX_LEVEL, metavar="K",
         help="在递归层级小于等于 K 时尝试检测及提取隐藏嵌入文件，设为 0 可禁用此功能",
+    )
+    parser.add_argument(
+        "--password-workers", type=positive_int, default=get_password_workers(), metavar="N",
+        help="密码字典的并行测试线程数，默认使用硬件线程数的 80%%（向下取整，最少 1 个）",
     )
     parser.add_argument(
         "--flatten-single-file", type=str2bool, default=True, metavar="{true,false}",
@@ -95,6 +107,7 @@ def _run_primary(args, password_book, queue):
         flatten_single_file=args.flatten_single_file,
         trash_on_success=args.trash_on_success,
         use_binwalk=args.use_binwalk,
+        password_workers=args.password_workers,
     )
     if not args.flatten_single_file:
         print_info("已禁用同名单文件自动扁平化喵。")
@@ -158,6 +171,8 @@ def main(argv=None):
                     print(str(args.files))
                 if args.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
                     print_warning("已有实例正在运行，新的嵌入扫描层级参数未被应用喵。请先关闭原实例再重新运行。")
+                if args.password_workers != get_password_workers():
+                    print_warning("已有实例正在运行，新的 --password-workers 参数未被应用喵。请先关闭原实例再重新运行。")
                 if args.use_binwalk:
                     print_warning("已有实例正在运行，新的 --use-binwalk 参数未被应用喵。请先关闭原实例再重新运行。")
                 print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")

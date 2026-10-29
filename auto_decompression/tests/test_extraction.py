@@ -73,10 +73,11 @@ class ExtractorResults(unittest.TestCase):
             self.assertEqual(extraction.extract_with_bandizip(str(self.source), str(self.target)), -2)
 
     def test_dictionary_attempt_order_and_skip(self):
-        with patch.object(extraction, "extract_with_7zip", side_effect=[-1, 1]) as backend:
-            result = extraction.try_passwords("input", "output", [("most", 9), ("middle", 5), ("last", 1)], "middle")
+        with patch.object(extraction, "_test_archive_password", side_effect=[False, True]) as probe, patch.object(extraction, "extract_with_7zip", return_value=1) as backend:
+            result = extraction.try_passwords("input", "output", [("most", 9), ("middle", 5), ("last", 1)], "middle", password_workers=1)
         self.assertEqual(result, "last")
-        self.assertEqual([call.args[2] for call in backend.call_args_list], ["most", "last"])
+        self.assertEqual([call.args[1] for call in probe.call_args_list], ["most", "last"])
+        backend.assert_called_once_with("input", "output", "last")
 
     def test_manual_entry_retries_and_can_skip(self):
         with patch("builtins.input", side_effect=["bad", "good"]), patch.object(extraction, "extract_with_7zip", side_effect=[-1, 1]) as backend:
@@ -134,6 +135,56 @@ class RealExtractorRoundTrips(unittest.TestCase):
         target = self.target()
         self.assertEqual(extraction.extract_with_7zip(str(archive), str(target), "fixture-key"), 1)
         self.assertEqual((target / self.payload.name).read_bytes(), self.data)
+
+    def test_parallel_dictionary_round_trip_with_read_only_probes(self):
+        for name, options in [
+            ("parallel.zip", []),
+            ("parallel.7z", ["-mhe=on"]),
+            ("parallel-split.7z", ["-mhe=on", "-v1k"]),
+        ]:
+            with self.subTest(name=name):
+                # Legacy ZipCrypto cannot represent arbitrary Unicode passwords.
+                password = "fixture-key" if name.endswith(".zip") else "密码-key"
+                archive = self.create_archive(name, "-p" + password, *options)
+                if "-v1k" in options:
+                    archive = Path(str(archive) + ".001")
+                target = self.target()
+                passwords = [("already-tried", 9), ("wrong", 8), (password, 7), ("other", 6)]
+                self.assertEqual(extraction.try_passwords(
+                    str(archive), str(target), passwords, "already-tried", password_workers=3
+                ), password)
+                self.assertEqual((target / self.payload.name).read_bytes(), self.data)
+                self.assertEqual(sorted(path.name for path in target.iterdir()), [self.payload.name])
+                failed_target = self.target()
+                self.assertIsNone(extraction.try_passwords(
+                    str(archive), str(failed_target), [("wrong1", 2), ("wrong2", 1)], None,
+                    password_workers=2,
+                ))
+                self.assertEqual(list(failed_target.iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("bz"), "Bandizip console tool is required")
+    def test_parallel_bandizip_dictionary_round_trip(self):
+        archive = self.create_archive("parallel-bandizip.zip", "-pfixture-key")
+        target = self.target()
+        self.assertEqual(extraction.handle_bandizip_extraction(
+            str(archive), str(target), [("wrong", 2), ("fixture-key", 1)], 1,
+            password_workers=2,
+        ), "fixture-key")
+        self.assertEqual((target / self.payload.name).read_bytes(), self.data)
+
+
+    def test_workflow_finds_dictionary_password_and_publishes_intact_payload(self):
+        archive = self.create_archive("dictionary.zip", "-pfixture-key")
+        self.book.passwords = {"wrong-first": 10, "wrong-second": 9, "fixture-key": 1}
+        runner = ExtractionWorkflow(
+            self.book, password_workers=3, trash_on_success=False, embedded_scan_depth=0
+        )
+        with patch("builtins.input", side_effect=AssertionError("dictionary search must succeed")):
+            runner.process_files([str(archive)])
+        self.assertEqual((self.root / "dictionary" / self.payload.name).read_bytes(), self.data)
+        self.assertTrue(archive.exists())
+        self.assertEqual(runner.last_success_password, "fixture-key")
+        self.assertEqual(self.book.passwords["fixture-key"], 2)
 
     def test_empty_book_can_use_archive_name_password(self):
         archive = self.create_archive("fixture-key.zip", "-pfixture-key")

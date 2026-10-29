@@ -52,6 +52,21 @@ class CliTests(unittest.TestCase):
             self.assertFalse(cli.str2bool(text))
         self.assertTrue(cli.str2bool("YES"))
 
+    def test_password_workers_default_and_override(self):
+        with patch("extraction.os.cpu_count", return_value=16):
+            self.assertEqual(cli.parse_cli_arguments([]).password_workers, 12)
+        self.assertEqual(cli.parse_cli_arguments(["--password-workers", "3"]).password_workers, 3)
+        with patch("sys.stderr", new=io.StringIO()):
+            for value in ("0", "-1", "abc", "1.5"):
+                with self.subTest(value=value), self.assertRaises(SystemExit) as error:
+                    cli.parse_cli_arguments(["--password-workers", value])
+                self.assertEqual(error.exception.code, 2)
+
+    def test_password_workers_is_forwarded_to_workflow(self):
+        self.assertEqual(cli.main(["--password-workers", "3", "file.zip"]), 0)
+        self.assertEqual(cli.ExtractionWorkflow.call_args.kwargs["password_workers"], 3)
+
+
     def test_show_paths_does_not_start_queue_or_sync_book(self):
         override = self.root / "override"
         self.assertEqual(cli.main(["--config-dir", str(override), "--show-paths"]), 0)
@@ -67,6 +82,13 @@ class CliTests(unittest.TestCase):
         cli.PasswordBook.assert_not_called()
         self.queue.start.assert_not_called()
         self.runner.process_files.assert_not_called()
+
+    def test_secondary_warns_that_password_worker_override_is_not_applied(self):
+        self.queue.claim_or_submit.return_value = False
+        with patch.object(cli, "print_warning") as warning:
+            self.assertEqual(cli.main(["--password-workers", "999", "a.zip"]), 0)
+        self.assertTrue(any("--password-workers" in call.args[0] for call in warning.call_args_list))
+        cli.ExtractionWorkflow.assert_not_called()
 
     def test_primary_processes_batches_before_single_exit_sync(self):
         self.queue.next_batch.side_effect = [["later.rar"], []]
@@ -132,7 +154,7 @@ class ImportAndHelpTests(unittest.TestCase):
     def test_script_help_retains_options(self):
         result = subprocess.run([sys.executable, "-B", str(Path(cli.__file__)), "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(result.returncode, 0, result.stderr)
-        for option in ("--embedded-scan-depth", "--flatten-single-file", "--trash-on-success", "--config-dir", "--show-paths", "--update-dict", "--check-dict-conflict-on-startup", "--use-binwalk"):
+        for option in ("--embedded-scan-depth", "--flatten-single-file", "--trash-on-success", "--config-dir", "--show-paths", "--update-dict", "--check-dict-conflict-on-startup", "--use-binwalk", "--password-workers"):
             self.assertIn(option, result.stdout)
 
 
