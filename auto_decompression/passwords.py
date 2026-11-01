@@ -19,6 +19,8 @@ from housekeeping import _ensure_directory
 
 GIST_CONFIG_FILE = "gist_config.json"
 PASSWORD_FILENAME = "dict.json"
+# Connect and socket-read inactivity limits, not a total request deadline.
+GIST_REQUEST_TIMEOUT = (5, 30)
 
 
 class PasswordBook:
@@ -69,6 +71,7 @@ class PasswordBook:
             response = requests.get(
                 f"https://api.github.com/gists/{cfg['gist_id']}",
                 headers=self._gist_headers(cfg["token"]),
+                timeout=GIST_REQUEST_TIMEOUT,
             )
             if response.status_code == 200:
                 gist = response.json()
@@ -86,6 +89,7 @@ class PasswordBook:
                 f"https://api.github.com/gists/{cfg['gist_id']}",
                 headers=self._gist_headers(cfg["token"]),
                 json=payload,
+                timeout=GIST_REQUEST_TIMEOUT,
             )
             return response.status_code == 200
         except Exception as error:
@@ -102,6 +106,7 @@ class PasswordBook:
             "https://api.github.com/gists",
             headers=self._gist_headers(token),
             json=payload,
+            timeout=GIST_REQUEST_TIMEOUT,
         )
         if response.status_code == 201:
             return response.json()["id"]
@@ -174,9 +179,16 @@ class PasswordBook:
     def read_passwords(self):
         try:
             with open(self.path, "r", encoding="utf-8") as file:
-                self.passwords = json.load(file)
+                dictionary = json.load(file)
+            if not isinstance(dictionary, dict) or not all(
+                isinstance(count, int) for count in dictionary.values()
+            ):
+                raise ValueError("密码本格式无效：期望密码到整数计数的字典")
+            self.passwords = dictionary
+            return True
         except Exception as error:
             print_warning(f"读取文件错误喵！错误信息：{error}")
+            return False
 
     def save_passwords(self):
         try:
@@ -229,10 +241,10 @@ class PasswordBook:
                 break
         if not os.path.exists(self.path):
             if self.pull_from_gist_if_possible():
-                return
+                return True
             self.passwords = {}
-        else:
-            self.read_passwords()
+            return True
+        return self.read_passwords()
 
     def sync_to_gist_before_exit(self):
         if self.gist_config is None or self.skip_gist_sync:

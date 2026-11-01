@@ -46,6 +46,25 @@ class PasswordBookTests(unittest.TestCase):
         other.read_passwords()
         self.assertEqual(other.passwords, {"密码": 1})
 
+    def test_read_passwords_reports_success_and_failure_without_erasing_local_bytes(self):
+        self.save({"retained": 7})
+        self.assertIs(self.book.read_passwords(), True)
+        self.assertEqual(self.book.passwords, {"retained": 7})
+        invalid = b"{ invalid JSON, retained for recovery }\n"
+        Path(self.book.path).write_bytes(invalid)
+        self.assertIs(self.book.read_passwords(), False)
+        self.assertEqual(Path(self.book.path).read_bytes(), invalid)
+        self.assertEqual(self.book.passwords, {"retained": 7})
+
+    def test_check_passwords_reports_invalid_existing_book(self):
+        for invalid in (b"{ incomplete", b'["not a dictionary"]', b'{"password": "not an integer"}'):
+            with self.subTest(content=invalid):
+                Path(self.book.path).write_bytes(invalid)
+                with patch.object(self.book, "_fetch_from_gist") as fetch:
+                    self.assertIs(self.book.check_passwords(), False)
+                self.assertEqual(Path(self.book.path).read_bytes(), invalid)
+                fetch.assert_not_called()
+
     def test_config_override_does_not_move_dictionary(self):
         self.save({"local": 4})
         self.assertTrue((self.data / "dict.json").is_file())
@@ -67,13 +86,13 @@ class PasswordBookTests(unittest.TestCase):
 
     def test_missing_local_book_pulls_remote_and_persists(self):
         with patch.object(self.book, "_fetch_from_gist", return_value=({"remote": 5}, "2026-01-01T00:00:00Z")):
-            self.book.check_passwords()
+            self.assertIs(self.book.check_passwords(), True)
         self.assertEqual(json.loads(Path(self.book.path).read_text(encoding="utf-8")), {"remote": 5})
         self.assertIsNotNone(self.book.gist_remote_ts)
 
     def test_missing_local_and_unavailable_remote_yields_empty_book(self):
         with patch.object(self.book, "_fetch_from_gist", return_value=(None, None)):
-            self.book.check_passwords()
+            self.assertIs(self.book.check_passwords(), True)
         self.assertEqual(self.book.passwords, {})
 
     def test_startup_conflict_default_pulls_remote(self):
@@ -118,6 +137,38 @@ class PasswordBookTests(unittest.TestCase):
         with patch.object(passwords.requests, "patch", return_value=Mock(status_code=200)) as upload:
             self.assertTrue(self.book._update_gist(cfg, '{"local": 3}'))
         self.assertEqual(upload.call_args.kwargs["json"]["files"]["dict.json"]["content"], '{"local": 3}')
+
+    def test_gist_requests_have_finite_connect_and_read_timeouts(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {"files": {"dict.json": {"content": "{}"}}, "updated_at": None}
+        created = Mock(status_code=201)
+        created.json.return_value = {"id": "created-fixture-id"}
+        with patch.object(passwords.requests, "get", return_value=response) as fetch, patch.object(passwords.requests, "patch", return_value=response) as update, patch.object(passwords.requests, "post", return_value=created) as create:
+            self.book._fetch_from_gist(self.book.gist_config)
+            self.book._update_gist(self.book.gist_config, "{}")
+            self.assertEqual(self.book._create_new_gist("fixture-token", "dict.json"), "created-fixture-id")
+        for name, request in (("GET", fetch), ("PATCH", update), ("POST", create)):
+            with self.subTest(method=name):
+                timeout = request.call_args.kwargs.get("timeout")
+                self.assertIsInstance(timeout, tuple)
+                self.assertEqual(len(timeout), 2)
+                for limit in timeout:
+                    self.assertIsInstance(limit, (int, float))
+                    self.assertGreater(limit, 0)
+                    self.assertLess(limit, float("inf"))
+
+    def test_transport_timeouts_preserve_local_book_and_report_failed_upload(self):
+        self.save({"valuable": 8})
+        original = Path(self.book.path).read_bytes()
+        with patch.object(passwords.requests, "get", side_effect=passwords.requests.exceptions.ConnectTimeout("fixture connect timeout")):
+            self.assertEqual(self.book._fetch_from_gist(self.book.gist_config), (None, None))
+        with patch.object(self.book, "_fetch_from_gist", return_value=(None, None)), patch.object(passwords.requests, "patch", side_effect=passwords.requests.exceptions.ReadTimeout("fixture read timeout")), patch.object(passwords, "print_warning") as warning:
+            self.book.sync_to_gist_before_exit()
+        self.assertEqual(Path(self.book.path).read_bytes(), original)
+        self.assertTrue(warning.called)
+        with patch.object(passwords.requests, "post", side_effect=passwords.requests.exceptions.ConnectTimeout("fixture creation timeout")):
+            with self.assertRaises(passwords.requests.exceptions.ConnectTimeout):
+                self.book._create_new_gist("fixture-token", "dict.json")
 
     def test_existing_gist_config_needs_no_interactive_setup(self):
         cfg = dict(self.book.gist_config)

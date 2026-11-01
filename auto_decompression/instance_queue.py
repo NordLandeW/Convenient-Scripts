@@ -80,11 +80,9 @@ class InstanceQueue:
             args=(self.queue_path, self.queue_lock_path, self._pending, self._stop_event),
             daemon=True,
         )
-        try:
-            self._process.start()
-        except BaseException:
-            self.close()
-            raise
+        # The context owner closes partially initialized workers on failure.
+        # Keep ownership until its password-book finalization has completed.
+        self._process.start()
 
     def _drain_unlocked(self):
         pending = []
@@ -94,13 +92,13 @@ class InstanceQueue:
         pending.extend(_read_disk_queue(self.queue_path))
         return pending
 
-    def next_batch(self):
-        """Atomically drain pending paths, or relinquish an idle primary."""
+    def next_batch(self, *, release_if_idle=True):
+        """Drain paths; only the final post-sync check may release an idle owner."""
         if not self._owns_instance:
             return []
         with FileLock(self.queue_lock_path):
             pending = self._drain_unlocked()
-            if not pending:
+            if not pending and release_if_idle:
                 # Signal while holding the same lock used by the listener. A
                 # listener waiting on this lock cannot steal the next owner's work.
                 if self._stop_event is not None:

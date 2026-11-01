@@ -6,6 +6,7 @@ import sys
 import time
 import traceback
 
+from filelock import FileLock
 from platformdirs import PlatformDirs
 
 from console import console, print_error, print_info, print_warning
@@ -85,6 +86,14 @@ def parse_cli_arguments(argv):
     return parser.parse_args(argv)
 
 
+def _sync_password_book(password_book):
+    """Finish one sync attempt without stranding tasks accepted during it."""
+    try:
+        password_book.sync_to_gist_before_exit()
+    except Exception as error:
+        print_warning(f"同步密码本时出错喵，将保留本地内容：{error}")
+
+
 def _run_primary(args, password_book, queue):
     password_book.ensure_gist_config()
     if args.update_dict:
@@ -96,50 +105,72 @@ def _run_primary(args, password_book, queue):
         print_error("强制拉取密码本失败喵。")
         return 1
 
-    password_book.check_passwords()
-    if args.check_dict_conflict_on_startup:
-        password_book.check_dict_conflict_on_startup()
-    queue.start()
+    if not password_book.check_passwords():
+        print_error("密码本未能安全加载，已停止处理且不会上传喵。")
+        return 1
+    needs_final_sync = True
+    try:
+        if args.check_dict_conflict_on_startup:
+            password_book.check_dict_conflict_on_startup()
+        queue.start()
 
-    workflow = ExtractionWorkflow(
-        password_book,
-        embedded_scan_depth=args.embedded_scan_depth,
-        flatten_single_file=args.flatten_single_file,
-        trash_on_success=args.trash_on_success,
-        use_binwalk=args.use_binwalk,
-        password_workers=args.password_workers,
-    )
-    if not args.flatten_single_file:
-        print_info("已禁用同名单文件自动扁平化喵。")
-    if args.use_binwalk:
-        print_info("已启用 binwalk 进行隐藏嵌入文件判定喵。")
-    if args.embedded_scan_depth < 0:
-        print_warning("嵌入检测层级小于 0 喵，已自动调整为 0（禁用嵌入扫描）。")
-    if workflow.embedded_scan_depth == 0:
-        print_info("当前已禁用隐藏嵌入文件判定喵。")
-    elif workflow.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
-        print_info(f"隐藏嵌入文件判定最大层级已调整为 {workflow.embedded_scan_depth} 层喵。")
+        workflow = ExtractionWorkflow(
+            password_book,
+            embedded_scan_depth=args.embedded_scan_depth,
+            flatten_single_file=args.flatten_single_file,
+            trash_on_success=args.trash_on_success,
+            use_binwalk=args.use_binwalk,
+            password_workers=args.password_workers,
+        )
+        if not args.flatten_single_file:
+            print_info("已禁用同名单文件自动扁平化喵。")
+        if args.use_binwalk:
+            print_info("已启用 binwalk 进行隐藏嵌入文件判定喵。")
+        if args.embedded_scan_depth < 0:
+            print_warning("嵌入检测层级小于 0 喵，已自动调整为 0（禁用嵌入扫描）。")
+        if workflow.embedded_scan_depth == 0:
+            print_info("当前已禁用隐藏嵌入文件判定喵。")
+        elif workflow.embedded_scan_depth != DEFAULT_EMBEDDED_SCAN_MAX_LEVEL:
+            print_info(f"隐藏嵌入文件判定最大层级已调整为 {workflow.embedded_scan_depth} 层喵。")
 
-    files_to_process = list(args.files)
-    if not files_to_process:
-        print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
-        print_info("也可以输入想要添加的密码喵：")
+        files_to_process = list(args.files)
+        if not files_to_process:
+            print_warning("请拖拽一个文件到这个脚本上进行解压喵！")
+            print_info("也可以输入想要添加的密码喵：")
+            while True:
+                password = input()
+                if password == "":
+                    break
+                password_book.add_password(password, 0)
+                password_book.save_passwords()
+                print_info(f"已添加密码 {password} 喵！")
+            # Manual password entry follows the same post-sync handoff as files.
+            files_to_process = queue.next_batch(release_if_idle=False)
+
         while True:
-            password = input()
-            if password == "":
+            while files_to_process:
+                workflow.process_files(files_to_process)
+                files_to_process = queue.next_batch(release_if_idle=False)
+            # Keep instance ownership, but never the queue-file lock, across I/O.
+            # A normal sync attempt must not be repeated by exception cleanup.
+            needs_final_sync = False
+            _sync_password_book(password_book)
+            files_to_process = queue.next_batch()
+            if not files_to_process:
                 break
-            password_book.add_password(password, 0)
-            password_book.save_passwords()
-            print_info(f"已添加密码 {password} 喵！")
-        # Files submitted while entering passwords still belong to this primary.
-        files_to_process = queue.next_batch()
-
-    while files_to_process:
-        workflow.process_files(files_to_process)
-        files_to_process = queue.next_batch()
-    if args.files:
-        print_info("解压完成，退出程序喵...")
-    return 0
+            needs_final_sync = True
+        if args.files:
+            print_info("解压和密码同步处理完成，退出程序喵...")
+        return 0
+    finally:
+        if needs_final_sync:
+            # Startup/processing failed after a valid load. Preserve learned
+            # passwords and finalize while both ownership locks are still held.
+            try:
+                password_book.save_passwords()
+            except Exception as error:
+                print_warning(f"保存密码本时出错喵：{error}")
+            _sync_password_book(password_book)
 
 
 def error_end(error=None):
@@ -163,7 +194,6 @@ def main(argv=None):
         print_info(f"数据目录: {data_dir}")
         return 0
 
-    book = None
     try:
         with InstanceQueue(config_dir) as queue:
             if not queue.claim_or_submit(args.files):
@@ -177,18 +207,16 @@ def main(argv=None):
                     print_warning("已有实例正在运行，新的 --use-binwalk 参数未被应用喵。请先关闭原实例再重新运行。")
                 print_info("检测到已经有一个实例在运行，已将任务添加到队列中喵！")
                 return 0
-            book = PasswordBook(config_dir, data_dir, os.path.dirname(os.path.abspath(__file__)))
-            result = _run_primary(args, book, queue)
+            # Configurations have separate queues but share the data directory.
+            # Acquire this writer lock before even loading a dictionary snapshot.
+            with FileLock(os.path.join(data_dir, "passwords.lock")):
+                book = PasswordBook(config_dir, data_dir, os.path.dirname(os.path.abspath(__file__)))
+                result = _run_primary(args, book, queue)
         time.sleep(1)
         return result
     except Exception as error:
         error_end(error)
         return 1
-    finally:
-        # Only the primary constructs a book. Explicit finalization also makes
-        # imports and Windows multiprocessing children free of Gist exit hooks.
-        if book is not None:
-            book.sync_to_gist_before_exit()
 
 
 if __name__ == "__main__":

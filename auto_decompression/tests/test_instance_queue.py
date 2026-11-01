@@ -50,6 +50,57 @@ class InstanceQueueTests(unittest.TestCase):
         self.assertEqual(primary.next_batch(), [])
         self.assertTrue(self.owner().claim_or_submit([]))
 
+    def test_non_releasing_empty_drain_keeps_primary_until_final_check(self):
+        primary = self.owner()
+        self.assertTrue(primary.claim_or_submit([]))
+        self.assertEqual(primary.next_batch(release_if_idle=False), [])
+        self.assertFalse(self.owner().claim_or_submit(["during-sync.zip"]))
+        self.assertEqual(primary.next_batch(), ["during-sync.zip"])
+        self.assertFalse(self.owner().claim_or_submit(["while-processing.zip"]))
+        self.assertEqual(primary.next_batch(release_if_idle=False), ["while-processing.zip"])
+        self.assertEqual(primary.next_batch(release_if_idle=False), [])
+        self.assertFalse(self.owner().claim_or_submit([]))
+        self.assertEqual(primary.next_batch(), [])
+        self.assertTrue(self.owner().claim_or_submit([]))
+
+    def test_non_releasing_drain_leaves_listener_available_for_late_work(self):
+        primary = self.owner()
+        self.assertTrue(primary.claim_or_submit([]))
+        primary.start()
+        self.assertEqual(primary.next_batch(release_if_idle=False), [])
+        self.assertFalse(self.owner().claim_or_submit(["late.zip"]))
+        self.assertEqual(primary.next_batch(release_if_idle=False), ["late.zip"])
+        self.assertEqual(primary.next_batch(), [])
+        replacement = self.owner()
+        self.assertTrue(replacement.claim_or_submit([]))
+        self.assertFalse(self.owner().claim_or_submit(["replacement.zip"]))
+        primary.close()
+        self.assertEqual(replacement.next_batch(), ["replacement.zip"])
+
+    def test_listener_start_failure_keeps_ownership_until_outer_cleanup(self):
+        primary = self.owner()
+        self.assertTrue(primary.claim_or_submit([]))
+        before = {child.pid for child in multiprocessing.active_children()}
+        # Fail only the listener start, after the real Manager has been created.
+        original_process = instance_queue.multiprocessing.get_context().Process
+
+        def failing_listener(*args, **kwargs):
+            process = original_process(*args, **kwargs)
+            if kwargs.get("target") is instance_queue._queue_listener:
+                process.start = unittest.mock.Mock(side_effect=OSError("listener fixture failure"))
+            return process
+
+        context = instance_queue.multiprocessing.get_context()
+        with patch.object(context, "Process", side_effect=failing_listener):
+            with self.assertRaisesRegex(OSError, "listener fixture failure"):
+                primary.start()
+        self.assertFalse(self.owner().claim_or_submit(["preserved-after-start-failure.zip"]))
+        primary.close()
+        self.assertEqual({child.pid for child in multiprocessing.active_children()}, before)
+        replacement = self.owner()
+        self.assertTrue(replacement.claim_or_submit([]))
+        self.assertEqual(replacement.next_batch(), ["preserved-after-start-failure.zip"])
+
     def test_listener_and_manager_are_stopped_after_drain(self):
         before = {child.pid for child in multiprocessing.active_children()}
         primary = self.owner()
