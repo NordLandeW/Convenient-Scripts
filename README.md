@@ -40,7 +40,8 @@
   * 帮助识别可见图片元素中包含的二维码。
 * gemini-web-translator
   * 油猴脚本。
-  * 将网页的文本元素传输给 Gemini 进行翻译并替换。
+  * 使用 Gemini、OpenRouter 或 OpenAI / 兼容 API 流式翻译网页，支持原文还原、内容校验缓存和失败部分重试。
+  * 密钥与 API 地址通过油猴菜单配置；安装、隔离沙箱要求和测试方法见[翻译器说明](gemini-web-translator/README.md)。
 * gemini-model-resumer
   * 在 Gemini 网页端点击开始新对话时，自动恢复模型到上一次你选中的模型。
   * 即修复 Gemini 网页端引入的一个“bug”。

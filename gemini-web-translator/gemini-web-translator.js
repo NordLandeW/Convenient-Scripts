@@ -101,7 +101,8 @@
             xhigh: 'XHigh（极高）',
             max: 'Max（最高）'
         },
-        cachePrefix: 'gm_cache_v7_',
+        cachePrefix: 'gm_cache_v8_',
+        cacheVersion: 1,
         cacheMetaKey: 'gm_cache_meta',
         finishNodeId: '__FINISH__',
         commonTargetLanguages: [
@@ -142,6 +143,10 @@
         isUIInitialized: false,
         originalTexts: new Map(),
         textNodeMap: new Map(),
+        sourceTexts: new Map(),
+        lastAppliedTexts: new Map(),
+        retryWaits: new Set(),
+        retryContext: null,
         currentToastId: null,
         translationProgress: null,
         lastProgressUpdateAt: 0,
@@ -238,17 +243,10 @@
     function normalizeUrl(rawUrl) {
         try {
             const url = new URL(rawUrl, window.location.origin);
-            let normalized = `${url.protocol}//${url.host}${url.pathname}`;
-            if (normalized.length > 1 && normalized.endsWith('/')) {
-                normalized = normalized.slice(0, -1);
-            }
-            return normalized;
+            // Query parameters, fragments and trailing slashes can identify different content.
+            return url.href;
         } catch {
-            const stripped = rawUrl.split('#')[0].split('?')[0];
-            if (stripped.length > 1 && stripped.endsWith('/')) {
-                return stripped.slice(0, -1);
-            }
-            return stripped;
+            return String(rawUrl);
         }
     }
 
@@ -376,162 +374,140 @@
         return (maxLen - dist) / maxLen;
     }
 
-    // Find best cache entry using exact and fuzzy URL matching
-    function findBestCacheKeyForUrl(rawUrl, meta, targetLanguage = getTargetLanguage()) {
+    // URLs select candidates only. Original text and context authorize reuse.
+    function findCacheCandidates(rawUrl, meta, targetLanguage = getTargetLanguage(), profile) {
         const normalizedUrl = normalizeUrl(rawUrl);
-        const normalizedTargetLanguage = normalizeTargetLanguage(targetLanguage);
+        const language = normalizeTargetLanguage(targetLanguage);
         const threshold = getUrlSimilarityThreshold();
-        const exactKey = generateCacheKey(normalizedUrl, normalizedTargetLanguage);
+        let origin;
+        try { origin = new URL(normalizedUrl).origin; } catch { return []; }
+        return Object.entries(meta).flatMap(([key, entry]) => {
+            if (entry.targetLanguage !== language || (profile !== undefined && entry.profile !== profile)) return [];
+            try { if (new URL(entry.normalizedUrl).origin !== origin) return []; } catch { return []; }
+            const score = stringSimilarity(normalizedUrl, entry.normalizedUrl);
+            return score >= threshold ? [{ key, entry, score }] : [];
+        }).sort((a, b) => b.score - a.score || b.entry.timestamp - a.entry.timestamp);
+    }
 
-        let bestKey = null;
-        let bestEntry = null;
-        let bestScore = 0;
+    function generateCacheKey(url, targetLanguage = getTargetLanguage(), profile = '') {
+        const source = JSON.stringify([normalizeTargetLanguage(targetLanguage), url, profile]);
+        let hash = 0;
+        for (let i = 0; i < source.length; i++) hash = ((hash << 5) - hash + source.charCodeAt(i)) | 0;
+        // Hash collisions may replace an entry, but never bypass metadata/content validation.
+        return CONFIG.cachePrefix + (hash >>> 0).toString(36);
+    }
 
-        if (meta[exactKey]) {
-            bestKey = exactKey;
-            bestEntry = meta[exactKey];
-            bestScore = 1;
-        }
-
+    function getCacheMeta() {
+        let meta;
+        try { meta = JSON.parse(GM_getValue(CONFIG.cacheMetaKey, '{}')); } catch { return {}; }
+        if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return {};
+        let changed = false;
         for (const [key, entry] of Object.entries(meta)) {
-            if (key === exactKey) continue;
-            const entryTargetLanguage = normalizeTargetLanguage(entry.targetLanguage);
-            if (entryTargetLanguage !== normalizedTargetLanguage) continue;
-
-            const candidateUrl = entry.normalizedUrl || normalizeUrl(entry.url || '');
-            const score = stringSimilarity(normalizedUrl, candidateUrl);
-            if (score >= threshold && score > bestScore) {
-                bestKey = key;
-                bestEntry = entry;
-                bestScore = score;
+            if (!key.startsWith(CONFIG.cachePrefix) || !entry || entry.version !== CONFIG.cacheVersion
+                || typeof entry.normalizedUrl !== 'string' || typeof entry.profile !== 'string'
+                || !Number.isFinite(entry.size) || entry.size < 0 || !Number.isFinite(entry.timestamp)) {
+                // Positional v7 records have no original-text evidence and cannot be migrated.
+                if (/^gm_cache_v\d+_/.test(key)) GM_deleteValue(key);
+                delete meta[key];
+                changed = true;
             }
         }
-
-        return { key: bestKey, entry: bestEntry, normalizedUrl };
+        if (changed) saveCacheMeta(meta);
+        return meta;
     }
 
-    // Generate cache key using simple hash
-    function generateCacheKey(url, targetLanguage = getTargetLanguage()) {
-        const source = `${normalizeTargetLanguage(targetLanguage)}\n${url}`;
-        let hash = 0;
-        for (let i = 0; i < source.length; i++) {
-            const char = source.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & hash;
-        }
-        return CONFIG.cachePrefix + Math.abs(hash).toString(36);
-    }
-    
-    // Get cache metadata
-    function getCacheMeta() {
-        const meta = GM_getValue(CONFIG.cacheMetaKey, '{}');
-        try {
-            return JSON.parse(meta);
-        } catch {
-            return {};
-        }
-    }
-    
-    // Save cache metadata
     function saveCacheMeta(meta) {
         GM_setValue(CONFIG.cacheMetaKey, JSON.stringify(meta));
     }
-    
-    // Get cache with TTL validation
-    function getCache(rawUrl, targetLanguage = getTargetLanguage()) {
+
+    function getCache(rawUrl, targetLanguage = getTargetLanguage(), profile = '') {
         const meta = getCacheMeta();
-        const { key, entry } = findBestCacheKeyForUrl(rawUrl, meta, targetLanguage);
-
-        if (!key || !entry) return null;
-
+        const records = new Map();
         const ttl = GM_getValue('gm_cache_ttl', CONFIG.defaults.cacheTTL);
-        const now = Date.now();
-
-        // ttl <= 0 means "never expire"
-        if (ttl > 0 && now - entry.timestamp > ttl) {
-            deleteCache(key);
-            return null;
+        let changed = false;
+        for (const { key, entry } of findCacheCandidates(rawUrl, meta, targetLanguage, profile)) {
+            let data;
+            try { data = JSON.parse(GM_getValue(key, 'null')); } catch { data = null; }
+            if ((ttl > 0 && Date.now() - entry.timestamp > ttl) || !data
+                || data.version !== CONFIG.cacheVersion || data.profile !== profile || !Array.isArray(data.records)) {
+                GM_deleteValue(key);
+                delete meta[key];
+                changed = true;
+                continue;
+            }
+            for (const record of data.records) {
+                if (record && typeof record.key === 'string'
+                    && (record.translation === null || typeof record.translation === 'string')
+                    && !records.has(record.key)) records.set(record.key, record);
+            }
         }
-
-        const value = GM_getValue(key, null);
-
-        // Clean up orphaned metadata
-        if (value == null) {
-            deleteCache(key);
-            return null;
-        }
-
-        return value;
+        if (changed) saveCacheMeta(meta);
+        return records;
     }
-    
-    // Set cache with size limit enforcement
-    function setCache(rawUrl, data, targetLanguage = getTargetLanguage()) {
+
+    function setCache(rawUrl, records, targetLanguage = getTargetLanguage(), profile = '') {
         const normalizedUrl = normalizeUrl(rawUrl);
-        const normalizedTargetLanguage = normalizeTargetLanguage(targetLanguage);
-        const key = generateCacheKey(normalizedUrl, normalizedTargetLanguage);
-        const meta = getCacheMeta();
+        const language = normalizeTargetLanguage(targetLanguage);
+        const key = generateCacheKey(normalizedUrl, language, profile);
+        const data = JSON.stringify({ version: CONFIG.cacheVersion, profile, records: [...records.values()] });
         const dataSize = new Blob([data]).size;
-        const maxSize = GM_getValue('gm_max_cache_size', CONFIG.defaults.maxCacheSize);
-
-        let totalSize = Object.values(meta).reduce(
-            (sum, entry) => sum + (entry.size || 0),
-            0
-        );
-
-        // Evict oldest entries if over size limit
-        while (totalSize + dataSize > maxSize && Object.keys(meta).length > 0) {
-            const oldestKey = Object.keys(meta).reduce((oldest, k) =>
-                !oldest || meta[k].timestamp < meta[oldest].timestamp ? k : oldest
-            , null);
-
-            if (!oldestKey) break;
-
-            totalSize -= meta[oldestKey].size || 0;
-            GM_deleteValue(oldestKey);
-            delete meta[oldestKey];
-        }
-
-        GM_setValue(key, data);
-        meta[key] = {
-            url: rawUrl,
-            normalizedUrl,
-            targetLanguage: normalizedTargetLanguage,
-            timestamp: Date.now(),
-            size: dataSize
-        };
-        saveCacheMeta(meta);
-    }
-    
-    // Delete specific cache entry
-    function deleteCache(key) {
+        const maxSize = Number(GM_getValue('gm_max_cache_size', CONFIG.defaults.maxCacheSize));
+        // An oversized page must not evict every other page or exceed the configured limit.
+        if (!Number.isFinite(maxSize) || dataSize > maxSize || records.size === 0) return false;
         const meta = getCacheMeta();
-        GM_deleteValue(key);
-        delete meta[key];
+        let totalSize = Object.entries(meta).reduce((sum, [entryKey, entry]) => sum + (entryKey === key ? 0 : entry.size), 0);
+        const oldest = Object.keys(meta).filter(entryKey => entryKey !== key)
+            .sort((a, b) => meta[a].timestamp - meta[b].timestamp);
+        while (totalSize + dataSize > maxSize && oldest.length) {
+            const oldKey = oldest.shift();
+            totalSize -= meta[oldKey].size;
+            GM_deleteValue(oldKey);
+            delete meta[oldKey];
+        }
+        GM_setValue(key, data);
+        meta[key] = { version: CONFIG.cacheVersion, url: rawUrl, normalizedUrl, targetLanguage: language,
+            profile, timestamp: Date.now(), size: dataSize };
         saveCacheMeta(meta);
+        return true;
     }
-    
-    // Delete cache for current page
+
+    function applyCachedTranslations(entries, records) {
+        const pending = [];
+        const reused = new Map();
+        let updated = 0;
+        for (const entry of entries) {
+            const record = records.get(entry.cacheKey);
+            if (!record) { pending.push(entry); continue; }
+            if (record.translation !== null) updated += applyPreparedTranslation({ id: entry.id, text: record.translation });
+            reused.set(entry.cacheKey, record);
+        }
+        return { pending, reused, updated, hits: entries.length - pending.length };
+    }
+
+    function cacheCompletedBatch(batch, records) {
+        for (const entry of batch.entries) {
+            records.set(entry.cacheKey, { key: entry.cacheKey, translation: batch.translations.get(entry.id) ?? null });
+        }
+    }
+
     function clearCurrentPageCache() {
         const meta = getCacheMeta();
-        const { key } = findBestCacheKeyForUrl(window.location.href, meta, getTargetLanguage());
-        if (!key) return;
-        deleteCache(key);
+        // Clear all candidates that could contribute to this page/language, including other models.
+        for (const { key } of findCacheCandidates(window.location.href, meta)) {
+            GM_deleteValue(key);
+            delete meta[key];
+        }
+        saveCacheMeta(meta);
     }
-    
-    // Clear all cache entries
+
     function clearAllCache() {
-        const meta = getCacheMeta();
-        Object.keys(meta).forEach(key => GM_deleteValue(key));
+        Object.keys(getCacheMeta()).forEach(key => GM_deleteValue(key));
         GM_deleteValue(CONFIG.cacheMetaKey);
     }
-    
-    // Get cache statistics
+
     function getCacheStats() {
-        const meta = getCacheMeta();
-        const entries = Object.values(meta);
-        const totalSize = entries.reduce((sum, entry) => sum + (entry.size || 0), 0);
-        const count = entries.length;
-        return { totalSize, count };
+        const entries = Object.values(getCacheMeta());
+        return { totalSize: entries.reduce((sum, entry) => sum + entry.size, 0), count: entries.length };
     }
     
     // Format bytes to human-readable size
@@ -593,6 +569,7 @@ Provide only the translated CSV lines plus the final finish line.
                 resultLines: [],
                 pendingCsvBuffer: '',
                 appliedIds: new Set(),
+                translations: new Map(),
                 attempts: 0,
                 nextEntryIndex: 0,
                 finishReceived: false,
@@ -750,6 +727,7 @@ Provide only the translated CSV lines plus the final finish line.
 
     function init() {
         GM_registerMenuCommand('🚀 翻译网页 (Alt+T)', () => startTranslationProcess());
+        GM_registerMenuCommand('🔄 重试未完成的翻译', retryFailedTranslation);
         GM_registerMenuCommand('⚙️ 设置', openSettings);
         for (const [platform, config] of Object.entries(CONFIG.platforms)) {
             GM_registerMenuCommand(`🔑 ${config.name} 密钥`, () => configureApiKey(platform));
@@ -765,69 +743,57 @@ Provide only the translated CSV lines plus the final finish line.
 
     // ================= Text Node Extraction =================
 
-    // Extract translatable text nodes from page
     function extractTextNodes() {
-        const walker = document.createTreeWalker(
-            document.body,
-            NodeFilter.SHOW_TEXT,
-            {
-                acceptNode: function(node) {
-                    const parent = node.parentElement;
-                    if (!parent) return NodeFilter.FILTER_REJECT;
-                    
-                    // Tag blacklist
-                    const tag = parent.tagName.toLowerCase();
-                    if (['script', 'style', 'noscript', 'textarea', 'code', 'pre', 'svg', 'path', 'kbd', 'var'].includes(tag)) {
-                        return NodeFilter.FILTER_REJECT;
-                    }
-
-                    // Skip no-translate elements
-                    if (parent.closest('[translate="no"], .notranslate, gm-translator, qr-scanner-ui, #gm-translator-container')) {
-                        return NodeFilter.FILTER_REJECT;
-                    }
-
-                    // Visibility check
-                    const style = window.getComputedStyle(parent);
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                        return NodeFilter.FILTER_REJECT;
-                    }
-
-                    // Filter whitespace-only or numeric-only content
-                    const text = node.nodeValue;
-                    if (!/[^\s\d]/.test(text)) {
-                        return NodeFilter.FILTER_REJECT;
-                    }
-
-                    return NodeFilter.FILTER_ACCEPT;
-                }
-            }
-        );
-
+        const eligibility = new WeakMap();
+        const styles = new WeakMap();
+        function styleFor(element) {
+            if (!styles.has(element)) styles.set(element, window.getComputedStyle(element));
+            return styles.get(element);
+        }
+        const excluded = 'script,style,noscript,textarea,code,pre,svg,path,kbd,var,select,option,'
+            + '[translate="no"],.notranslate,[contenteditable]:not([contenteditable="false"]),'
+            + '[hidden],[aria-hidden="true"],gm-translator,qr-scanner-ui,#gm-translator-container';
+        function eligible(element) {
+            if (!element) return true;
+            if (eligibility.has(element)) return eligibility.get(element);
+            const style = styleFor(element);
+            const collapsedTablePart = style.visibility === 'collapse' && /^table-(row|column)(-group)?$/.test(style.display);
+            const allowed = !element.matches(excluded) && !element.isContentEditable
+                && style.display !== 'none' && !collapsedTablePart
+                && style.opacity !== '0' && eligible(element.parentElement);
+            eligibility.set(element, allowed);
+            return allowed;
+        }
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+            // visibility can be overridden by a visible descendant; display/opacity cannot.
+            acceptNode: node => node.parentElement && /[^\s\d]/.test(node.nodeValue) && eligible(node.parentElement)
+                && styleFor(node.parentElement).visibility === 'visible' ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+        });
         const nodes = [];
-        let n;
-        while (n = walker.nextNode()) nodes.push(n);
+        let node;
+        while ((node = walker.nextNode())) nodes.push(node);
         return nodes;
     }
 
     // ================= CSV Processing =================
 
-    // Generate translation entries and node mapping
     function generateTranslationEntries(nodes) {
         state.textNodeMap.clear();
+        state.sourceTexts.clear();
         const tagCounters = {};
-
+        const contexts = new WeakMap();
         return nodes.map((node, index) => {
-            const tag = node.parentElement.tagName.toUpperCase();
+            const parent = node.parentElement;
+            const tag = parent.tagName.toUpperCase();
             if (!tagCounters[tag]) tagCounters[tag] = 0;
-
             const id = `${tag}_${tagCounters[tag]++}_${index}`;
+            const sourceText = node.nodeValue;
+            if (!contexts.has(parent)) contexts.set(parent, parent.textContent);
             state.textNodeMap.set(id, node);
-
-            return {
-                id,
-                node,
-                text: node.nodeValue.replace(/"/g, '""').replace(/[\r\n]+/g, ' ')
-            };
+            state.sourceTexts.set(node, sourceText);
+            return { id, node, sourceText,
+                cacheKey: JSON.stringify([tag, sourceText, contexts.get(parent)]),
+                text: sourceText.replace(/"/g, '""').replace(/[\r\n]+/g, ' ') };
         });
     }
 
@@ -837,56 +803,26 @@ Provide only the translated CSV lines plus the final finish line.
 
     function parseCsvTranslationLine(rawLine) {
         const line = rawLine.trim();
-        if (!line || /^```(?:csv)?\s*$/i.test(line) || /^id\s*,/i.test(line)) {
-            return null;
-        }
-
-        const match = line.match(/^([^,]+),"(.*)"$/);
-        if (!match) return null;
-
-        if (match[1] === CONFIG.finishNodeId) {
-            return {
-                type: 'finish',
-                line,
-                id: match[1],
-                text: match[2]
-            };
-        }
-
-        return {
-            type: 'translation',
-            line,
-            id: match[1],
-            text: match[2].replace(/""/g, '"')
-        };
+        if (!line) return null;
+        const match = line.match(/^([^,\s"]+),"((?:[^"]|"")*)"$/);
+        if (!match) throw new Error('翻译结果包含无效 CSV 记录');
+        const text = match[2].replace(/""/g, '"');
+        const type = match[1] === CONFIG.finishNodeId ? 'finish' : 'translation';
+        if (type === 'finish' && text !== 'finish') throw new Error('翻译结束标记无效');
+        return { type, line, id: match[1], text };
     }
 
     function applyPreparedTranslation(preparedLine) {
         const node = state.textNodeMap.get(preparedLine.id);
-        if (!node) return 0;
-
-        if (!state.originalTexts.has(node)) {
-            state.originalTexts.set(node, node.nodeValue);
-        }
-
+        if (!node?.isConnected || !state.sourceTexts.has(node)
+            || node.nodeValue !== state.sourceTexts.get(node) || node.nodeValue === preparedLine.text) return 0;
+        state.originalTexts.set(node, node.nodeValue);
+        state.lastAppliedTexts.set(node, preparedLine.text);
         node.nodeValue = preparedLine.text;
         state.isTranslated = true;
         return 1;
     }
 
-    function applyCsvTranslationLine(rawLine) {
-        const preparedLine = parseCsvTranslationLine(rawLine);
-        if (!preparedLine || preparedLine.type !== 'translation') return 0;
-        return applyPreparedTranslation(preparedLine);
-    }
-
-    function applyCsvTranslation(csvText) {
-        let count = 0;
-        csvText.split('\n').forEach(line => {
-            count += applyCsvTranslationLine(line);
-        });
-        return count;
-    }
 
     function getBatchSkippedCount(batch) {
         return Math.max(0, batch.nextEntryIndex - batch.appliedIds.size);
@@ -894,42 +830,37 @@ Provide only the translated CSV lines plus the final finish line.
 
     function flushBatchCsvBuffer(batch, force = false, runId = state.activeTranslationRunId) {
         if (!isActiveTranslationRun(runId)) return { appliedCount: 0, skippedCount: 0 };
-
         const segments = batch.pendingCsvBuffer.replace(/\r/g, '').split('\n');
-        const lines = force ? segments : segments.slice(0, -1);
+        const lines = (force ? segments : segments.slice(0, -1)).map(parseCsvTranslationLine).filter(Boolean);
         batch.pendingCsvBuffer = force ? '' : (segments[segments.length - 1] || '');
-
+        // Validate the whole chunk before applying any part, so counters and rollback stay paired.
+        let nextIndex = batch.nextEntryIndex;
+        let finished = batch.finishReceived;
+        for (const line of lines) {
+            if (finished) throw new Error('结束标记之后仍有翻译记录');
+            if (line.type === 'finish') { finished = true; continue; }
+            const index = batch.entryIndexes.get(line.id);
+            if (index === undefined) throw new Error(`翻译结果包含不属于本批的 ID: ${line.id}`);
+            if (index < nextIndex) throw new Error(`翻译记录重复或乱序: ${line.id}`);
+            nextIndex = index + 1;
+        }
         let appliedCount = 0;
-        let skippedCount = 0;
-
-        lines.forEach(line => {
-            const preparedLine = parseCsvTranslationLine(line);
-            if (!preparedLine) return;
-
-            if (preparedLine.type === 'finish') {
-                if (batch.nextEntryIndex < batch.entries.length) {
-                    skippedCount += batch.entries.length - batch.nextEntryIndex;
-                    batch.nextEntryIndex = batch.entries.length;
-                }
+        const previousSkipped = getBatchSkippedCount(batch);
+        for (const line of lines) {
+            batch.resultLines.push(line.line);
+            if (line.type === 'finish') {
                 batch.finishReceived = true;
-                batch.resultLines.push(preparedLine.line);
-                return;
+                batch.nextEntryIndex = batch.entries.length;
+            } else {
+                batch.nextEntryIndex = batch.entryIndexes.get(line.id) + 1;
+                batch.translations.set(line.id, line.text);
+                if (applyPreparedTranslation(line)) {
+                    batch.appliedIds.add(line.id);
+                    appliedCount++;
+                }
             }
-
-            if (batch.appliedIds.has(preparedLine.id)) return;
-
-            const entryIndex = batch.entryIndexes.get(preparedLine.id);
-            if (typeof entryIndex === 'number' && entryIndex >= batch.nextEntryIndex) {
-                skippedCount += entryIndex - batch.nextEntryIndex;
-                batch.nextEntryIndex = entryIndex + 1;
-            }
-
-            batch.appliedIds.add(preparedLine.id);
-            batch.resultLines.push(preparedLine.line);
-            appliedCount += applyPreparedTranslation(preparedLine);
-        });
-
-        return { appliedCount, skippedCount };
+        }
+        return { appliedCount, skippedCount: getBatchSkippedCount(batch) - previousSkipped };
     }
 
     function appendBatchTranslationChunk(batch, chunkText, runId = state.activeTranslationRunId) {
@@ -939,14 +870,23 @@ Provide only the translated CSV lines plus the final finish line.
         return flushBatchCsvBuffer(batch, false, runId);
     }
 
-    // Restore original text to DOM
+    function restoreNode(node) {
+        let restored = 0;
+        if (node?.isConnected && state.originalTexts.has(node)
+            && node.nodeValue === state.lastAppliedTexts.get(node)) {
+            node.nodeValue = state.originalTexts.get(node);
+            restored = 1;
+        }
+        state.originalTexts.delete(node);
+        state.lastAppliedTexts.delete(node);
+        return restored;
+    }
+
     function restoreOriginalText() {
         let count = 0;
-        state.originalTexts.forEach((originalText, node) => {
-            node.nodeValue = originalText;
-            count++;
-        });
-        state.originalTexts.clear();
+        for (const node of state.originalTexts.keys()) count += restoreNode(node);
+        state.textNodeMap.clear();
+        state.sourceTexts.clear();
         state.isTranslated = false;
         return count;
     }
@@ -966,6 +906,7 @@ Provide only the translated CSV lines plus the final finish line.
             }
         });
         state.activeRequests.clear();
+        for (const cancel of state.retryWaits) cancel();
 
         const count = restoreOriginalText();
         state.isTranslating = false;
@@ -981,110 +922,84 @@ Provide only the translated CSV lines plus the final finish line.
 
     // ================= Translation Process =================
 
-    async function startTranslationProcess() {
+    async function retryFailedTranslation() {
+        if (state.isTranslating) return;
+        if (!state.retryContext) { showToast('没有待重试的翻译', 'info'); return; }
+        restoreOriginalText();
+        await startTranslationProcess({ resume: true });
+    }
+
+    async function startTranslationProcess({ resume = false } = {}) {
         ensureUI();
-
-        if (state.isTranslating) {
-            cancelActiveTranslationAndRestoreOriginal();
-            return;
-        }
-
+        if (state.isTranslating) { cancelActiveTranslationAndRestoreOriginal(); return; }
         if (state.isTranslated) {
-            const count = restoreOriginalText();
-            showToast(`已还原原始状态 (${count} 个节点)`, 'success');
+            showToast(`已还原原始状态 (${restoreOriginalText()} 个节点)`, 'success');
             return;
         }
-        
         if (!requireIsolatedRuntime()) return;
         const platform = GM_getValue('gm_platform', CONFIG.defaults.platform);
-        const apiKey = GM_getValue(`gm_api_key_${platform}`, '');
-        
-        if (!apiKey) {
-            showToast('请通过油猴菜单配置 API 密钥', 'error');
-            openSettings();
-            return;
-        }
-
+        if (!Object.hasOwn(CONFIG.platforms, platform)) { showToast('平台配置无效', 'error'); return; }
+        const previousRun = resume ? state.retryContext : null;
         state.isTranslating = true;
         const runId = ++state.activeTranslationRunId;
-        state.isTranslated = false;
         state.originalTexts.clear();
+        state.lastAppliedTexts.clear();
         state.translationProgress = null;
         state.lastProgressUpdateAt = 0;
         state.currentToastId = showToast('正在分析页面结构...', 'loading', 0);
-
         try {
             const currentUrl = window.location.href;
             const cacheEnabled = GM_getValue('gm_cache_enable', true);
             const targetLanguage = getTargetLanguage();
-            const nodes = extractTextNodes();
-
-            if (nodes.length === 0) throw new Error('未找到可翻译的文本');
-
-            const entries = generateTranslationEntries(nodes);
-
-            // Try cache first
-            if (cacheEnabled) {
-                const cachedData = getCache(currentUrl, targetLanguage);
-                if (cachedData) {
-                    if (!isActiveTranslationRun(runId)) return;
-                    state.currentToastId = updateToast(state.currentToastId, '正在从缓存加载...', 'loading');
-                    const count = applyCsvTranslation(cachedData);
-                    state.currentToastId = updateToast(state.currentToastId, `⚡ 缓存已加载 (${count} 个节点)`, 'success');
-                    return;
-                }
+            const modelSettings = getPlatformModelSettings(platform);
+            const model = modelSettings.customModel.trim() || modelSettings.model || CONFIG.platforms[platform].models[0];
+            const prompt = buildTranslationPrompt(targetLanguage);
+            const requestSettings = getRequestSettings(platform, model);
+            const profile = JSON.stringify([platform, model, prompt, requestSettings.protocol,
+                requestSettings.baseUrl, requestSettings.reasoningEffort]);
+            const entries = generateTranslationEntries(extractTextNodes());
+            if (!entries.length) throw new Error('未找到可翻译的文本');
+            const cached = cacheEnabled ? getCache(currentUrl, targetLanguage, profile) : new Map();
+            if (previousRun?.url === currentUrl && previousRun.profile === profile) {
+                for (const [key, record] of previousRun.records) cached.set(key, record);
             }
-
+            const { pending, reused, updated, hits } = applyCachedTranslations(entries, cached);
+            state.retryContext = { url: currentUrl, profile, records: reused };
+            let cacheWarning = '';
+            const retainBatch = batch => {
+                cacheCompletedBatch(batch, reused);
+                if (cacheEnabled) {
+                    try {
+                        if (!setCache(currentUrl, reused, targetLanguage, profile)) cacheWarning = '；结果超出缓存限制，未写入本地缓存';
+                    } catch { cacheWarning = '；本地缓存保存失败'; }
+                }
+            };
+            if (!pending.length) {
+                state.retryContext = null;
+                state.currentToastId = updateToast(state.currentToastId, `⚡ 缓存已验证 (${hits} 个节点，更新 ${updated} 个)`, 'success');
+                return;
+            }
+            const apiKey = GM_getValue(`gm_api_key_${platform}`, '');
+            if (!apiKey) throw new Error(`请通过油猴菜单配置 ${CONFIG.platforms[platform].name} 密钥`);
             const batchNodeCount = getClampedIntegerSetting('gm_batch_node_count', CONFIG.defaults.batchNodeCount, 1, 5000);
             const concurrency = getClampedIntegerSetting('gm_concurrency', CONFIG.defaults.concurrency, 1, 32);
-            const batches = createTranslationBatches(entries, batchNodeCount);
-            const workerCount = Math.min(concurrency, batches.length);
-            const modelSettings = getPlatformModelSettings(platform);
-            const model = modelSettings.customModel.trim()
-                || modelSettings.model
-                || CONFIG.platforms[platform].models[0];
-            const isDebug = GM_getValue('gm_debug', false);
-
-            if (isDebug) {
-                console.log('[Gemini Translator] Translation entries:', entries.length);
-                console.log('[Gemini Translator] Batch count:', batches.length, 'Worker count:', workerCount);
-            }
-
-            state.translationProgress = createProgressState(entries.length, batches.length, workerCount);
-            state.currentToastId = updateToast(
-                state.currentToastId,
-                `已拆分为 ${batches.length} 批，准备启动 ${workerCount} 个并发请求...`,
-                'loading'
-            );
+            const batches = createTranslationBatches(pending, batchNodeCount);
+            state.translationProgress = createProgressState(entries.length, batches.length, Math.min(concurrency, batches.length));
+            state.translationProgress.updatedNodes = updated;
+            state.translationProgress.skippedNodes = hits - updated;
+            state.translationProgress.completedNodes = hits;
             refreshProgressToast(true);
-
-            const resultCsv = await translateAllBatches({
-                runId,
-                platform,
-                apiKey,
-                model,
-                prompt: buildTranslationPrompt(targetLanguage),
-                batches,
-                isDebug
-            });
-
+            await translateAllBatches({ runId, platform, apiKey, model, prompt, requestSettings, batches,
+                isDebug: GM_getValue('gm_debug', false), onBatchComplete: retainBatch });
             if (!isActiveTranslationRun(runId)) return;
-
-            if (cacheEnabled && resultCsv) {
-                setCache(currentUrl, resultCsv, targetLanguage);
-            }
-
-            state.currentToastId = updateToast(
-                state.currentToastId,
-                `✅ 翻译完成 (完成 ${state.translationProgress.completedNodes}/${entries.length} 个节点，更新 ${state.translationProgress.updatedNodes} 个节点，跳过 ${state.translationProgress.skippedNodes} 个节点，${batches.length} 批)`,
-                'success'
-            );
-        } catch (e) {
+            state.retryContext = null;
+            state.currentToastId = updateToast(state.currentToastId,
+                `✅ 翻译完成 (完成 ${state.translationProgress.completedNodes}/${entries.length} 个节点，更新 ${state.translationProgress.updatedNodes} 个，跳过 ${state.translationProgress.skippedNodes} 个)${cacheWarning}`, 'success');
+        } catch (error) {
             if (!isActiveTranslationRun(runId)) return;
-            console.error(e);
-            const partialCount = state.originalTexts.size;
-            const partialHint = partialCount > 0 ? `；已应用 ${partialCount} 个节点，可再次翻译以还原` : '';
-            state.currentToastId = updateToast(state.currentToastId, 'Error: ' + e.message + partialHint, 'error');
+            console.error('[Gemini Translator]', error.message);
+            state.currentToastId = updateToast(state.currentToastId,
+                `Error: ${error.message}；可用油猴菜单重试未完成部分，Alt+T 还原已应用译文`, 'error');
         } finally {
             if (state.activeTranslationRunId === runId) {
                 state.isTranslated = state.originalTexts.size > 0;
@@ -1095,350 +1010,252 @@ Provide only the translated CSV lines plus the final finish line.
         }
     }
 
-    async function translateAllBatches({ runId, platform, apiKey, model, prompt, batches, isDebug }) {
+    function waitForRetry(runId, milliseconds) {
+        if (!isActiveTranslationRun(runId)) return Promise.resolve(false);
+        if (milliseconds <= 0) return Promise.resolve(true);
+        return new Promise(resolve => {
+            const until = Date.now() + milliseconds;
+            let timer;
+            const finish = value => { clearTimeout(timer); state.retryWaits.delete(cancel); resolve(value); };
+            const cancel = () => finish(false);
+            const tick = () => {
+                if (!isActiveTranslationRun(runId)) { finish(false); return; }
+                const remaining = until - Date.now();
+                if (remaining <= 0) finish(true);
+                else timer = setTimeout(tick, Math.min(remaining, 2147483647));
+            };
+            state.retryWaits.add(cancel);
+            tick();
+        });
+    }
+
+    function getRetryDelay(error, attempts) {
+        return Math.max(error.retryAfterMs || 0, Math.min(30000, 500 * 2 ** (attempts - 1)) + Math.random() * 250);
+    }
+
+    async function translateAllBatches({ runId, platform, apiKey, model, prompt, batches, isDebug,
+        requestSettings = getRequestSettings(platform, model), onBatchComplete = () => {} }) {
         const errors = [];
-        const pendingBatchIndexes = batches.map((_, index) => index);
-        const maxBatchRetries = CONFIG.defaults.maxBatchRetries;
-
+        const pending = [...batches];
+        let fatalError = null;
+        let cooldownUntil = 0;
         async function worker() {
-            while (true) {
-                if (!isActiveTranslationRun(runId)) return;
-
-                const batchIndex = pendingBatchIndexes.shift();
-                if (typeof batchIndex !== 'number') return;
-
-                const batch = batches[batchIndex];
-                if (!state.translationProgress) return;
+            while (isActiveTranslationRun(runId) && !fatalError) {
+                // A concurrent rate-limit response can extend the deadline during this wait.
+                while (cooldownUntil > Date.now()) {
+                    if (!await waitForRetry(runId, cooldownUntil - Date.now()) || fatalError) return;
+                }
+                if (!isActiveTranslationRun(runId) || fatalError) return;
+                const batch = pending.shift();
+                if (!batch) return;
                 state.translationProgress.runningBatches++;
                 refreshProgressToast(true);
-
+                let retryDelay = null;
                 try {
                     batch.attempts++;
-                    await translateSingleBatch({ runId, batch, platform, apiKey, model, prompt, isDebug });
+                    await translateSingleBatch({ runId, batch, platform, apiKey, model, prompt, requestSettings, isDebug });
+                    if (!isActiveTranslationRun(runId)) return;
+                    onBatchComplete(batch);
                 } catch (error) {
                     if (!isActiveTranslationRun(runId) || !state.translationProgress) return;
-
-                    const skippedCount = getBatchSkippedCount(batch);
-                    const revertedCount = resetBatchForRetry(batch);
-                    if (revertedCount > 0) {
-                        state.translationProgress.updatedNodes = Math.max(0, state.translationProgress.updatedNodes - revertedCount);
+                    state.translationProgress.skippedNodes -= getBatchSkippedCount(batch);
+                    state.translationProgress.updatedNodes -= resetBatchForRetry(batch);
+                    if (error.fatal) {
+                        fatalError = error;
+                        pending.length = 0;
+                        for (const request of state.activeRequests) request.abort();
+                        for (const cancel of state.retryWaits) cancel();
                     }
-                    if (skippedCount > 0) {
-                        state.translationProgress.skippedNodes = Math.max(0, state.translationProgress.skippedNodes - skippedCount);
-                    }
-
-                    if (batch.attempts <= maxBatchRetries) {
+                    if (!fatalError && error.retryable !== false && batch.attempts <= CONFIG.defaults.maxBatchRetries) {
+                        retryDelay = getRetryDelay(error, batch.attempts);
+                        if (error.status === 429 || error.retryAfterMs > 0) cooldownUntil = Math.max(cooldownUntil, Date.now() + retryDelay);
                         state.translationProgress.retriedBatches++;
-                        pendingBatchIndexes.push(batchIndex);
-
-                        if (isDebug) {
-                            console.warn(`[Gemini Translator] Batch ${batch.index + 1} failed on attempt ${batch.attempts}, re-queued:`, error);
-                        }
                     } else {
-                        errors.push({ batchIndex, error, attempts: batch.attempts });
+                        errors.push({ batch, error });
                         state.translationProgress.failedBatches++;
-
-                        if (isDebug) {
-                            console.error(`[Gemini Translator] Batch ${batch.index + 1} exhausted retries after ${batch.attempts} attempts:`, error);
-                        }
                     }
+                    if (isDebug) console.warn(`[Gemini Translator] Batch ${batch.index + 1}:`, error.message);
                 } finally {
                     if (isActiveTranslationRun(runId) && state.translationProgress) {
-                        state.translationProgress.runningBatches = Math.max(0, state.translationProgress.runningBatches - 1);
+                        state.translationProgress.runningBatches--;
                         refreshProgressToast(true);
                     }
                 }
+                if (retryDelay !== null && await waitForRetry(runId, retryDelay) && !fatalError) pending.push(batch);
             }
         }
-
-        const workers = Array.from({ length: state.translationProgress.workerCount }, () => worker());
-        await Promise.all(workers);
-
+        await Promise.all(Array.from({ length: state.translationProgress.workerCount }, () => worker()));
         if (!isActiveTranslationRun(runId)) return '';
-
-        if (errors.length > 0) {
-            const firstError = errors[0];
-            throw new Error(`第 ${firstError.batchIndex + 1} 批在 ${firstError.attempts} 次尝试后仍然失败: ${firstError.error.message}`);
+        if (fatalError) throw fatalError;
+        if (errors.length) {
+            const { batch, error } = errors[0];
+            throw new Error(`第 ${batch.index + 1} 批在 ${batch.attempts} 次尝试后失败: ${error.message}`);
         }
-
-        return batches
-            .map(batch => batch.resultLines.join('\n'))
-            .filter(Boolean)
-            .join('\n');
+        return batches.map(batch => batch.resultLines.join('\n')).filter(Boolean).join('\n');
     }
 
     function resetBatchForRetry(batch) {
-        let revertedCount = 0;
-
-        batch.appliedIds.forEach(id => {
-            const node = state.textNodeMap.get(id);
-            const originalText = node ? state.originalTexts.get(node) : null;
-            if (!node || originalText == null) return;
-
-            node.nodeValue = originalText;
-            revertedCount++;
-        });
-
+        const revertedCount = batch.appliedIds.size;
+        for (const id of batch.appliedIds) restoreNode(state.textNodeMap.get(id));
         batch.pendingCsvBuffer = '';
         batch.resultLines = [];
         batch.appliedIds.clear();
+        batch.translations.clear();
         batch.nextEntryIndex = 0;
         batch.finishReceived = false;
         batch.completed = false;
-
         return revertedCount;
     }
 
-    function translateSingleBatch({ runId, batch, platform, apiKey, model, prompt, isDebug }) {
+    function normalizeTranslationError(value) {
+        let message = '翻译请求失败';
+        try { message = String(value?.message ?? value ?? message); } catch { /* Arbitrary stream error reasons are allowed. */ }
+        const error = new Error(message);
+        for (const key of ['retryable', 'fatal', 'status', 'retryAfterMs']) {
+            try {
+                const field = value?.[key];
+                if ((['retryable', 'fatal'].includes(key) && typeof field === 'boolean')
+                    || (['status', 'retryAfterMs'].includes(key) && Number.isFinite(field))) error[key] = field;
+            } catch { /* Error normalization must always settle the request. */ }
+        }
+        return error;
+    }
+
+    function translateSingleBatch({ runId, batch, platform, apiKey, model, prompt, isDebug, requestSettings }) {
         return new Promise((resolve, reject) => {
-            const requestOptions = createStreamRequestOptions(platform, apiKey, model, prompt, batch.csvInput);
-            const parserState = { buffer: '' };
-            const textDecoder = new TextDecoder();
+            let requestOptions;
+            try { requestOptions = createStreamRequestOptions(platform, apiKey, model, prompt, batch.csvInput, requestSettings); }
+            catch (error) { reject(Object.assign(normalizeTranslationError(error), { retryable: false, fatal: true })); return; }
+            const parser = { buffer: '' };
+            const decoder = new TextDecoder('utf-8', { fatal: true });
             let processedLength = 0;
             let settled = false;
-            let streamStarted = false;
-            let streamFinalizeTimer = null;
-            let request = null;
-
-            const cleanupRequest = () => {
-                if (request) state.activeRequests.delete(request);
-            };
-
-            const finishWithError = (error) => {
+            let readable = false;
+            let request;
+            let reader;
+            let abortTransport = false;
+            const active = () => !settled && isActiveTranslationRun(runId);
+            const controller = { abort: () => finish(Object.assign(new Error('翻译请求已取消'), { retryable: false })) };
+            function finish(error, failed = true) {
                 if (settled) return;
-                if (streamFinalizeTimer) {
-                    clearTimeout(streamFinalizeTimer);
-                    streamFinalizeTimer = null;
-                }
                 settled = true;
-                cleanupRequest();
-                reject(error instanceof Error ? error : new Error(String(error)));
-            };
-
-            const finishSuccessfully = () => {
+                state.activeRequests.delete(controller);
+                if (failed) {
+                    abortTransport = true;
+                    try { request?.abort?.(); } catch { /* Settlement must survive transport errors. */ }
+                    try { Promise.resolve(reader?.cancel?.()).catch(() => {}); } catch { /* Best effort. */ }
+                    const safeError = normalizeTranslationError(error);
+                    if (apiKey) safeError.message = safeError.message.split(apiKey).join('[redacted]');
+                    reject(safeError);
+                } else resolve();
+            }
+            function recordProgress({ appliedCount, skippedCount }) {
+                if (!active() || !state.translationProgress) return;
+                state.translationProgress.updatedNodes += appliedCount;
+                state.translationProgress.skippedNodes += skippedCount;
+                if (appliedCount || skippedCount) refreshProgressToast();
+            }
+            function payload(data) {
+                if (active()) recordProgress(appendBatchTranslationChunk(batch, extractStreamTextFromPayload(data, platform), runId));
+            }
+            function complete() {
+                if (!active()) { controller.abort(); return; }
+                flushSSEBuffer(parser, payload);
+                recordProgress(flushBatchCsvBuffer(batch, true, runId));
+                if (!batch.finishReceived) throw new Error('流式响应未输出 finish 结点');
+                batch.completed = true;
+                state.translationProgress.completedNodes += batch.entries.length;
+                state.translationProgress.finishedBatches++;
+                if (isDebug) console.log(`[Gemini Translator] Batch ${batch.index + 1} completed.`);
+                finish(null, false);
+            }
+            function text(response) {
+                if (!active() || typeof response !== 'string' || !response) return;
+                if (response.length < processedLength) throw new Error('流式响应累计文本发生回退');
+                const delta = response.slice(processedLength);
+                processedLength = response.length;
+                if (delta) consumeSSEPayload(delta, parser, payload);
+            }
+            const guarded = callback => response => {
                 if (settled) return;
-                if (streamFinalizeTimer) {
-                    clearTimeout(streamFinalizeTimer);
-                    streamFinalizeTimer = null;
-                }
-                settled = true;
-                cleanupRequest();
-                resolve();
+                if (!isActiveTranslationRun(runId)) { controller.abort(); return; }
+                try { callback(response); } catch (error) { finish(error); }
             };
-
-            const finalizeBatch = () => {
-                if (!isActiveTranslationRun(runId)) {
-                    finishSuccessfully();
-                    return;
-                }
-
-                const { appliedCount, skippedCount } = flushBatchCsvBuffer(batch, true, runId);
-                if (!state.translationProgress) {
-                    finishSuccessfully();
-                    return;
-                }
-                if (appliedCount > 0) {
-                    state.translationProgress.updatedNodes += appliedCount;
-                }
-                if (skippedCount > 0) {
-                    state.translationProgress.skippedNodes += skippedCount;
-                }
-                if (appliedCount > 0 || skippedCount > 0) {
-                    refreshProgressToast(true);
-                }
-
-                if (!batch.finishReceived) {
-                    throw new Error('流式响应未输出 finish 结点');
-                }
-
-                if (!batch.completed) {
-                    batch.completed = true;
-                    state.translationProgress.completedNodes += batch.entries.length;
-                    state.translationProgress.finishedBatches++;
-                }
-
-                if (isDebug) {
-                    console.log(`[Gemini Translator] Batch ${batch.index + 1} output:`, batch.resultLines.join('\n'));
-                }
-            };
-
-            const handlePayload = (payload) => {
-                if (!isActiveTranslationRun(runId)) return;
-                const chunkText = extractStreamTextFromPayload(payload, platform);
-                const { appliedCount, skippedCount } = appendBatchTranslationChunk(batch, chunkText, runId);
-                if (!state.translationProgress) return;
-                if (appliedCount > 0) {
-                    state.translationProgress.updatedNodes += appliedCount;
-                }
-                if (skippedCount > 0) {
-                    state.translationProgress.skippedNodes += skippedCount;
-                }
-                if (appliedCount > 0 || skippedCount > 0) {
-                    refreshProgressToast();
-                }
-            };
-
-            const processIncomingText = (responseBody, force = false) => {
-                if (!responseBody) return;
-                if (responseBody.length < processedLength) {
-                    processedLength = 0;
-                }
-
-                const delta = responseBody.slice(processedLength);
-                processedLength = responseBody.length;
-
-                if (delta) {
-                    consumeSSEPayload(delta, parserState, handlePayload);
-                }
-
-                if (force) {
-                    flushSSEBuffer(parserState, handlePayload);
-                }
-            };
-
-            const processIncomingChunk = (chunk, force = false) => {
-                if (chunk == null) {
-                    if (force) {
-                        flushSSEBuffer(parserState, handlePayload);
-                    }
-                    return;
-                }
-
-                if (typeof chunk === 'string') {
-                    consumeSSEPayload(chunk, parserState, handlePayload);
-                } else {
-                    consumeSSEPayload(textDecoder.decode(chunk, { stream: !force }), parserState, handlePayload);
-                }
-
-                if (force) {
-                    flushSSEBuffer(parserState, handlePayload);
-                }
-            };
-
-            const consumeReadableStream = async (stream) => {
-                if (!stream) {
-                    throw new Error('Tampermonkey 未提供流对象');
-                }
-
-                if (typeof stream.getReader === 'function') {
-                    const reader = stream.getReader();
-                    try {
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-                            processIncomingChunk(value, false);
-                        }
-                        processIncomingChunk(null, true);
-                        return;
-                    } finally {
-                        if (typeof reader.releaseLock === 'function') {
-                            reader.releaseLock();
-                        }
-                    }
-                }
-
-                if (typeof stream.read === 'function') {
-                    while (true) {
-                        const result = await stream.read();
-                        if (!result || result.done) break;
-                        processIncomingChunk(result.value, false);
-                    }
-                    processIncomingChunk(null, true);
-                    return;
-                }
-
-                throw new Error('无法识别的流对象类型');
-            };
-
-            const finalizeFromLoadFallback = (res) => {
-                if (settled) return;
-
+            async function readStream(stream) {
                 try {
-                    const fallbackText = res.responseText || (typeof res.response === 'string' ? res.response : '');
-                    if (fallbackText) {
-                        processIncomingText(fallbackText, true);
-                    } else {
-                        processIncomingChunk(null, true);
+                    reader = typeof stream.getReader === 'function' ? stream.getReader() : stream;
+                    while (active()) {
+                        const result = await reader.read();
+                        if (!active()) return;
+                        if (!result || result.done) break;
+                        const chunk = typeof result.value === 'string' ? result.value : decoder.decode(result.value, { stream: true });
+                        consumeSSEPayload(chunk, parser, payload);
                     }
-
-                    if (isDebug) {
-                        console.log(`[Gemini Translator] Batch ${batch.index + 1} finalized from onload fallback.`);
-                    }
-
-                    finalizeBatch();
-                    finishSuccessfully();
-                } catch (error) {
-                    finishWithError(error);
-                }
-            };
-
-            if (!isActiveTranslationRun(runId)) {
-                resolve();
-                return;
+                    if (!active()) return;
+                    consumeSSEPayload(decoder.decode(), parser, payload);
+                    complete();
+                } catch (error) { finish(error); }
+                finally { try { reader?.releaseLock?.(); } catch { /* A cancelled reader may already be released. */ } }
             }
-
-            request = GM_xmlhttpRequest({
-                ...requestOptions,
-                onloadstart: (res) => {
-                    if (settled || !res?.response) return;
-
-                    streamStarted = true;
-                    (async () => {
-                        try {
-                            if (isHttpErrorStatus(res.status)) {
-                                throw new Error(getResponseErrorMessage(res));
-                            }
-
-                            await consumeReadableStream(res.response);
-                            finalizeBatch();
-                            finishSuccessfully();
-                        } catch (error) {
-                            finishWithError(error);
+            if (!isActiveTranslationRun(runId)) { resolve(); return; }
+            state.activeRequests.add(controller);
+            try {
+                request = GM_xmlhttpRequest({
+                    ...requestOptions,
+                    onloadstart: guarded(res => {
+                        if (isHttpErrorStatus(res.status)) throw getHttpError(res);
+                        const stream = res.response;
+                        if (!readable && (typeof stream?.getReader === 'function' || typeof stream?.read === 'function')) {
+                            if (processedLength) throw new Error('响应已开始使用文本传输，不能切换到 readable');
+                            readable = true;
+                            void readStream(stream);
                         }
-                    })();
-                },
-                onprogress: (res) => {
-                    if (settled || streamStarted) return;
-                    try {
-                        processIncomingText(res.responseText || res.response || '', false);
-                    } catch (error) {
-                        finishWithError(error);
-                    }
-                },
-                onload: (res) => {
-                    if (settled) return;
-
-                    try {
-                        if (isHttpErrorStatus(res.status)) {
-                            throw new Error(getResponseErrorMessage(res));
-                        }
-
-                        if (streamStarted) {
-                            if (streamFinalizeTimer) {
-                                clearTimeout(streamFinalizeTimer);
-                            }
-                            streamFinalizeTimer = setTimeout(() => finalizeFromLoadFallback(res), 150);
-                            return;
-                        }
-
-                        processIncomingText(res.responseText || res.response || '', true);
-                        finalizeBatch();
-                        finishSuccessfully();
-                    } catch (error) {
-                        finishWithError(error);
-                    }
-                },
-                onerror: (err) => finishWithError(new Error(getNetworkErrorMessage(err)))
-            });
-
-            if (request && typeof request.abort === 'function') {
-                state.activeRequests.add(request);
-            }
+                    }),
+                    onprogress: guarded(res => {
+                        if (isHttpErrorStatus(res.status)) throw getHttpError(res);
+                        if (!readable) text(res.responseText || res.response);
+                    }),
+                    onload: guarded(res => {
+                        if (isHttpErrorStatus(res.status)) throw getHttpError(res);
+                        // Once claimed, the reader exclusively owns EOF, decoding and finalization.
+                        if (readable) return;
+                        text(res.responseText || res.response);
+                        complete();
+                    }),
+                    onabort: () => controller.abort(),
+                    ontimeout: () => finish(new Error('翻译请求超时')),
+                    onerror: error => finish(new Error(getNetworkErrorMessage(error)))
+                });
+                // Some transports invoke a terminal callback before returning their handle.
+                if (abortTransport) { try { request?.abort?.(); } catch { /* Already settled. */ } }
+            } catch (error) { finish(Object.assign(normalizeTranslationError(error), { retryable: false, fatal: true })); }
         });
     }
 
-    function createStreamRequestOptions(platform, apiKey, model, prompt, csvInput) {
-        const reasoningEffort = getReasoningEffort(platform, model);
+    function getRequestSettings(platform, model) {
+        const protocol = platform === 'openai' ? getOpenAIProtocol() : 'chat';
+        return {
+            protocol,
+            baseUrl: platform === 'openai' ? normalizeOpenAIBaseUrl(GM_getValue('gm_openai_base_url', '')) : CONFIG.platforms[platform].endpoint,
+            reasoningEffort: getReasoningEffort(platform, model),
+            serviceTier: platform === 'openai' ? getOpenAIServiceTier(protocol) : ''
+        };
+    }
+
+    function getHttpError(res) {
+        const status = res.status;
+        const retryable = status === 408 || status === 409 || status === 429 || status >= 500;
+        const value = String(res.responseHeaders || '').match(/^retry-after:\s*(.*?)\s*$/im)?.[1];
+        let retryAfterMs = 0;
+        if (value) {
+            retryAfterMs = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+            if (!Number.isFinite(retryAfterMs) || retryAfterMs < 0) retryAfterMs = 0;
+        }
+        return Object.assign(new Error(getResponseErrorMessage(res)), { status, retryable, fatal: !retryable, retryAfterMs });
+    }
+
+    function createStreamRequestOptions(platform, apiKey, model, prompt, csvInput, settings = getRequestSettings(platform, model)) {
+        const { reasoningEffort, protocol, baseUrl, serviceTier } = settings;
         if (platform === 'gemini') {
             const body = {
                 system_instruction: { parts: [{ text: prompt }] },
@@ -1459,7 +1276,6 @@ Provide only the translated CSV lines plus the final finish line.
             };
         }
 
-        const protocol = platform === 'openai' ? getOpenAIProtocol() : 'chat';
         const body = protocol === 'responses'
             ? { model, instructions: prompt, input: csvInput, stream: true, store: false }
             : {
@@ -1472,9 +1288,7 @@ Provide only the translated CSV lines plus the final finish line.
             };
         let url;
         if (platform === 'openai') {
-            const baseUrl = normalizeOpenAIBaseUrl(GM_getValue('gm_openai_base_url', ''));
             url = `${baseUrl}/${protocol === 'responses' ? 'responses' : 'chat/completions'}`;
-            const serviceTier = getOpenAIServiceTier(protocol);
             if (serviceTier) body.service_tier = serviceTier;
             body.store = false;
             if (reasoningEffort) {

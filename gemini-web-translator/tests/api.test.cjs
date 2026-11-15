@@ -1,32 +1,6 @@
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 const test = require('node:test');
-const vm = require('node:vm');
-
-// Exercise the userscript's actual functions without initializing a webpage.
-const source = fs.readFileSync(path.join(__dirname, '..', 'gemini-web-translator.js'), 'utf8');
-const instrumented = source.replace('    if (isExcludedContext()) {', `
-    globalThis.api = {
-        CONFIG, state, getPlatformModelSettings, getOpenAIProtocol, getOpenAIServiceTier,
-        normalizeOpenAIBaseUrl, createStreamRequestOptions, extractStreamTextFromPayload,
-        consumeSSEPayload, flushSSEBuffer, createTranslationBatches, createProgressState,
-        translateSingleBatch, translateAllBatches
-    };
-    return;
-    if (isExcludedContext()) {`);
-
-function load(values = {}, request = () => { throw new Error('Unexpected request'); }) {
-    const storage = new Map(Object.entries(values));
-    const context = vm.createContext({
-        URL, TextDecoder, setTimeout, clearTimeout, console,
-        GM_getValue: (key, fallback) => storage.has(key) ? storage.get(key) : fallback,
-        GM_setValue: (key, value) => storage.set(key, value),
-        GM_xmlhttpRequest: request
-    });
-    vm.runInContext(instrumented, context);
-    return { api: context.api, storage };
-}
+const { load } = require('./helpers.cjs');
 
 function requestBody(api, platform = 'openai', model = 'test-model') {
     const options = api.createStreamRequestOptions(platform, 'test-key', model, 'Translate', 'n1,"Hello"');
@@ -258,10 +232,11 @@ test('SSE survives every possible split, including CRLF pairs, and ignores DONE'
 });
 
 function prepareBatch(api) {
-    const node = { nodeValue: 'Hello' };
+    const node = { nodeValue: 'Hello', isConnected: true };
     api.state.isTranslating = true;
     api.state.activeTranslationRunId = 1;
     api.state.textNodeMap.set('n1', node);
+    api.state.sourceTexts.set(node, 'Hello');
     api.state.translationProgress = api.createProgressState(1, 1, 1);
     return { node, batch: api.createTranslationBatches([{ id: 'n1', text: 'Hello' }], 10)[0] };
 }
