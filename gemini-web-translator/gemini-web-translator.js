@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Webpage Translator
 // @namespace    http://tampermonkey.net/
-// @version      7.3.0
+// @version      7.4.0
 // @description  Translate webpages using Gemini, OpenRouter, or OpenAI (Chat Completions / Responses).
 // @author       NordLandeW
 // @match        *://*/*
@@ -23,6 +23,8 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_info
+// @sandbox      DOM
 // @connect      generativelanguage.googleapis.com
 // @connect      openrouter.ai
 // @connect      api.openai.com
@@ -186,7 +188,7 @@
         #gm-settings-overlay.open { opacity: 1; pointer-events: auto; }
         
         #gm-settings-panel {
-            background: #2b2c30; border: 1px solid rgba(255,255,255,0.1);
+            background: #2b2c30; color: var(--gm-text); border: 1px solid rgba(255,255,255,0.1);
             width: 420px; max-width: calc(100vw - 32px); max-height: 90vh; overflow-y: auto;
             box-sizing: border-box; border-radius: 16px; padding: 32px;
             box-shadow: 0 24px 48px rgba(0,0,0,0.5);
@@ -207,8 +209,6 @@
         .gm-select option { background: #2b2c30; color: #fff; }
         .gm-input:focus, .gm-select:focus { border-color: var(--gm-primary); background: rgba(138, 180, 248, 0.05); box-shadow: 0 0 0 2px rgba(138, 180, 248, 0.2); }
         .gm-input:hover, .gm-select:hover { border-color: #888; }
-        
-        .gm-input-secret { -webkit-text-security: disc; text-security: disc; letter-spacing: 2px; }
         
         .gm-checkbox-group { display: flex; flex-direction: column; gap: 10px; margin: 6px 0; background: rgba(0,0,0,0.15); padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05); }
         .gm-checkbox-label { color: #e8eaed; font-size: 13px; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
@@ -702,15 +702,64 @@ Provide only the translated CSV lines plus the final finish line.
         state.isUIInitialized = true;
     }
 
-    function init() {
-        GM_registerMenuCommand("🚀 翻译网页 (Alt+T)", startTranslationProcess);
-        GM_registerMenuCommand("⚙️ 设置", openSettings);
+    function isIsolatedRuntime() {
+        return typeof GM_info !== 'undefined' && ['dom', 'js'].includes(GM_info.sandboxMode);
+    }
 
-        document.addEventListener('keydown', (e) => {
-            if (e.altKey && e.key.toLowerCase() === 't') { e.preventDefault(); startTranslationProcess(); }
-            if (e.altKey && e.key.toLowerCase() === 's') { e.preventDefault(); openSettings(); }
+    function requireIsolatedRuntime() {
+        if (isIsolatedRuntime()) return true;
+        showToast('需要油猴隔离沙箱 (dom/js)。当前运行模式不支持安全读取或使用密钥，请检查脚本管理器设置。', 'error');
+        return false;
+    }
+
+    function updateKeyStatus() {
+        if (!state.isUIInitialized) return;
+        const platform = document.getElementById('gm-platform').value;
+        document.getElementById('gm-key-status').textContent = !isIsolatedRuntime() ? '隔离沙箱不可用'
+            : GM_getValue(`gm_api_key_${platform}`, '') ? '已配置' : '未配置';
+    }
+
+    function configureApiKey(platform) {
+        if (!requireIsolatedRuntime() || !Object.hasOwn(CONFIG.platforms, platform)) return;
+        const name = CONFIG.platforms[platform].name;
+        // Browser dialogs belong to the isolated world. Never prefill or place a key in page DOM.
+        const value = window.prompt(`设置 ${name} API 密钥。取消保留原值；留空后确认可删除密钥。`, '');
+        if (value === null) return;
+        const key = value.trim();
+        if (key) GM_setValue(`gm_api_key_${platform}`, key);
+        else {
+            if (!window.confirm(`删除 ${name} 的已保存密钥？`)) return;
+            GM_deleteValue(`gm_api_key_${platform}`);
+        }
+        updateKeyStatus();
+        showToast(`${name} 密钥已${key ? '保存' : '删除'}`, 'success');
+    }
+
+    function configureOpenAIBaseUrl() {
+        if (!requireIsolatedRuntime()) return;
+        const value = window.prompt('设置 OpenAI / 兼容 API Base URL。留空恢复官方地址。', GM_getValue('gm_openai_base_url', CONFIG.platforms.openai.endpoint));
+        if (value === null) return;
+        let url;
+        try { url = normalizeOpenAIBaseUrl(value); } catch (error) { showToast(error.message, 'error'); return; }
+        const warning = url.startsWith('http:') ? '\n注意：HTTP 不加密。' : '';
+        if (!window.confirm(`翻译内容与 OpenAI 密钥将发送到：\n${url}${warning}\n确认使用此地址？`)) return;
+        GM_setValue('gm_openai_base_url', url);
+        if (state.isUIInitialized) document.getElementById('gm-openai-base-url').textContent = url;
+        showToast('API Base URL 已保存，下次翻译生效', 'success');
+    }
+
+    function init() {
+        GM_registerMenuCommand('🚀 翻译网页 (Alt+T)', () => startTranslationProcess());
+        GM_registerMenuCommand('⚙️ 设置', openSettings);
+        for (const [platform, config] of Object.entries(CONFIG.platforms)) {
+            GM_registerMenuCommand(`🔑 ${config.name} 密钥`, () => configureApiKey(platform));
+        }
+        GM_registerMenuCommand('🔗 OpenAI / 兼容 API 地址', configureOpenAIBaseUrl);
+        document.addEventListener('keydown', event => {
+            if (!event.isTrusted) return;
+            if (event.altKey && event.key.toLowerCase() === 't') { event.preventDefault(); void startTranslationProcess(); }
+            if (event.altKey && event.key.toLowerCase() === 's') { event.preventDefault(); openSettings(); }
         });
-        
         console.log('[Gemini Translator] Ready.');
     }
 
@@ -946,11 +995,12 @@ Provide only the translated CSV lines plus the final finish line.
             return;
         }
         
+        if (!requireIsolatedRuntime()) return;
         const platform = GM_getValue('gm_platform', CONFIG.defaults.platform);
         const apiKey = GM_getValue(`gm_api_key_${platform}`, '');
         
         if (!apiKey) {
-            showToast('请在设置 (Alt+S) 中配置 API 密钥', 'error');
+            showToast('请通过油猴菜单配置 API 密钥', 'error');
             openSettings();
             return;
         }
@@ -1564,7 +1614,7 @@ Provide only the translated CSV lines plus the final finish line.
             <div id="gm-settings-overlay">
                 <div id="gm-settings-panel">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.3.0</h3>
+                        <h3 style="color:#fff; margin:0; font-size:18px;">Gemini 翻译器 V7.4.0</h3>
                     </div>
                     
                     <div>
@@ -1587,12 +1637,14 @@ Provide only the translated CSV lines plus the final finish line.
                     
                     <div id="gm-api-key-container">
                         <label class="gm-label" id="gm-key-label">API 密钥</label>
-                        <input type="text" id="gm-key" class="gm-input gm-input-secret" placeholder="粘贴 API 密钥" spellcheck="false">
+                        <div id="gm-key-status"></div>
+                        <div style="color:#9aa0a6; font-size:12px; margin-top:6px">通过油猴菜单管理各平台密钥，密钥不会显示在网页中。</div>
                     </div>
 
                     <div id="gm-openai-settings" class="gm-hidden">
                         <label class="gm-label">API Base URL</label>
-                        <input type="url" id="gm-openai-base-url" class="gm-input" placeholder="https://api.openai.com/v1" spellcheck="false">
+                        <div id="gm-openai-base-url" style="overflow-wrap:anywhere"></div>
+                        <div style="color:#9aa0a6; font-size:12px; margin-top:6px">通过油猴菜单“OpenAI / 兼容 API 地址”修改。</div>
                         <label class="gm-label" style="margin-top:12px">API 协议</label>
                         <select id="gm-openai-protocol" class="gm-select">
                             <option value="chat">Chat Completions (/chat/completions)</option>
@@ -1700,26 +1752,19 @@ Provide only the translated CSV lines plus the final finish line.
         document.getElementById('gm-model-input').oninput = () => updateReasoningUI();
         document.getElementById('gm-target-language-select').onchange = updateTargetLanguageUI;
         
-        document.getElementById('gm-save').onclick = () => {
+        document.getElementById('gm-save').onclick = event => {
+            if (!event.isTrusted) return;
             const platform = document.getElementById('gm-platform').value;
-            let openaiBaseUrl;
-            try {
-                openaiBaseUrl = normalizeOpenAIBaseUrl(document.getElementById('gm-openai-base-url').value);
-            } catch (error) {
-                showToast(error.message, 'error');
-                return;
-            }
+            if (!Object.hasOwn(CONFIG.platforms, platform)) return;
 
             capturePlatformSettings();
             state.settingsDrafts.forEach((draft, draftPlatform) => {
-                GM_setValue(`gm_api_key_${draftPlatform}`, draft.apiKey);
                 GM_setValue(`gm_model_${draftPlatform}`, draft.model);
                 GM_setValue(`gm_model_input_${draftPlatform}`, draft.customModel);
                 GM_setValue(`gm_reasoning_effort_${draftPlatform}`, draft.reasoningEffort);
             });
             GM_setValue('gm_platform', platform);
             GM_setValue('gm_target_language', readTargetLanguageFromUI());
-            GM_setValue('gm_openai_base_url', openaiBaseUrl);
             GM_setValue('gm_openai_protocol', document.getElementById('gm-openai-protocol').value);
             GM_setValue('gm_openai_service_tier', document.getElementById('gm-openai-service-tier').value);
             GM_setValue('gm_cache_enable', document.getElementById('gm-cache').checked);
@@ -1763,7 +1808,6 @@ Provide only the translated CSV lines plus the final finish line.
     function capturePlatformSettings() {
         if (!state.settingsPlatform) return;
         state.settingsDrafts.set(state.settingsPlatform, {
-            apiKey: document.getElementById('gm-key').value.trim(),
             model: document.getElementById('gm-model').value,
             customModel: document.getElementById('gm-model-input').value.trim(),
             reasoningEffort: document.getElementById('gm-reasoning-effort').value
@@ -1775,13 +1819,11 @@ Provide only the translated CSV lines plus the final finish line.
         const platform = document.getElementById('gm-platform').value;
         state.settingsPlatform = platform;
         const modelSelect = document.getElementById('gm-model');
-        const keyInput = document.getElementById('gm-key');
         const draft = state.settingsDrafts.get(platform) || {
             ...getPlatformModelSettings(platform),
-            apiKey: GM_getValue(`gm_api_key_${platform}`, ''),
             reasoningEffort: getSavedReasoningEffort(platform)
         };
-        keyInput.value = draft.apiKey;
+        updateKeyStatus();
         document.getElementById('gm-model-input').value = draft.customModel;
         
         // Update model dropdown
@@ -1894,7 +1936,7 @@ Provide only the translated CSV lines plus the final finish line.
         state.settingsDrafts.clear();
         const platform = GM_getValue('gm_platform', CONFIG.defaults.platform);
         document.getElementById('gm-platform').value = platform;
-        document.getElementById('gm-openai-base-url').value = GM_getValue('gm_openai_base_url', '');
+        document.getElementById('gm-openai-base-url').textContent = GM_getValue('gm_openai_base_url', CONFIG.platforms.openai.endpoint);
         const protocol = getOpenAIProtocol();
         document.getElementById('gm-openai-protocol').value = protocol;
         document.getElementById('gm-openai-service-tier').value = getOpenAIServiceTier(protocol);
