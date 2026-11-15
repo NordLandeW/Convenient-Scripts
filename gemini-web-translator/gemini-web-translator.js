@@ -1930,7 +1930,7 @@ Provide only the translated CSV lines plus the final finish line.
         const container = document.getElementById('gm-translator-container');
         const toast = document.createElement('div');
         toast.className = 'gm-toast';
-        toast.innerHTML = getToastContent(text, type);
+        toast.replaceChildren(getToastContent(text, type));
         container.appendChild(toast);
         
         requestAnimationFrame(() => toast.classList.add('visible'));
@@ -1946,7 +1946,7 @@ Provide only the translated CSV lines plus the final finish line.
         const toast = activeToasts.get(id);
         if (!toast) return showToast(text, type);
         
-        toast.innerHTML = getToastContent(text, type);
+        toast.replaceChildren(getToastContent(text, type));
         
         // Auto-destroy when not loading
         if (type !== 'loading') {
@@ -1957,11 +1957,15 @@ Provide only the translated CSV lines plus the final finish line.
     }
 
     function getToastContent(text, type) {
-        let icon = '';
-        if (type === 'loading') icon = '<div class="gm-spinner"></div>';
-        else if (type === 'success') icon = '<span style="color:#4ade80; font-size:16px;">✓</span>';
-        else if (type === 'error') icon = '<span style="color:#ef4444; font-size:16px;">✕</span>';
-        return `${icon}<span>${text}</span>`;
+        const content = document.createDocumentFragment();
+        const icon = document.createElement('span');
+        if (type === 'loading') icon.className = 'gm-spinner';
+        else if (type === 'success') { icon.textContent = '✓'; icon.style.color = '#4ade80'; }
+        else if (type === 'error') { icon.textContent = '✕'; icon.style.color = '#ef4444'; }
+        const label = document.createElement('span');
+        label.textContent = String(text);
+        content.append(icon, label);
+        return content;
     }
 
     function removeToast(id) {
