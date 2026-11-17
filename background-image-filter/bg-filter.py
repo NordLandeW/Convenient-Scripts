@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Background image browser (Qt edition).
 
-Migrated from the Tk implementation (bg-filter-tk.py) without changing the
-scoring rules or the feature set. Rendering runs on OpenGL where available:
+Content-aware scoring runs in the background; the legacy Tk browser remains
+available as bg-filter-tk.py. Rendering runs on OpenGL where available:
 the thumbnail grid and the preview canvas are QOpenGLWidgets, and interactive
 zoom is scaled by the GPU while the Lanczos refinement is rendered in the
 background. Set BG_FILTER_RENDER=raster to force software raster painting.
@@ -14,14 +14,15 @@ import os
 import struct
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from ctypes import c_void_p, memmove
 from dataclasses import dataclass
+from threading import Event
 
 from PIL import Image
 from loguru import logger
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -52,6 +53,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from scoring import AnalysisCache, INVALID_SCORE, aspect_ratio_score, scan_folder
+
 try:
     from ctypes import windll
 except ImportError:
@@ -68,7 +71,7 @@ GRID_SPACING = 4
 
 
 # ---------------------------------------------------------------------------
-# Image helpers (unchanged from the Tk version)
+# Image helpers
 # ---------------------------------------------------------------------------
 
 def prepare_for_resampling(img):
@@ -114,55 +117,6 @@ def get_simplest_ratio(ratio_float):
     return f"{f.numerator}:{f.denominator}"
 
 
-def compute_score(img_path, target_ratio, max_area, max_size, preloaded_info=None):
-    info = preloaded_info if preloaded_info is not None else get_image_info(img_path)
-    if info is None:
-        return -10000
-    width, height, ratio, file_size = info
-
-    score_aspect = aspect_ratio_score(ratio, target_ratio)
-
-    ext = os.path.splitext(img_path)[1].lower()
-    if ext == ".png":
-        score_format = 20
-    elif ext in [".jpg", ".jpeg"]:
-        score_format = 10
-    elif ext == ".gif":
-        score_format = -1000
-    else:
-        score_format = 0
-
-    if width * height >= 3840 * 2160:
-        score_resolution = 45
-    elif width * height >= 2560 * 1440:
-        score_resolution = 40
-    elif width * height >= 1920 * 1080:
-        score_resolution = 20
-    elif width * height >= 1280 * 720:
-        score_resolution = 10
-    else:
-        score_resolution = -40
-
-    score_filesize = 20 * (file_size / max_size) if max_size > 0 else 0
-
-    return score_aspect + score_format + score_resolution + score_filesize
-
-
-def aspect_ratio_score(image_ratio, desired_ratio):
-    if desired_ratio <= 0 or image_ratio <= 0:
-        return 0
-
-    if image_ratio > desired_ratio:
-        visible_ratio = desired_ratio / image_ratio
-    else:
-        visible_ratio = image_ratio / desired_ratio
-
-    invisible_ratio = 1.0 - visible_ratio
-
-    max_score = 200.0
-    return max_score * (1.0 - invisible_ratio)
-
-
 def get_image_info(filepath):
     try:
         with Image.open(filepath) as img:
@@ -174,30 +128,11 @@ def get_image_info(filepath):
     return width, height, ratio, file_size
 
 
-def collect_images(folder):
-    image_files = []
-    allowed_ext = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"}
-    for root, dirs, files in os.walk(folder):
-        for f in files:
-            ext = os.path.splitext(f)[1].lower()
-            if ext in allowed_ext:
-                image_files.append(os.path.join(root, f))
-    return image_files
-
-
 def _console_print(*args, **kwargs):
     """print() that also survives pythonw.exe, where sys.stdout is None."""
     if sys.stdout is None:
         return
     print(*args, **kwargs)
-
-
-def _print_progress(cur, total, prefix=""):
-    if sys.stdout is None:
-        return
-    pct = cur * 100 // total
-    sys.stdout.write(f"\r{prefix}{cur}/{total}  {pct}%")
-    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +317,8 @@ class WorkerSignals(QObject):
     prefetch_done = Signal(object, object)           # key, PIL image | None
     preview_done = Signal(int, object, object, object)  # generation, (w,h), dpr, PIL image
     neighbor_done = Signal(str, object)              # path, result tuple | None
+    scan_progress = Signal(int, int, int)             # generation, completed, total
+    scan_done = Signal(int, object, str)              # generation, ScanResult | None, error
 
 
 # ---------------------------------------------------------------------------
@@ -457,23 +394,31 @@ class ImageBrowser(QMainWindow):
         self._last_thumbnail_size = None
         self.image_info_cache = {}
         self.score_cache = {}
+        self.score_details = {}
+        self.analysis_cache = AnalysisCache()
+        self._scan_executor = ThreadPoolExecutor(max_workers=1)
+        self._scan_future = None
+        self._scan_cancel = Event()
+        self._scan_generation = 0
+        self._loading = False
         self.current_page = 0
-        self.max_area = 0
-        self.max_size = 0
         self._cells = []
         self._shown = False
         self._closed = False
         self.previews = []
 
-        if desired_ratio is not None:
-            self.screen_ratio = desired_ratio
+        screen = QGuiApplication.primaryScreen()
+        geo = screen.geometry() if screen is not None else None
+        if geo and geo.width() > 0 and geo.height() > 0:
+            self.screen_ratio = geo.width() / geo.height()
+            self.target_pixels = geo.width() * geo.height() * screen.devicePixelRatio() ** 2
         else:
-            screen = QGuiApplication.primaryScreen()
-            geo = screen.geometry() if screen is not None else None
-            if geo and geo.height() > 0:
-                self.screen_ratio = geo.width() / geo.height()
-            else:
-                self.screen_ratio = 16 / 9
+            self.screen_ratio = 16 / 9
+            self.target_pixels = 1920 * 1080
+        if desired_ratio is not None:
+            if not math.isfinite(desired_ratio) or desired_ratio <= 0:
+                raise ValueError("Target ratio must be finite and positive")
+            self.screen_ratio = desired_ratio
 
         self.use_opengl = opengl_available()
         logger.info("渲染模式: {}", "OpenGL 硬件加速" if self.use_opengl else "软件光栅")
@@ -485,6 +430,8 @@ class ImageBrowser(QMainWindow):
         self.signals = WorkerSignals(self)
         self.signals.thumbnail_done.connect(self._thumbnail_done)
         self.signals.prefetch_done.connect(self._prefetch_done)
+        self.signals.scan_progress.connect(self._scan_progress, Qt.ConnectionType.QueuedConnection)
+        self.signals.scan_done.connect(self._scan_done, Qt.ConnectionType.QueuedConnection)
 
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -576,6 +523,8 @@ class ImageBrowser(QMainWindow):
     def closeEvent(self, event):
         self._closed = True
         self._resize_timer.stop()
+        self._scan_cancel.set()
+        self._scan_executor.shutdown(wait=False, cancel_futures=True)
         self._cancel_prefetch()
         future_list = list(self.thumbnail_futures.values())
         self.thumbnail_futures.clear()
@@ -640,69 +589,90 @@ class ImageBrowser(QMainWindow):
 
     def load_folder(self, folder):
         self.folder = folder
-        self.images = collect_images(folder)
-        if not self.images:
-            QMessageBox.information(self, "提示", "该文件夹中未找到图片！")
-            self.sorted_images = []
-            self.current_page = 0
-            if self._shown:
-                self.display_page()
+        if self._closed:
             return
+        self._scan_cancel.set()
+        if self._scan_future is not None:
+            self._scan_future.cancel()
+        self._scan_generation += 1
+        generation = self._scan_generation
+        self._scan_cancel = Event()
+        self._loading = True
+        # Replace snapshots rather than clearing dictionaries held by previews.
+        self.images = []
+        self.sorted_images = []
+        self.image_info_cache = {}
+        self.score_cache = {}
+        self.score_details = {}
+        self._cancel_prefetch()
+        for future in self.thumbnail_futures.values():
+            future.cancel()
+        self.thumbnail_futures.clear()
+        self.thumbnails.clear()
+        self.display_page()
+        self.statusBar().showMessage("正在扫描图片…")
+        future = self._scan_executor.submit(
+            scan_folder, folder, self.screen_ratio, self.target_pixels,
+            self.analysis_cache, self._scan_cancel,
+            lambda completed, total: self._emit_scan_progress(generation, completed, total),
+        )
+        self._scan_future = future
+        future.add_done_callback(lambda done: self._scan_finished(generation, done))
 
-        total = len(self.images)
-        self.image_info_cache.clear()
-        self.score_cache.clear()
-        self.max_area = 0
-        self.max_size = 0
-        max_workers = min(32, max(4, (os.cpu_count() or 1) * 2))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(get_image_info, path): path for path in self.images}
-            for idx, fut in enumerate(as_completed(futures), 1):
-                path = futures[fut]
-                try:
-                    info = fut.result()
-                except Exception:
-                    logger.exception("读取图片信息失败: {}", path)
-                    info = None
-                if info is not None:
-                    self.image_info_cache[path] = info
-                    w, h, _, sz = info
-                    area = w * h
-                    if area > self.max_area:
-                        self.max_area = area
-                    if sz > self.max_size:
-                        self.max_size = sz
-                _print_progress(idx, total, "正在读取 ")
-        _console_print()
+    def _emit_scan_progress(self, generation, completed, total):
+        try:
+            self.signals.scan_progress.emit(generation, completed, total)
+        except RuntimeError:
+            pass
 
-        score_dict = {}
-        score_workers = min(32, max(4, (os.cpu_count() or 1) * 2))
-        with ThreadPoolExecutor(max_workers=score_workers) as pool:
-            futures = {
-                pool.submit(
-                    compute_score,
-                    p,
-                    self.screen_ratio,
-                    self.max_area,
-                    self.max_size,
-                    self.image_info_cache.get(p),
-                ): p
-                for p in self.images
-            }
-            for idx, fut in enumerate(as_completed(futures), 1):
-                p = futures[fut]
-                try:
-                    score_dict[p] = fut.result()
-                except Exception:
-                    logger.exception("计算得分失败: {}", p)
-                    score_dict[p] = -10000
-                _print_progress(idx, total, "正在评分 ")
-        _console_print()
+    def _scan_finished(self, generation, future):
+        try:
+            result = future.result()
+            error = ""
+        except CancelledError:
+            return
+        except Exception as exception:
+            logger.exception("扫描图片失败")
+            result, error = None, str(exception)
+        try:
+            self.signals.scan_done.emit(generation, result, error)
+        except RuntimeError:
+            pass
 
-        self.score_cache = score_dict
-        self.sorted_images = sorted(self.images, key=lambda x: score_dict[x], reverse=True)
-        if self._shown and self.grid.width() > 1 and self.grid.height() > 1:
-            self.display_page()
+    @Slot(int, int, int)
+    def _scan_progress(self, generation, completed, total):
+        if self._closed or generation != self._scan_generation or not self._loading:
+            return
+        self.statusBar().showMessage(f"正在分析图片 {completed}/{total}…")
+
+    @Slot(int, object, str)
+    def _scan_done(self, generation, result, error):
+        if self._closed or generation != self._scan_generation:
+            return
+        self._loading = False
+        self._scan_future = None
+        if error:
+            self.statusBar().showMessage(f"扫描失败: {error}")
+            return
+        if result is None:
+            return
+        self.images = result.images
+        self.sorted_images = result.sorted_images
+        self.image_info_cache = result.info
+        self.score_cache = result.scores
+        self.score_details = result.details
+        for path, message in result.errors.items():
+            logger.warning("分析图片失败 {}: {}", path, message)
+        target_width = math.sqrt(self.target_pixels * self.screen_ratio)
+        target_height = math.sqrt(self.target_pixels / self.screen_ratio)
+        if self.images:
+            self.statusBar().showMessage(
+                f"已分析 {len(self.images)} 张，失败 {len(result.errors)} 张；"
+                f"评分目标约 {target_width:.0f}×{target_height:.0f} 像素"
+            )
+        else:
+            self.statusBar().showMessage("该文件夹中未找到图片")
+        self.display_page()
 
     def get_cached_image_info(self, img_path):
         info = self.image_info_cache.get(img_path)
@@ -770,13 +740,8 @@ class ImageBrowser(QMainWindow):
             rect = QRectF(x, y, target_size[0], target_size[1])
 
             self.get_thumbnail(img_path, target_size, dpr)
-            cached_info = self.get_cached_image_info(img_path)
-            total_score = self.score_cache.get(img_path)
-            if total_score is None:
-                total_score = compute_score(
-                    img_path, self.screen_ratio, self.max_area, self.max_size, cached_info
-                )
-                self.score_cache[img_path] = total_score
+            cached_info = self.image_info_cache.get(img_path)
+            total_score = self.score_cache.get(img_path, INVALID_SCORE)
             if cached_info is not None:
                 _, _, ratio, _ = cached_info
                 aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
@@ -810,7 +775,7 @@ class ImageBrowser(QMainWindow):
         for cell in self._cells:
             rect = cell.rect
             pixmap = self.thumbnails.get(
-                (cell.path, cell.target_size, cell.dpr), self.placeholder_pixmap
+                (cell.path, cell.target_size, cell.dpr, self._scan_generation), self.placeholder_pixmap
             )
             pw = pixmap.width() / (pixmap.devicePixelRatio() or 1.0)
             ph = pixmap.height() / (pixmap.devicePixelRatio() or 1.0)
@@ -927,7 +892,7 @@ class ImageBrowser(QMainWindow):
     # -- Thumbnail cache / prefetch ---------------------------------------
 
     def get_thumbnail(self, img_path, target_size, dpr):
-        key = (img_path, target_size, dpr)
+        key = (img_path, target_size, dpr, self._scan_generation)
         if key in self.thumbnails:
             return self.thumbnails[key]
         if key in self.thumbnail_futures:
@@ -966,7 +931,7 @@ class ImageBrowser(QMainWindow):
             pass
 
     def _thumbnail_done(self, key, pil_image):
-        if self._closed:
+        if self._closed or key[3] != self._scan_generation:
             return
         self.thumbnail_futures.pop(key, None)
         if key not in self.thumbnails and pil_image is not None:
@@ -998,7 +963,7 @@ class ImageBrowser(QMainWindow):
                 desired_paths.update(self.sorted_images[start:start + self.page_size])
 
         for key, future in list(self.prefetch_futures.items()):
-            if key[1:] != (target_size, dpr) or key[0] not in desired_paths:
+            if key[1:3] != (target_size, dpr) or key[0] not in desired_paths:
                 future.cancel()
                 self.prefetch_futures.pop(key, None)
 
@@ -1006,7 +971,7 @@ class ImageBrowser(QMainWindow):
             self.prefetch_thumbnail(img_path, target_size, dpr)
 
     def prefetch_thumbnail(self, img_path, target_size, dpr):
-        key = (img_path, target_size, dpr)
+        key = (img_path, target_size, dpr, self._scan_generation)
         if key in self.thumbnails or key in self.thumbnail_futures or key in self.prefetch_futures:
             return
         future = self.prefetch_executor.submit(
@@ -1026,7 +991,7 @@ class ImageBrowser(QMainWindow):
             pass
 
     def _prefetch_done(self, key, pil_image):
-        if self._closed:
+        if self._closed or key[3] != self._scan_generation:
             return
         self.prefetch_futures.pop(key, None)
         if key in self.thumbnails or pil_image is None:
@@ -1044,10 +1009,9 @@ class ImageBrowser(QMainWindow):
             self.sorted_images,
             index,
             self.screen_ratio,
-            self.max_area,
-            self.max_size,
             self.image_info_cache,
             self.score_cache,
+            self.score_details,
         )
         if getattr(preview, "_init_failed", False):
             return
@@ -1138,20 +1102,19 @@ class _PreviewCanvasOpenGL(QOpenGLWidget):
 
 
 class PreviewWindow(QWidget):
-    def __init__(self, parent, image_list, index, screen_ratio, max_area, max_size,
-                 info_cache, score_cache):
+    def __init__(self, parent, image_list, index, screen_ratio,
+                 info_cache, score_cache, score_details):
         super().__init__(parent, Qt.WindowType.Window)
         self._init_failed = False
         self._closed = False
         self._shown = False
         self.screen_ratio = screen_ratio
-        self.max_area = max_area
-        self.max_size = max_size
         self.image_list = image_list
         self.index = index
         self.img_path = self.image_list[self.index]
         self.info_cache = info_cache
         self.score_cache = score_cache
+        self.score_details = score_details
 
         try:
             with Image.open(self.img_path) as img:
@@ -1457,11 +1420,18 @@ class PreviewWindow(QWidget):
         info = self.get_cached_image_info(self.img_path)
         if info is not None:
             width, height, ratio, file_size = info
-            total_score = self.get_cached_score(self.img_path, info)
-            aspect_score = aspect_ratio_score(ratio, self.screen_ratio)
+            total_score = self.score_cache.get(self.img_path, INVALID_SCORE)
+            detail = self.score_details.get(self.img_path)
+            score_text = f"总分: {total_score:.1f}"
+            if detail is not None:
+                score_text += (
+                    f", 比例分: {detail.aspect:.1f}, "
+                    f"有效分辨率分: {detail.resolution:.1f}, 色彩分: {detail.color:.1f}"
+                )
+                if detail.format_penalty:
+                    score_text += f", GIF: {detail.format_penalty:.0f}"
             self.info_label.setText(
-                f"分辨率: {width}x{height}, 大小: {file_size} 字节, "
-                f"总分: {total_score:.1f}, 比例分: {aspect_score:.1f}"
+                f"分辨率: {width}x{height}, 大小: {file_size} 字节\n{score_text}"
             )
 
     # -- Async high-quality rendering -------------------------------------
@@ -1779,18 +1749,6 @@ class PreviewWindow(QWidget):
                 self.info_cache[img_path] = info
         return info
 
-    def get_cached_score(self, img_path, info=None):
-        score = None
-        if self.score_cache is not None:
-            score = self.score_cache.get(img_path)
-        if score is None:
-            if info is None:
-                info = self.get_cached_image_info(img_path)
-            score = compute_score(img_path, self.screen_ratio, self.max_area, self.max_size, info)
-            if self.score_cache is not None:
-                self.score_cache[img_path] = score
-        return score
-
     def closeEvent(self, event):
         if self._closed:
             super().closeEvent(event)
@@ -1824,6 +1782,8 @@ def main():
         try:
             a, b = args.ratio.split(":")
             desired_ratio = float(a) / float(b)
+            if not math.isfinite(desired_ratio) or desired_ratio <= 0:
+                raise ValueError
         except Exception:
             _console_print("比例格式应为 a:b")
             sys.exit(1)
