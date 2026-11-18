@@ -6,12 +6,14 @@ from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from threading import Lock
+from time import monotonic
 
 from PIL import Image
 
 ANALYSIS_EDGE = 256
 ANALYSIS_CACHE_BYTES = 64 * 1024 * 1024
 ANALYSIS_WORKERS = 4
+PROGRESS_INTERVAL = 0.1  # seconds between ordinary GUI updates
 COLOR_WEIGHT = 30.0
 COLOR_SCALE = 45.0
 INVALID_SCORE = -10000.0
@@ -177,35 +179,60 @@ class AnalysisCache:
         return analysis
 
 
-def collect_images(folder, cancel=None):
+def collect_images(folder, cancel=None, found=None):
     if not os.path.isdir(folder):
         raise NotADirectoryError(folder)
     image_files = []
     allowed_ext = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"}
-
-    def on_error(error):
-        raise error
-
-    for root, _dirs, files in os.walk(folder, onerror=on_error):
-        for filename in files:
-            if cancel is not None and cancel.is_set():
-                return []
-            if os.path.splitext(filename)[1].lower() in allowed_ext:
-                image_files.append(os.path.join(root, filename))
+    # Stream entries even in one large directory; keep os.walk's traversal order
+    # because the final sort preserves discovery order for equal scores.
+    folders = [folder]
+    while folders:
+        if cancel is not None and cancel.is_set():
+            return []
+        root = folders.pop()
+        if root != folder and os.path.islink(root):
+            continue
+        subdirs = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if cancel is not None and cancel.is_set():
+                    return []
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    is_dir = False  # Same classification as os.walk.
+                if is_dir:
+                    subdirs.append(entry.path)
+                elif os.path.splitext(entry.name)[1].lower() in allowed_ext:
+                    image_files.append(entry.path)
+                    if found is not None:
+                        found(len(image_files))
+        folders.extend(reversed(subdirs))
     return image_files
 
 
 def scan_folder(folder, target_ratio, target_pixels, cache, cancel, progress):
     """Run off the GUI thread; at most four decodes are outstanding at once."""
-    images = collect_images(folder, cancel)
+    next_update = 0.0
+
+    def report(count, total):
+        # Discovery has no denominator yet. Always publish phase boundaries and
+        # the first completion; subsequent updates depend on time, not folder size.
+        nonlocal next_update
+        now = monotonic()
+        if count <= 1 or count == total or now >= next_update:
+            progress(count, total)
+            next_update = now + PROGRESS_INTERVAL
+
+    images = collect_images(folder, cancel, lambda found: report(found, None))
     if cancel.is_set():
         return None
     info, scores, details, errors = {}, {}, {}, {}
     paths = iter(images)
     total = len(images)
     completed = 0
-    last_percent = -1
-    progress(0, total)
+    report(0, total)
 
     def analyze(path):
         if cancel.is_set():
@@ -245,10 +272,7 @@ def scan_folder(folder, target_ratio, target_pixels, cache, cancel, progress):
                     scores[path] = INVALID_SCORE
                     errors[path] = str(error)
                 completed += 1
-                percent = completed * 100 // total
-                if percent != last_percent:
-                    progress(completed, total)
-                    last_percent = percent
+                report(completed, total)
                 submit_next()
     if cancel.is_set():
         return None

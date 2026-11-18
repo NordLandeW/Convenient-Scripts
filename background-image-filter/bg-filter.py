@@ -317,7 +317,7 @@ class WorkerSignals(QObject):
     prefetch_done = Signal(object, object)           # key, PIL image | None
     preview_done = Signal(int, object, object, object)  # generation, (w,h), dpr, PIL image
     neighbor_done = Signal(str, object)              # path, result tuple | None
-    scan_progress = Signal(int, int, int)             # generation, completed, total
+    scan_progress = Signal(int, int, object)          # generation, count, total (None during discovery)
     scan_done = Signal(int, object, str)              # generation, ScanResult | None, error
 
 
@@ -639,11 +639,14 @@ class ImageBrowser(QMainWindow):
         except RuntimeError:
             pass
 
-    @Slot(int, int, int)
+    @Slot(int, int, object)
     def _scan_progress(self, generation, completed, total):
         if self._closed or generation != self._scan_generation or not self._loading:
             return
-        self.statusBar().showMessage(f"正在分析图片 {completed}/{total}…")
+        if total is None:
+            self.statusBar().showMessage(f"正在扫描文件夹，已找到 {completed} 张图片…")
+        else:
+            self.statusBar().showMessage(f"正在分析图片 {completed}/{total}…")
 
     @Slot(int, object, str)
     def _scan_done(self, generation, result, error):

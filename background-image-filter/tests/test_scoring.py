@@ -185,8 +185,30 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result.sorted_images, [good, str(bad)])
         self.assertIn(str(bad), result.errors)
         self.assertLess(result.scores[str(bad)], result.scores[good])
-        self.assertEqual(progress[0], (0, 2))
+        self.assertEqual(progress[0], (1, None))
+        self.assertIn((0, 2), progress)
         self.assertEqual(progress[-1], (2, 2))
+
+    def test_large_scan_reports_subpercent_progress_without_flooding(self):
+        data = Path(self.save("first.bmp", size=(1, 1))).read_bytes()
+        subdir = self.root / "nested"
+        subdir.mkdir()
+        for i in range(319):
+            ((self.root if i % 2 else subdir) / f"{i}.bmp").write_bytes(data)
+        expected = [os.path.join(root, name) for root, _, files in os.walk(self.root) for name in files]
+        events = []
+        now = 0.0
+
+        def progress(count, total):
+            nonlocal now
+            events.append((count, total))
+            if count == 1:
+                now += 1.0  # One slow completion, then a burst within the same instant.
+
+        with patch.object(scoring, "monotonic", lambda: now):
+            result = scoring.scan_folder(str(self.root), 1, 1, self.cache, Event(), progress)
+        self.assertEqual(events, [(1, None), (2, None), (0, 320), (1, 320), (2, 320), (320, 320)])
+        self.assertEqual(result.sorted_images, expected)  # Equal scores keep discovery order.
 
     def test_empty_missing_and_pre_cancelled_folders(self):
         self.assertEqual(self.scan().images, [])

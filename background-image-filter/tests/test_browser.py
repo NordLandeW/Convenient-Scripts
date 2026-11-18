@@ -111,6 +111,16 @@ class BrowserTests(unittest.TestCase):
         self.assertTrue(threads)
         self.assertEqual(set(threads), {threading.get_ident()})
 
+    def test_status_shows_discovery_before_analysis_and_keeps_final_summary(self):
+        self.save(self.root)
+        messages = []
+        self.browser.statusBar().messageChanged.connect(messages.append)
+        self.wait_scan(lambda: self.browser.load_folder(str(self.root)))
+        discovered = next(i for i, text in enumerate(messages) if "已找到 1 张" in text)
+        analyzing = next(i for i, text in enumerate(messages) if "1/1" in text)
+        self.assertLess(discovered, analyzing)
+        self.assertIn("已分析 1 张", self.browser.statusBar().currentMessage())
+
     def test_ui_dispatches_events_while_analysis_is_blocked(self):
         entered, release = Event(), Event()
         self.releases.append(release)
