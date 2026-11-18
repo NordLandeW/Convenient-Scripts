@@ -227,8 +227,13 @@ class ScoringTests(unittest.TestCase):
         self.assertIsNone(scoring.scan_folder(str(self.root), 2, 20000, self.cache, cancel, lambda *_: None))
 
     def test_cancellation_limits_outstanding_analysis(self):
-        for index in range(12):
+        for index in range(27):
             self.save(f"{index}.png", size=(8, 8))
+        for cpus, expected in ((None, 1), (1, 1), (8, 6), (32, 25)):
+            with self.subTest(cpus=cpus), patch.object(scoring, "_logical_cpu_count", return_value=cpus):
+                self.assert_decode_concurrency(expected)
+
+    def assert_decode_concurrency(self, expected):
         entered, release, cancel = Event(), Event(), Event()
         lock = Lock()
         started = []
@@ -237,7 +242,7 @@ class ScoringTests(unittest.TestCase):
         def blocked(path, size):
             with lock:
                 started.append(path)
-                if len(started) == scoring.ANALYSIS_WORKERS:
+                if len(started) == expected:
                     entered.set()
             if not release.wait(10):
                 raise TimeoutError("Test decode gate not released")
@@ -251,7 +256,7 @@ class ScoringTests(unittest.TestCase):
             finally:
                 release.set()
             self.assertIsNone(future.result(timeout=10))
-        self.assertEqual(len(started), 4)
+        self.assertEqual(len(started), expected)
 
     def test_invalid_target_parameters_are_rejected(self):
         for value in (0, -1, math.inf, math.nan):

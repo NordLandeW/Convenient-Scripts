@@ -10,7 +10,7 @@ from time import monotonic
 from PIL import Image, ImageChops
 
 ANALYSIS_EDGE = 128
-ANALYSIS_WORKERS = 4
+_logical_cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
 PROGRESS_INTERVAL = 0.1  # seconds between ordinary GUI updates
 COLOR_WEIGHT = 40.0
 COLOR_SCALE = 45.0
@@ -174,7 +174,7 @@ def _decode(path, stamp):
 
 
 def scan_folder(folder, target_ratio, target_pixels, cache, cancel, progress):
-    """Run off the GUI thread; at most four decodes are outstanding at once."""
+    """Scan off the GUI thread with a bounded number of concurrent decodes."""
     next_update = 0.0
 
     def report(count, total, *, immediate=False):
@@ -222,7 +222,8 @@ def scan_folder(folder, target_ratio, target_pixels, cache, cancel, progress):
     completed = total - len(misses)
     report(completed, total, immediate=True)
 
-    with ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS) as pool:
+    workers = max(1, (_logical_cpu_count() or 1) * 4 // 5)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {}
 
         def submit_next():
@@ -230,7 +231,7 @@ def scan_folder(folder, target_ratio, target_pixels, cache, cancel, progress):
             if item is not None and not cancel.is_set():
                 pending[pool.submit(_decode, *item)] = item
 
-        for _ in range(ANALYSIS_WORKERS):
+        for _ in range(min(workers, len(misses))):
             submit_next()
         while pending:
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
