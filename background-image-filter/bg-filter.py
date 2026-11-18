@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from scoring import AnalysisCache, INVALID_SCORE, aspect_ratio_score, scan_folder
+from scoring import INVALID_SCORE, aspect_ratio_score, scan_folder
 
 try:
     from ctypes import windll
@@ -395,7 +395,7 @@ class ImageBrowser(QMainWindow):
         self.image_info_cache = {}
         self.score_cache = {}
         self.score_details = {}
-        self.analysis_cache = AnalysisCache()
+        self.analysis_cache = {}
         self._scan_executor = ThreadPoolExecutor(max_workers=1)
         self._scan_future = None
         self._scan_cancel = Event()

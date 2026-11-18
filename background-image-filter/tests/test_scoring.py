@@ -21,15 +21,15 @@ class ScoringTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.cache = scoring.AnalysisCache()
+        self.cache = {}
 
     def save(self, name, color="gray", size=(200, 100), **options):
         path = self.root / name
         Image.new("RGB", size, color).save(path, **options)
         return str(path)
 
-    def scan(self):
-        return scoring.scan_folder(str(self.root), 2, 20000, self.cache, Event(), lambda *_: None)
+    def scan(self, ratio=2):
+        return scoring.scan_folder(str(self.root), ratio, 20000, self.cache, Event(), lambda *_: None)
 
     def test_colorful_beats_gray_at_equal_resolution_and_ratio(self):
         gray = self.save("gray.png")
@@ -56,16 +56,16 @@ class ScoringTests(unittest.TestCase):
         # rg = (-3, 3), yb = (-4.5, 7.5); variances are 9 and 36.
         self.assertAlmostEqual(scoring.colorfulness(image), math.sqrt(45) + 0.45)
 
-    def test_colors_outside_visible_crop_do_not_contribute(self):
+    def test_colors_outside_visible_crop_contribute_at_every_ratio(self):
         image = Image.new("RGB", (200, 100), "red")
         image.paste("gray", (50, 0, 150, 100))
         path = self.root / "crop.png"
         image.save(path)
-        analysis = self.cache.get(path)
+        analysis = scoring.read_analysis(path, path.stat().st_size)
         whole = scoring.score_analysis(analysis, 2, 20000)
         square = scoring.score_analysis(analysis, 1, 20000)
         self.assertGreater(whole.color, 0)
-        self.assertEqual(square.color, 0)
+        self.assertEqual(square.color, whole.color)
         self.assertLess(square.resolution, whole.resolution)
         self.assertEqual(square.aspect, 100)
 
@@ -74,7 +74,7 @@ class ScoringTests(unittest.TestCase):
         image = Image.new("RGBA", (600, 300), (255, 0, 0, 0))
         image.paste((0, 0, 255, 0), (300, 0, 600, 300))
         image.save(path)
-        analysis = self.cache.get(path)
+        analysis = scoring.read_analysis(path, path.stat().st_size)
         self.assertEqual(scoring.score_analysis(analysis, 2, 20000).color, 0)
 
     def test_palette_transparency_and_grayscale_modes(self):
@@ -86,9 +86,7 @@ class ScoringTests(unittest.TestCase):
                     image.putpalette([255, 0, 0] + [0] * 765)
                     image.info["transparency"] = 0
                 image.save(path)
-                analysis = self.cache.get(path)
-                self.assertEqual(analysis.sample.mode, "RGB")
-                self.assertLessEqual(max(analysis.sample.size), 256)
+                analysis = scoring.read_analysis(path, path.stat().st_size)
                 self.assertEqual(scoring.score_analysis(analysis, 2, 20000).color, 0)
 
     def test_resolution_uses_remaining_pixels_and_saturates_smoothly(self):
@@ -107,9 +105,10 @@ class ScoringTests(unittest.TestCase):
         self.assertGreaterEqual(low, -40)
 
     def test_rotated_image_and_target_have_equal_scores(self):
-        image = Image.new("RGB", (200, 100), "red")
-        a = scoring.Analysis((200, 100, 2, 1), image)
-        b = scoring.Analysis((100, 200, 0.5, 1), image.transpose(Image.Transpose.ROTATE_90))
+        a = self.save("landscape.png", "red", (200, 100))
+        b = self.save("portrait.png", "red", (100, 200))
+        a = scoring.read_analysis(a, os.path.getsize(a))
+        b = scoring.read_analysis(b, os.path.getsize(b))
         self.assertEqual(scoring.score_analysis(a, 2, 20000), scoring.score_analysis(b, 0.5, 20000))
 
     def test_lossless_file_size_and_format_do_not_change_score(self):
@@ -120,7 +119,7 @@ class ScoringTests(unittest.TestCase):
         result = self.scan()
         self.assertEqual(result.scores[compact], result.scores[large])
         self.assertEqual(result.scores[compact], result.scores[bitmap])
-        analysis = self.cache.get(compact)
+        analysis = scoring.read_analysis(compact, os.path.getsize(compact))
         self.assertEqual(scoring.score_analysis(analysis, 2, 20000, ".png"), scoring.score_analysis(analysis, 2, 20000, ".jpg"))
 
     def test_unrelated_larger_file_does_not_change_existing_score(self):
@@ -135,36 +134,39 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(score.format_penalty, -1000)
         self.assertLess(score.total, 0)
 
-    def test_ratio_changes_reuse_decoded_sample(self):
+    def test_ratio_changes_reuse_completed_color_statistics(self):
         path = self.save("cache.jpg", "red", (1600, 800))
-        with patch.object(scoring, "read_analysis", wraps=scoring.read_analysis) as read:
-            a = self.cache.get(path)
-            scoring.score_analysis(a, 2, 20000)
-            scoring.score_analysis(self.cache.get(path), 1, 20000)
-        self.assertEqual(read.call_count, 1)
-        self.assertEqual(a.info[:2], (1600, 800))
-        self.assertEqual(a.sample.size, (256, 128))
+        first = self.scan()
+        with patch.object(scoring, "read_analysis", side_effect=AssertionError("unexpected decode")), \
+             patch.object(scoring, "colorfulness", side_effect=AssertionError("unexpected pixel work")):
+            second = self.scan(0.5)
+        self.assertEqual(first.info[path][:2], (1600, 800))
+        self.assertFalse(second.errors)
+        self.assertEqual(first.details[path].color, second.details[path].color)
+        self.assertGreater(first.scores[path], second.scores[path])
 
     def test_cache_invalidates_when_same_size_file_changes(self):
         path = self.save("same.bmp", "gray")
-        old = self.cache.get(path)
+        old = self.scan()
         stamp = os.stat(path)
         self.save("same.bmp", "red")
         os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1000000000))
-        new = self.cache.get(path)
-        self.assertEqual(old.info[3], new.info[3])
-        self.assertEqual(scoring.colorfulness(old.sample), 0)
-        self.assertGreater(scoring.colorfulness(new.sample), 0)
+        new = self.scan()
+        self.assertEqual(old.info[path][3], new.info[path][3])
+        self.assertEqual(old.details[path].color, 0)
+        self.assertGreater(new.details[path].color, 0)
 
-    def test_lru_budget_evicts_old_decodes(self):
-        first = self.save("first.png", size=(8, 8))
-        second = self.save("second.png", size=(8, 8))
-        cache = scoring.AnalysisCache(max_bytes=8 * 8 * 4)
+    def test_rescan_discards_removed_files_and_analyzes_only_new_files(self):
+        removed = self.save("first.png")
+        kept = self.save("second.png")
+        self.scan()
+        os.remove(removed)
+        added = self.save("third.png")
         with patch.object(scoring, "read_analysis", wraps=scoring.read_analysis) as read:
-            cache.get(first)
-            cache.get(second)
-            cache.get(first)
-        self.assertEqual(read.call_count, 3)
+            result = self.scan(1)
+        self.assertEqual(set(result.images), {kept, added})
+        self.assertNotIn(removed, self.cache)
+        read.assert_called_once_with(added, os.path.getsize(added))
 
     def test_file_changed_during_decode_is_not_cached(self):
         path = self.save("changing.bmp")
@@ -177,9 +179,8 @@ class ScoringTests(unittest.TestCase):
             return result
 
         with patch.object(scoring, "read_analysis", side_effect=changing_read):
-            with self.assertRaises(OSError):
-                self.cache.get(path)
-        self.assertIsNotNone(self.cache.get(path))
+            self.assertIn(path, self.scan().errors)
+        self.assertGreater(self.scan().scores[path], scoring.INVALID_SCORE)
 
     def test_bad_file_does_not_stop_scan_and_progress_completes(self):
         good = self.save("good.png")
@@ -218,6 +219,8 @@ class ScoringTests(unittest.TestCase):
     def test_empty_missing_and_pre_cancelled_folders(self):
         self.assertEqual(self.scan().images, [])
         with self.assertRaises(NotADirectoryError):
+            scoring.scan_folder("", 2, 20000, self.cache, Event(), lambda *_: None)
+        with self.assertRaises(NotADirectoryError):
             scoring.scan_folder(str(self.root / "missing"), 2, 20000, self.cache, Event(), lambda *_: None)
         cancel = Event()
         cancel.set()
@@ -229,20 +232,19 @@ class ScoringTests(unittest.TestCase):
         entered, release, cancel = Event(), Event(), Event()
         lock = Lock()
         started = []
-        cache = self.cache
+        read = scoring.read_analysis
 
-        class BlockedCache:
-            def get(inner, path):
-                with lock:
-                    started.append(path)
-                    if len(started) == 4:
-                        entered.set()
-                if not release.wait(10):
-                    raise TimeoutError("Test decode gate was not released")
-                return cache.get(path)
+        def blocked(path, size):
+            with lock:
+                started.append(path)
+                if len(started) == scoring.ANALYSIS_WORKERS:
+                    entered.set()
+            if not release.wait(10):
+                raise TimeoutError("Test decode gate not released")
+            return read(path, size)
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(scoring.scan_folder, str(self.root), 2, 20000, BlockedCache(), cancel, lambda *_: None)
+        with patch.object(scoring, "read_analysis", blocked), ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(scoring.scan_folder, str(self.root), 2, 20000, self.cache, cancel, lambda *_: None)
             try:
                 self.assertTrue(entered.wait(10), "Analysis workers did not reach the gate")
                 cancel.set()

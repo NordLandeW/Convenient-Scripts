@@ -148,7 +148,7 @@ class BrowserTests(unittest.TestCase):
         first, second = self.root / "first", self.root / "second"
         self.save(first, color="gray")
         second_path = self.save(second)
-        old = scoring.scan_folder(str(first), 2, 20000, scoring.AnalysisCache(), Event(), lambda *_: None)
+        old = scoring.scan_folder(str(first), 2, 20000, {}, Event(), lambda *_: None)
         entered_old, entered_new = Event(), Event()
         release_old, release_new = Event(), Event()
         self.releases.extend([release_old, release_new])
@@ -179,7 +179,7 @@ class BrowserTests(unittest.TestCase):
 
     def test_close_ignores_late_result(self):
         self.save(self.root)
-        result = scoring.scan_folder(str(self.root), 2, 20000, scoring.AnalysisCache(), Event(), lambda *_: None)
+        result = scoring.scan_folder(str(self.root), 2, 20000, {}, Event(), lambda *_: None)
         entered, release = Event(), Event()
         self.releases.append(release)
 
@@ -215,14 +215,16 @@ class BrowserTests(unittest.TestCase):
             self.wait_scan(self.browser.apply_ratio)
             self.assertEqual(read.call_count, 1)
         self.assertGreater(old_details.color, 0)
-        self.assertEqual(self.browser.score_details[str(path)].color, 0)
+        new_details = self.browser.score_details[str(path)]
+        self.assertEqual(new_details.color, old_details.color)
+        self.assertLess(new_details.aspect, old_details.aspect)
         self.assertEqual(preview.screen_ratio, 2)
         preview._update_info_label()
         self.assertEqual(preview.info_label.text(), old_label)
         self.browser.open_preview(str(path), 0)
         current = self.browser.previews[-1]
         self.assertEqual(current.screen_ratio, 1)
-        self.assertEqual(current.score_details[str(path)].color, 0)
+        self.assertEqual(current.score_details[str(path)], new_details)
 
     def test_stale_thumbnails_are_not_restored_after_rescan(self):
         path = self.save(self.root)
