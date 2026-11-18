@@ -51,6 +51,12 @@ class ScoringTests(unittest.TestCase):
         image.paste("green", (0, 0, 50, 100))
         self.assertGreater(scoring.colorfulness(image), scoring.colorfulness(Image.new("RGB", (100, 100), "red")))
 
+    def test_colorfulness_preserves_signed_and_half_integer_channels(self):
+        image = Image.new("RGB", (2, 1))
+        image.putdata([(2, 5, 8), (9, 6, 0)])
+        # rg = (-3, 3), yb = (-4.5, 7.5); variances are 9 and 36.
+        self.assertAlmostEqual(scoring.colorfulness(image), math.sqrt(45) + 0.45)
+
     def test_colors_outside_visible_crop_do_not_contribute(self):
         image = Image.new("RGB", (200, 100), "red")
         image.paste("gray", (50, 0, 150, 100))

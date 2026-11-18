@@ -5,10 +5,11 @@ import os
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from operator import mul
 from threading import Lock
 from time import monotonic
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 ANALYSIS_EDGE = 256
 ANALYSIS_CACHE_BYTES = 64 * 1024 * 1024
@@ -17,6 +18,7 @@ PROGRESS_INTERVAL = 0.1  # seconds between ordinary GUI updates
 COLOR_WEIGHT = 30.0
 COLOR_SCALE = 45.0
 INVALID_SCORE = -10000.0
+_SQUARED_LEVELS = tuple(i * i for i in range(256))
 
 
 @dataclass(frozen=True)
@@ -82,18 +84,22 @@ def resolution_score(width, height, target_ratio, target_pixels):
 
 def colorfulness(image):
     """Hasler-Suesstrunk M3, using signed opponent channels in 8-bit RGB."""
-    rg_sum = yb_sum = rg_square_sum = yb_square_sum = 0.0
     count = image.width * image.height
-    for red, green, blue in image.getdata():
-        rg = float(red) - green
-        yb = 0.5 * (red + green) - blue
-        rg_sum += rg
-        yb_sum += yb
-        rg_square_sum += rg * rg
-        yb_square_sum += yb * yb
-    rg_mean = rg_sum / count
-    yb_mean = yb_sum / count
-    variance = (rg_square_sum + yb_square_sum) / count - rg_mean**2 - yb_mean**2
+    red, green, blue = image.split()
+    r, g, b = (sum(map(mul, range(256), ch.histogram())) for ch in (red, green, blue))
+    rg_mean = (r - g) / count
+    yb_mean = (0.5 * (r + g) - b) / count
+
+    def squared_difference(a, b):
+        histogram = ImageChops.difference(a, b).histogram()
+        return sum(map(mul, _SQUARED_LEVELS, histogram))
+
+    # rg² + yb² = 3/4 (R-G)² + 1/2 ((R-B)² + (G-B)²). Absolute differences
+    # fit Pillow's 8-bit histograms exactly; the signed means come from RGB above.
+    sum_squares = 0.75 * squared_difference(red, green) + 0.5 * (
+        squared_difference(red, blue) + squared_difference(green, blue)
+    )
+    variance = sum_squares / count - rg_mean**2 - yb_mean**2
     return math.sqrt(max(0.0, variance)) + 0.3 * math.hypot(rg_mean, yb_mean)
 
 
