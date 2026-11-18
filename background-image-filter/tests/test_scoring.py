@@ -33,12 +33,11 @@ class ScoringTests(unittest.TestCase):
 
     def test_colorful_beats_gray_at_equal_resolution_and_ratio(self):
         gray = self.save("gray.png")
-        colorful = self.save("colorful.png", "red")
+        colorful = self.save("colorful.png", (150, 150, 0))  # Solid color with C = 45.
         result = self.scan()
         self.assertGreater(result.scores[colorful], result.scores[gray])
         self.assertEqual(result.details[gray].color, 0)
-        self.assertGreater(result.details[colorful].color, 0)
-        self.assertLess(result.details[colorful].color, 30)
+        self.assertAlmostEqual(result.details[colorful].color, 20.0)
         self.assertEqual(result.sorted_images[0], colorful)
 
     def test_grayscale_contrast_does_not_count_as_color(self):
